@@ -162,6 +162,11 @@ DOC_ROOT = _env.get("MMU_DOC_ROOT", "/docs")
 # Stage 1 only fetches URLs the caller names; no model chooses its own targets.
 WEB_ENABLED = _env.get("MMU_WEB_ENABLED", "false").lower() == "true"
 
+# Phase 13.2: how many skills a single recall may deliver. Small on purpose --
+# a skill substitutes for its source memories, so several firing at once
+# withholds a lot of context on the strength of a similarity score.
+SKILL_RECALL_MAX = int(_env.get("MMU_SKILL_RECALL_MAX", "2"))
+
 # Phase 13.1: whether a model may confirm a crystallization itself.
 #
 # OFF by default, and the default is the recommendation. Crystallizing demotes
@@ -523,6 +528,51 @@ class EmbeddingClient:
 
 
 EMB = EmbeddingClient()
+
+
+def _skill_embedding_text(trigger, procedure):
+    """
+    The single canonical definition of "what text represents a skill".
+
+    Same discipline as _embedding_text() for memories, and for the same reason:
+    vectors are only comparable if the text that produced them was assembled
+    the same way, so creation and the reindex backfill must both come here.
+
+    Trigger first. It is the part phrased like a query -- "asked to explain X"
+    reads much closer to what someone actually types than the procedure does --
+    and it carries the most weight for matching.
+    """
+    return f"{trigger or ''}\n{procedure or ''}".strip()
+
+
+def _index_skill(skill_id, trigger, procedure):
+    """
+    Make a skill retrievable: embed it and link it into the Keyword graph.
+
+    Best-effort and never raises. A skill that fails to index is still a
+    perfectly good skill, it is just invisible until /skills/reindex catches
+    it -- exactly how an un-embedded memory is treated. Failing the
+    crystallization over it would undo a human's decision for a reason that
+    has nothing to do with the decision.
+    """
+    embedded = keyworded = 0
+    text = _skill_embedding_text(trigger, procedure)
+    try:
+        vec = EMB.embed(text)
+        if vec and n4j.write_skill_embedding(skill_id, vec):
+            embedded = 1
+        elif not vec:
+            log.warning("No embedding for skill %s -- reindex will catch it", skill_id)
+    except Exception as e:
+        log.warning("Skill embedding failed for %s (skill still created): %s", skill_id, e)
+
+    try:
+        terms = ingest.extract_keywords(text)
+        keyworded = n4j.link_skill_keywords(skill_id, terms)
+    except Exception as e:
+        log.warning("Skill keyword linking failed for %s: %s", skill_id, e)
+
+    return {"embedded": bool(embedded), "keywords": keyworded}
 
 
 def _embedding_text(keywords, payload):
@@ -1333,9 +1383,44 @@ def recall(body: RecallIn):
     mmu._current_session_id = str(uuid.uuid4())
     results = mmu.recall(body.prompt, top_k=body.top_k, skip_pinned=body.skip_pinned)
 
-    context_lines = [
+    # ── Phase 13.2: deliver matching skills ──
+    #
+    # This is the half of crystallization that was never built. A Skill had no
+    # keywords and no embedding, so nothing could retrieve it; crystallizing
+    # three memories changed recall by zero bytes, and the 636-character skill
+    # that was 11% of its source was never delivered in place of it.
+    #
+    # A matched skill REPLACES its own members in the delivered context. That
+    # substitution is the entire point -- a skill that arrives alongside
+    # everything it compressed has added text rather than saved it. Members are
+    # never deleted, and a direct query for one still finds it; they are only
+    # withheld from this block, and `replaced_members` says which.
+    skills, replaced = [], set()
+    try:
+        qvec = EMB.embed(body.prompt) if EMB.enabled else None
+        skills = n4j.match_skills(
+            query_vector = qvec,
+            terms        = ingest.extract_keywords(body.prompt),
+            limit        = SKILL_RECALL_MAX,
+        )
+        if skills:
+            for sk in skills:
+                replaced.update(a for a in (sk.get("members") or []) if a)
+            n4j.record_skill_invocation([sk["skill_id"] for sk in skills])
+    except Exception as e:
+        log.warning("skill matching failed (recall unaffected): %s", e)
+
+    context_lines = []
+    for sk in skills:
+        context_lines.append(
+            f"[SKILL | {sk['via']} {sk['score']:.2f} | {sk['skill_id']}]\n"
+            f"  When: {sk['trigger']}\n"
+            f"  Do:   {sk['procedure']}"
+        )
+    withheld = {r["address"] for r in results if r["address"] in replaced}
+    context_lines += [
         f"[{r['color']} | {r['src_label']} | {r['address']}]: {r['payload']}"
-        for r in results
+        for r in results if r["address"] not in withheld
     ]
     context_block = "\n".join(context_lines) if context_lines else "No relevant memories found."
 
@@ -1384,6 +1469,19 @@ def recall(body: RecallIn):
         "memories":      results,
         "context_block": context_block,
         "count":         len(results),
+        # Reported separately from `memories` for the same reason `anticipated`
+        # is: these did not surface the way a memory surfaces, and blending them
+        # would misrepresent why each is here.
+        "skills":        [{k: v for k, v in sk.items() if k != "members"}
+                          # Only what this recall ACTUALLY withheld. Reporting
+                          # every member regardless claimed credit for saving
+                          # context that was never going to be delivered --
+                          # a compression number that flatters itself is worse
+                          # than none, since it is the number used to judge
+                          # whether crystallizing was worth it.
+                          | {"replaced_members": [a for a in (sk.get("members") or [])
+                                                  if a in withheld]}
+                          for sk in skills],
         "anticipated":   anticipated,
         "read_path":     getattr(mmu, "_last_read_path", "v2"),
         "read_ms":       getattr(mmu, "_last_read_ms", 0)
@@ -1652,6 +1750,9 @@ def crystallize(body: CrystallizeIn, x_mmu_source: Optional[str] = Header(None))
     # bookkeeping miss must not be reported as a failed crystallization.
     n4j.close_proposal_for_members(body.member_addresses, skill["skill_id"])
 
+    # Phase 13.2: a skill nothing can retrieve is a skill that does not exist.
+    skill["indexed"] = _index_skill(skill["skill_id"], body.trigger, body.procedure)
+
     return {"status": "crystallized", **skill}
 
 
@@ -1720,6 +1821,24 @@ def uncrystallize(skill_id: str, confirm: str = ""):
     mmu.v2_index.save()
 
     return {"status": "uncrystallized", **info}
+
+
+@app.post("/skills/reindex")
+def reindex_skills():
+    """
+    Embed and keyword-link any active skill that lacks either.
+
+    Needed for anything crystallized before Phase 13.2, and as the recovery
+    path when the embedding service was down at creation time. Safe to re-run.
+    """
+    pending = n4j.get_skills_needing_index()
+    done = []
+    for sk in pending:
+        r = _index_skill(sk["skill_id"], sk["trigger"], sk["procedure"])
+        done.append({"skill_id": sk["skill_id"], **r})
+    return {"status": "reindexed", "count": len(done), "skills": done,
+            "note": ("Nothing needed indexing." if not done else
+                     "These skills are now retrievable through /recall.")}
 
 
 @app.get("/meta_skill_candidates")
@@ -1829,6 +1948,7 @@ def crystallize_proposal(proposal_id: str, body: CrystallizeIn,
     mmu.v2_index.save()
 
     n4j.close_proposal_for_members(addrs, skill["skill_id"])
+    skill["indexed"] = _index_skill(skill["skill_id"], body.trigger, body.procedure)
     return {"status": "crystallized", "proposal_id": proposal_id, **skill}
 
 

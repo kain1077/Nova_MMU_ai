@@ -42,6 +42,7 @@ SIMILAR_THRESH = 0.72
 # instance at deploy time, not assumed from the model name.
 EMBEDDING_DIM   = int(os.environ.get("MMU_EMBEDDING_DIM", "768"))
 EMBEDDING_INDEX = "memory_embedding"
+SKILL_EMBEDDING_INDEX = "skill_embedding"
 
 SOURCE_LABELS = {
     0: "Conversation",
@@ -143,6 +144,21 @@ def bootstrap_schema():
                 """)
                 log.info("Vector index %s ensured (dim=%d, cosine)",
                          EMBEDDING_INDEX, EMBEDDING_DIM)
+
+                # Phase 13.2: the same treatment for Skill. A separate index
+                # rather than a shared one -- skills and memories are ranked
+                # against each other only after both are retrieved, and mixing
+                # labels in one ANN index would make "top k memories" and "top
+                # k skills" compete for the same k.
+                s.run(f"""
+                    CREATE VECTOR INDEX {SKILL_EMBEDDING_INDEX} IF NOT EXISTS
+                    FOR (sk:Skill) ON (sk.embedding)
+                    OPTIONS {{ indexConfig: {{
+                        `vector.dimensions`: {int(EMBEDDING_DIM)},
+                        `vector.similarity_function`: 'cosine'
+                    }} }}
+                """)
+                log.info("Vector index %s ensured", SKILL_EMBEDDING_INDEX)
             except Exception as e:
                 # Community edition below 5.11 has no vector index support.
                 # Semantic recall degrades to the keyword path; nothing breaks.
@@ -1679,6 +1695,208 @@ def uncrystallize_skill(skill_id):
     except Exception as e:
         log.warning(f"uncrystallize_skill failed (nothing applied): {e}")
         return None, str(e)
+
+
+# ═════════════════════════════════════════════
+#  PHASE 13.2 — SKILL DELIVERY
+# ═════════════════════════════════════════════
+#
+# Crystallization was write-only. A Skill node carried trigger and procedure
+# and nothing else: no keywords, no embedding, no edge into the Keyword graph.
+# Every retrieval path in this system reaches a memory through keywords or
+# through the vector index, so a Skill was unreachable by all of them -- and
+# invocation_count, written as 0 at creation, was never incremented because
+# nothing ever invoked anything.
+#
+# Measured before this existed: crystallizing three memories changed recall by
+# zero bytes. The 636-character skill was 11% of its 5,377 characters of source
+# and was never delivered in place of them, so the compression was real on
+# paper and absent in practice.
+#
+# The model noticed before the code did. Asked about skills, it saved an
+# ordinary Memory titled "SKILL NODE: ..." with a trigger phrase and a
+# provenance footer -- reimplementing the mechanism at the only layer that was
+# actually retrievable.
+
+
+def write_skill_embedding(skill_id, vector):
+    """Attach an embedding to a Skill, in Neo4j's native vector encoding."""
+    driver = get_driver()
+    if driver is None or not vector:
+        return False
+    try:
+        with driver.session() as s:
+            rec = s.run("""
+                MATCH (sk:Skill {skill_id: $sid})
+                CALL db.create.setNodeVectorProperty(sk, 'embedding', $vector)
+                RETURN count(sk) AS n
+            """, sid=skill_id, vector=[float(x) for x in vector]).single()
+            return bool(rec and rec["n"])
+    except Exception as e:
+        log.warning(f"write_skill_embedding failed: {e}")
+        return False
+
+
+def link_skill_keywords(skill_id, terms):
+    """
+    Link a Skill into the same Keyword graph memories use.
+
+    Deliberately the existing HAS_KEYWORD edge and the existing Keyword nodes
+    rather than a parallel vocabulary: a skill about dimensional relativity and
+    a memory about dimensional relativity should match the same term, or the
+    keyword gate would need to learn about skills as a special case.
+    """
+    driver = get_driver()
+    if driver is None or not terms:
+        return 0
+    try:
+        n = 0
+        with driver.session() as s:
+            for term in terms:
+                term = (term or "").strip().lower()
+                if not term:
+                    continue
+                s.run("""
+                    MERGE (k:Keyword {term: $term})
+                    ON CREATE SET k.freq = 0, k.stem = $term
+                    WITH k
+                    MATCH (sk:Skill {skill_id: $sid})
+                    MERGE (sk)-[:HAS_KEYWORD]->(k)
+                """, term=term, sid=skill_id)
+                n += 1
+        return n
+    except Exception as e:
+        log.warning(f"link_skill_keywords failed: {e}")
+        return 0
+
+
+def match_skills(query_vector=None, terms=None, limit=3, min_semantic=0.75):
+    """
+    Find active skills relevant to a query, by embedding and by keyword.
+
+    Returns [{skill_id, trigger, procedure, confidence, members, score, via}]
+    where via is "semantic" or "keyword", so a caller can report WHY a skill
+    surfaced -- the same transparency rule that puts `via` on every memory row.
+
+    Deprecated skills are never matched. A skill with no embedding falls back
+    to the keyword path rather than being invisible, which is what keeps a
+    skill crystallized before this phase from silently disappearing.
+
+    min_semantic is deliberately high. A skill substitutes for its source
+    memories in the delivered context, so a loose match does not merely add
+    noise, it withholds the memories the caller would otherwise have seen.
+    """
+    driver = get_driver()
+    if driver is None:
+        return []
+
+    terms = [t.strip().lower() for t in (terms or []) if (t or "").strip()]
+    found = {}
+
+    try:
+        with driver.session() as s:
+            if query_vector:
+                try:
+                    for r in s.run("""
+                        CALL db.index.vector.queryNodes($index, $k, $vector)
+                        YIELD node, score
+                        WHERE node.status = 'active' AND score >= $floor
+                        RETURN node.skill_id AS sid, score AS score
+                    """, index=SKILL_EMBEDDING_INDEX, k=max(int(limit) * 3, 10),
+                         vector=[float(x) for x in query_vector],
+                         floor=float(min_semantic)):
+                        found[r["sid"]] = (float(r["score"]), "semantic")
+                except Exception as e:
+                    # No vector index (older Neo4j), or no embedded skills yet.
+                    log.debug("skill vector match unavailable: %s", e)
+
+            if terms:
+                for r in s.run("""
+                    MATCH (sk:Skill)-[:HAS_KEYWORD]->(k:Keyword)
+                    WHERE sk.status = 'active' AND k.term IN $terms
+                    WITH sk, count(DISTINCT k) AS hits
+                    RETURN sk.skill_id AS sid, hits
+                    ORDER BY hits DESC LIMIT $lim
+                """, terms=terms, lim=max(int(limit) * 3, 10)):
+                    sid, hits = r["sid"], r["hits"]
+                    # Fraction of the query's terms this skill carries. Kept on
+                    # the same 0-1 scale as the cosine score so one threshold
+                    # and one ordering apply to both paths.
+                    score = hits / float(len(terms))
+                    if sid not in found or score > found[sid][0]:
+                        found[sid] = (score, "keyword")
+
+            if not found:
+                return []
+
+            rows = s.run("""
+                MATCH (sk:Skill) WHERE sk.skill_id IN $sids
+                OPTIONAL MATCH (m:Memory)-[:PROCEDURALIZED_FROM]->(sk)
+                RETURN sk.skill_id   AS skill_id,
+                       sk.trigger    AS trigger,
+                       sk.procedure  AS procedure,
+                       sk.confidence AS confidence,
+                       collect(m.address) AS members
+            """, sids=list(found.keys()))
+
+            out = []
+            for r in rows:
+                score, via = found[r["skill_id"]]
+                d = dict(r)
+                d["score"] = round(score, 4)
+                d["via"]   = via
+                out.append(d)
+            out.sort(key=lambda d: -d["score"])
+            return out[:int(limit)]
+    except Exception as e:
+        log.warning(f"match_skills failed: {e}")
+        return []
+
+
+def record_skill_invocation(skill_ids):
+    """
+    Count a delivery. invocation_count existed from Phase 12 and was never
+    incremented, which meant there was no way to tell a skill that earns its
+    place from one that has never once been used.
+    """
+    driver = get_driver()
+    if driver is None or not skill_ids:
+        return False
+    try:
+        with driver.session() as s:
+            s.run("""
+                MATCH (sk:Skill) WHERE sk.skill_id IN $sids
+                SET sk.invocation_count = coalesce(sk.invocation_count, 0) + 1,
+                    sk.last_invoked     = $now
+            """, sids=list(skill_ids), now=datetime.now().isoformat())
+        return True
+    except Exception as e:
+        log.warning(f"record_skill_invocation failed: {e}")
+        return False
+
+
+def get_skills_needing_index():
+    """
+    Active skills with no embedding or no keywords -- everything crystallized
+    before delivery existed, plus anything whose embedding write failed.
+    """
+    driver = get_driver()
+    if driver is None:
+        return []
+    try:
+        with driver.session() as s:
+            return [dict(r) for r in s.run("""
+                MATCH (sk:Skill)
+                WHERE sk.status = 'active'
+                  AND (sk.embedding IS NULL
+                       OR NOT (sk)-[:HAS_KEYWORD]->(:Keyword))
+                RETURN sk.skill_id  AS skill_id,
+                       sk.trigger   AS trigger,
+                       sk.procedure AS procedure
+            """)]
+    except Exception as e:
+        log.warning(f"get_skills_needing_index failed: {e}")
+        return []
 
 
 def link_skills(child_id, parent_id):

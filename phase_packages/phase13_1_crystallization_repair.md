@@ -400,6 +400,80 @@ undone, and much less so when it is not. Reversibility landed first on purpose.
 
 ---
 
+## Phase 13.2 -- delivery
+
+Crystallization was write-only, and nothing noticed for two phases because
+every part of it worked except the part that returns a skill to anyone.
+
+A `Skill` node carried `trigger`, `procedure`, `confidence`, `status`, and
+`invocation_count`, plus `PROCEDURALIZED_FROM` edges pointing *in* from its
+members. No keywords. No embedding. Every retrieval path in the system reaches
+a memory through the `Keyword` graph or the vector index, so a Skill was
+unreachable by all of them. No `/recall`, session-bundle, or idle-context query
+mentioned `:Skill` at all, and `invocation_count` -- written as `0` at creation
+-- was never incremented, because nothing ever invoked anything.
+
+Measured before the fix: crystallizing three memories changed recall by **zero
+bytes**. Identical queries returned identical results, 7642 characters either
+way. The 636-character skill was 11% of its 5,377 characters of source and was
+never delivered in place of it.
+
+The model found this before the code did. Asked about skills, it saved an
+ordinary `Memory` titled `SKILL NODE: Dimensional Relativity Theory (DRT)
+Framework`, with a trigger phrase and a `(Crystallized from memories: ...)`
+footer -- reimplementing the mechanism at the only layer that was actually
+retrievable. That memory came back `via=direct` in every test. The real Skill
+never came back at all.
+
+### What delivery required
+
+**Skills join the retrieval graph.** A `skill_embedding` vector index, and
+`HAS_KEYWORD` edges into the same `Keyword` nodes memories use -- not a
+parallel vocabulary, or the keyword gate would need to learn about skills as a
+special case. `_skill_embedding_text()` is the canonical "what text represents
+a skill", mirroring `_embedding_text()`, because vectors only compare if the
+text that produced them was assembled the same way.
+
+**A matched skill substitutes for its members.** This is the whole point: a
+skill delivered alongside everything it compressed has added text rather than
+saved it. Members are never deleted and a direct query still finds them; they
+are withheld from that one context block, and `replaced_members` reports which.
+
+**`invocation_count` increments.** Which finally makes `confidence` and
+`last_invoked` mean something, and gives an answer to "is this skill earning
+its place" that is evidence rather than intuition.
+
+`POST /skills/reindex` backfills anything crystallized before this existed, and
+is idempotent.
+
+### What it is honestly worth
+
+Measured on a controlled pair -- two memories that genuinely surface for their
+query:
+
+```
+before crystallizing   2607 chars, both members present
+after                  2532 chars, 0 members present, skill delivered (0.91)
+```
+
+Substitution works. But on the real DRT skill, the same before/after showed the
+skill *adding* 717 characters and withholding nothing, because its three
+members do not surface for any query tried -- including their own near-verbatim
+text. Among 869 chunks of one corpus they are never in the top 8.
+
+That is worth stating plainly rather than rounding up: **a skill only saves
+context when it displaces members that would otherwise have been retrieved.**
+Co-recall density and retrieval competitiveness are different properties, and
+`find_skill_candidates()` selects for the first. A cluster can be densely
+co-recalled and still never win a query on its own.
+
+So the compression case is real but conditional, and the unconditional gain is
+different: the skill delivers procedural guidance -- *how* to answer -- that no
+individual memory contained. Whether that trade is worth the demotion is a
+judgement per skill, which is why `invocation_count` now exists to inform it.
+
+---
+
 ## Regression guards
 
 `tests/test_mmu.py` gains pure tests that fail if any of this is reintroduced:

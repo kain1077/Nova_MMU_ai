@@ -481,6 +481,64 @@ def test_insights_and_skill_candidates_agree():
 
 
 @live
+def test_a_crystallized_skill_is_actually_retrievable():
+    """
+    Phase 13.2. Crystallization was write-only: a Skill had no keywords and no
+    embedding, and every retrieval path reaches memories through one or the
+    other, so nothing could ever return one. Crystallizing three memories
+    changed recall by zero bytes.
+    """
+    _, a = _call("POST", "/remember", {
+        "keywords": ["quibbleprobe", "alpha"],
+        "payload": "Quibbleprobe step one: seat the widget before torquing.",
+        "src_type": 1})
+    _, b = _call("POST", "/remember", {
+        "keywords": ["quibbleprobe", "beta"],
+        "payload": "Quibbleprobe step two: torque the widget to the quibbleprobe spec.",
+        "src_type": 1})
+    addrs = [a["address"], b["address"]]
+    sid = None
+    try:
+        st, sk = _call("POST", "/crystallize", {
+            "member_addresses": addrs,
+            "trigger": "asked how to fit a quibbleprobe widget",
+            "procedure": "Seat the widget first, then torque it to spec.",
+            "confirmed": True})
+        assert st == 200, sk
+        sid = sk["skill_id"]
+
+        st, d = _call("POST", "/recall",
+                      {"prompt": "quibbleprobe widget torque", "top_k": 5})
+        assert st == 200
+        ids = [s["skill_id"] for s in d.get("skills", [])]
+        assert sid in ids, "a crystallized skill must be retrievable by recall"
+
+        # And it must SUBSTITUTE for its members, not arrive alongside them.
+        # A skill delivered next to everything it compressed has added text
+        # rather than saved it.
+        hit = next(s for s in d["skills"] if s["skill_id"] == sid)
+        assert hit["replaced_members"], "the skill must displace its own members"
+        for addr in hit["replaced_members"]:
+            assert addr not in d["context_block"],                 "a replaced member must not also appear in the context block"
+        assert "SKILL" in d["context_block"]
+    finally:
+        if sid:
+            _call("POST", f"/skills/{sid}/uncrystallize?confirm=UNCRYSTALLIZE")
+        for addr in addrs:
+            _call("DELETE", f"/memories/{urllib.parse.quote(addr, safe='')}")
+
+
+@live
+def test_skill_reindex_is_safe_to_rerun():
+    """Anything crystallized before Phase 13.2 has no embedding and no
+    keywords; the backfill must be idempotent, not just present."""
+    st, first = _call("POST", "/skills/reindex")
+    assert st == 200
+    st, second = _call("POST", "/skills/reindex")
+    assert st == 200 and second["count"] == 0,         "a second reindex must find nothing left to do"
+
+
+@live
 def test_crystallization_is_reversible():
     """
     Crystallization is the one operation that restructures memory, and it had
