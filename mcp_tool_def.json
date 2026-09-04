@@ -1,0 +1,98 @@
+{
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "recall_memory",
+        "description": "Query your long-term memory system for relevant context. CALL THIS FIRST before answering any question about the user, their setup, their projects, or anything you might have learned before. Do not assume you already know — always check memory first.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "prompt": {
+              "type": "string",
+              "description": "A natural language query or the user's message to search memory against. Use key nouns and topics."
+            },
+            "top_k": {
+              "type": "integer",
+              "description": "Max number of memories to retrieve. Default 8. Use 3-5 for narrow queries, 8-10 for broad ones.",
+              "default": 8
+            }
+          },
+          "required": ["prompt"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "save_memory",
+        "description": "Save something to long-term memory. Use this proactively when you learn something important about the user, their preferences, their setup, or anything you want to remember in future sessions. You do NOT need to be asked — use your judgment.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "payload": {
+              "type": "string",
+              "description": "The fact or memory to store. Be specific and self-contained — write it so future-you can understand it with no other context."
+            },
+            "keywords": {
+              "type": "string",
+              "description": "Comma-separated keywords that should trigger this memory in future searches."
+            },
+            "priority": {
+              "type": "integer",
+              "description": "1 = most important (identity, critical config). 5 = normal context. 9 = minor note.",
+              "default": 5
+            },
+            "src_type": {
+              "type": "integer",
+              "description": "Source type: 0=conversation, 1=AI self-generated, 2=document, 3=web",
+              "default": 1
+            }
+          },
+          "required": ["payload", "keywords"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "pin_memory",
+        "description": "Pin a critical memory that should ALWAYS be in context and never age out. Use for identity facts, system config, or rules that must always apply.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "payload": {
+              "type": "string",
+              "description": "The critical fact to permanently pin."
+            },
+            "keywords": {
+              "type": "string",
+              "description": "Comma-separated keywords."
+            }
+          },
+          "required": ["payload", "keywords"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "check_memory_health",
+        "description": "Check the memory system status — how many memories exist, their color distribution, and whether the system is running.",
+        "parameters": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    }
+  ],
+
+  "_mmu_endpoints": {
+    "recall_memory":      "POST http://127.0.0.1:8765/recall",
+    "save_memory":        "POST http://127.0.0.1:8765/remember",
+    "pin_memory":         "POST http://127.0.0.1:8765/pin",
+    "check_memory_health":"GET  http://127.0.0.1:8765/health"
+  },
+
+  "_notes": "These tools map to the MMU Docker server on port 8765. In LM Studio, add these under Settings > Tools. The server must be running (docker compose up) before starting a session."
+}

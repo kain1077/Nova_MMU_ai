@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "mmu-memory": {
+      "command": "python",
+      "args": [
+        "/absolute/path/to/mmu_mcp_server.py"
+      ],
+      "env": {
+        "MMU_BASE": "http://127.0.0.1:8765"
+      }
+    },
+    "duckduckgo": {
+      "command": "uvx",
+      "args": [
+        "duckduckgo-mcp-server@0.6.1"
+      ]
+    }
+  }
+}

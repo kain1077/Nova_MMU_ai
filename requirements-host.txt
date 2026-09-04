@@ -1,0 +1,19 @@
+# Host-side dependencies -- for the pieces that run OUTSIDE the container.
+#
+# You need these only if you connect a model over MCP or run the maintenance
+# scripts. A pure `docker compose up` install needs nothing from this file.
+#
+# Validated on Python 3.14; 3.10+ should be fine.
+#
+#   pip install -r requirements-host.txt
+
+# mmu_mcp_server.py, mmu_idle_daemon.py, Extra/test_client.py, Extra/graph_viz.py
+requests==2.34.2
+
+# Only for the scripts that talk to Neo4j directly, rather than through the API:
+#   migrate_add_valence.py, neo4j_backfill.py, Extra/migrate_to_v2_index.py
+neo4j==6.3.0
+
+# Optional. Only mmu_claude_bridge.py needs this, and only if you drive MMU
+# from the Anthropic API rather than an MCP client. Uncomment to install.
+# anthropic

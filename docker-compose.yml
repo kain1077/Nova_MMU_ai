@@ -1,0 +1,90 @@
+services:
+
+  # ── Neo4j graph database ─────────────────────────────
+  neo4j:
+    image: neo4j:5.18-community
+    container_name: ${MMU_NEO4J_NAME:-mmu-neo4j}
+    ports:
+      - "${MMU_BIND:-127.0.0.1}:${NEO4J_HTTP_PORT:-7474}:7474"   # Neo4j Browser UI
+      - "${MMU_BIND:-127.0.0.1}:${NEO4J_BOLT_PORT:-7687}:7687"   # Bolt protocol
+    volumes:
+      - neo4j-data:/data
+      - neo4j-logs:/logs
+    environment:
+      - NEO4J_AUTH=neo4j/${NEO4J_PASS:?NEO4J_PASS is not set. Copy .env.example to .env and set it.}
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_apoc_export_file_enabled=true
+      - NEO4J_apoc_import_file_enabled=true
+      - NEO4J_dbms_security_procedures_unrestricted=apoc.*
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:7474"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ── MMU FastAPI server ───────────────────────────────
+  mmu-server:
+    build: .
+    container_name: ${MMU_SERVER_NAME:-mmu-memory-server}
+    ports:
+      - "${MMU_BIND:-127.0.0.1}:${MMU_PORT:-8765}:8765"
+    volumes:
+      - mmu-data:/data
+      # Phase 11: read-only source documents for /ingest. Read-only on purpose --
+      # ingestion reads originals and must never be able to modify them.
+      - ${MMU_DOC_HOST:-./documents}:/docs:ro
+    environment:
+      - MMU_INDEX_PATH=/data/memory_index_v2.json
+      - MMU_ARCHIVE_THRESH=20
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASS=${NEO4J_PASS:?NEO4J_PASS is not set. Copy .env.example to .env and set it.}
+      - NEO4J_ENABLED=true
+      # Phase 9 -- semantic embedding layer.
+      # NOTE: the server runs inside Docker, so LM Studio is NOT on localhost
+      # from its point of view. host.docker.internal is the host machine.
+      # MMU_EMBEDDING_DIM must match what the model actually returns; it is
+      # baked into the Neo4j vector index at creation time. Changing the model
+      # means changing the dim AND dropping/recreating memory_embedding.
+      - MMU_EMBEDDING_ENABLED=${MMU_EMBEDDING_ENABLED:-true}
+      - MMU_EMBEDDING_BASE=${MMU_EMBEDDING_BASE:-http://host.docker.internal:1234/v1}
+      - MMU_EMBEDDING_MODEL=${MMU_EMBEDDING_MODEL:-text-embedding-nomic-embed-text-v1.5}
+      - MMU_EMBEDDING_API_KEY=${MMU_EMBEDDING_API_KEY:-}
+      - MMU_API_KEY=${MMU_API_KEY:-}
+      - MMU_CORS_ORIGINS=${MMU_CORS_ORIGINS:-}
+      - MMU_EMBEDDING_DIM=${MMU_EMBEDDING_DIM:-768}
+      # Neo4j normalizes cosine to [0,1] where 0.5 = orthogonal. 0.0 disables
+      # down-ranking entirely, so the keyword path cannot regress. Raise this
+      # only after reading real semantic_score values out of /recall.
+      - MMU_SEMANTIC_FLOOR=${MMU_SEMANTIC_FLOOR:-0.0}
+      - MMU_SEMANTIC_WEIGHT=${MMU_SEMANTIC_WEIGHT:-0.80}
+      # Phase 11 -- /ingest confinement root; source_path cannot escape it
+      - MMU_DOC_ROOT=/docs
+      - MMU_WEB_ENABLED=${MMU_WEB_ENABLED:-false}
+      - MMU_HOLD_THRESH=${MMU_HOLD_THRESH:-20}
+      - MMU_ARCHIVE_THRESH=${MMU_ARCHIVE_THRESH:-20}
+      - MMU_ARCHIVE_MIN_DAYS=${MMU_ARCHIVE_MIN_DAYS:-14}
+      - MMU_AGING_MIN_MEMORIES=${MMU_AGING_MIN_MEMORIES:-25}
+      - MMU_ANTICIPATE_MAX=${MMU_ANTICIPATE_MAX:-3}
+      - MMU_ANTICIPATE_PER_SESSION=${MMU_ANTICIPATE_PER_SESSION:-5}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  mmu-data:
+    driver: local
+  neo4j-data:
+    driver: local
+  neo4j-logs:
+    driver: local

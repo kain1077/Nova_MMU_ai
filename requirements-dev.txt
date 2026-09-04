@@ -1,0 +1,12 @@
+# Test dependencies.
+#
+#   pip install -r requirements-dev.txt
+#   pytest tests/ -v
+#
+# The pure tests need nothing running. The live tests are skipped unless a
+# server is listening -- point MMU_TEST_BASE at a TEST instance, never at a
+# graph you care about.
+
+-r requirements-host.txt
+
+pytest>=8.0

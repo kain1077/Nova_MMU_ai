@@ -1,0 +1,42 @@
+# ── Secrets ──────────────────────────────────────────
+# API key material. Never commit.
+Extra/apik.txt
+*.key
+*.pem
+.env
+.env.*
+# ...but the template MUST ship, or nobody can install.
+!.env.example
+
+# ── Superseded copies ────────────────────────────────
+# Pre-phase backups and the archive of earlier module versions.
+# Git history replaces both of these.
+*.bak
+old/
+
+# ── Runtime / generated ──────────────────────────────
+*.log
+memories_export.json
+creative_outputs_export.json
+insights_before.json
+insights_after.json
+
+# Benchmark output
+scratchpad/
+
+# Empty scratch directories
+New folder/
+Move/
+
+# ── Python ───────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ── Editor / OS ──────────────────────────────────────
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
