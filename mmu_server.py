@@ -162,6 +162,34 @@ DOC_ROOT = _env.get("MMU_DOC_ROOT", "/docs")
 # Stage 1 only fetches URLs the caller names; no model chooses its own targets.
 WEB_ENABLED = _env.get("MMU_WEB_ENABLED", "false").lower() == "true"
 
+# Phase 13.1: whether a model may confirm a crystallization itself.
+#
+# OFF by default, and the default is the recommendation. Crystallizing demotes
+# its source memories to Blue -- it restructures memory rather than adding to
+# it -- and Phase 12 put that behind a human on purpose. With this on, a model
+# that drafts a proposal can also approve its own draft, and the review stops
+# being a review.
+#
+# It exists because testing the full loop with a model requires it, and because
+# the operator asked for it with the trade-off already on the table. Enforced here rather
+# than only in the MCP tool list: a tool list is a client-side promise, and the
+# server should not depend on a client keeping one.
+#
+# Reverse anything a model gets wrong with POST /skills/{id}/uncrystallize.
+MODEL_MAY_CRYSTALLIZE = _env.get("MMU_ALLOW_MODEL_CRYSTALLIZE", "false").lower() == "true"
+
+
+def _guard_model_write(source: str):
+    """Refuse a model-originated crystallization unless it is explicitly enabled."""
+    if (source or "").strip().lower() == "model" and not MODEL_MAY_CRYSTALLIZE:
+        raise HTTPException(
+            403,
+            "This request is tagged as coming from a model, and model-initiated "
+            "crystallization is disabled. Crystallizing demotes the source "
+            "memories and is a human decision by default. Set "
+            "MMU_ALLOW_MODEL_CRYSTALLIZE=true to allow it."
+        )
+
 # -- Phase 10: aging redesign --
 # Archiving requires BOTH sustained disuse (count) AND real elapsed time.
 # Count alone was the shipped behaviour and it is a defect: twenty recalls
@@ -1551,10 +1579,21 @@ def skill_candidates(min_cluster: int = 3, min_pairwise: float = 0.6, limit: int
     cands = n4j.find_skill_candidates(
         min_cluster=min_cluster, min_pairwise_norm=min_pairwise, limit=limit
     )
+    # Phase 13.1: report the floor and which rule set it. An empty list is a
+    # legitimate answer, but only readable as one if the caller can see the bar
+    # that was actually applied and what it was derived from.
+    floor, ref_w, basis = n4j.skill_weight_floor(min_pairwise)
     return {
         "candidates": cands,
         "count":      len(cands),
-        "thresholds": {"min_cluster": min_cluster, "min_pairwise_norm": min_pairwise},
+        "thresholds": {
+            "min_cluster":       min_cluster,
+            "min_pairwise_norm": min_pairwise,
+            "weight_floor":      round(floor, 3),
+            "reference_weight":  round(ref_w, 3),
+            "reference":         f"p{int(n4j.SKILL_NORM_PERCENTILE * 100)} of CO_RECALLED weight",
+            "floor_set_by":      basis,
+        },
         "note": ("No cluster currently meets the mutual-density bar. This is a "
                  "normal result for a graph without long co-recall history."
                  if not cands else
@@ -1563,7 +1602,7 @@ def skill_candidates(min_cluster: int = 3, min_pairwise: float = 0.6, limit: int
 
 
 @app.post("/crystallize")
-def crystallize(body: CrystallizeIn):
+def crystallize(body: CrystallizeIn, x_mmu_source: Optional[str] = Header(None)):
     """
     Confirm step. THE ONLY WRITE PATH, and deliberately heavier to invoke than
     anything else in this API.
@@ -1573,6 +1612,7 @@ def crystallize(body: CrystallizeIn):
     It is intentionally NOT wired into mmu_idle_daemon.py's IDLE_TOOLS -- Nova
     may propose and may argue for a skill, but confirming is the user's.
     """
+    _guard_model_write(x_mmu_source)
     if not body.confirmed:
         raise HTTPException(
             400,
@@ -1584,16 +1624,17 @@ def crystallize(body: CrystallizeIn):
     if not body.trigger.strip() or not body.procedure.strip():
         raise HTTPException(400, "trigger and procedure are both required")
 
-    skill = n4j.crystallize_skill(
+    skill, why = n4j.crystallize_skill(
         member_addresses = body.member_addresses,
         trigger          = body.trigger,
         procedure        = body.procedure,
         confidence       = body.confidence,
     )
     if skill is None:
-        raise HTTPException(
-            500, "Crystallization failed; nothing was applied. Check the server log."
-        )
+        # 409, not 500: the usual cause is a stale address, which is a conflict
+        # with the current graph rather than a server fault -- and the reviewer
+        # can fix it in one step if told what actually happened.
+        raise HTTPException(409, f"Crystallization failed; nothing was applied. {why}")
 
     # The v2 index mirrors colour, and the memories were just demoted to Blue.
     # Without this the gate would keep treating them as active until the next
@@ -1604,6 +1645,12 @@ def crystallize(body: CrystallizeIn):
         except Exception as e:
             log.warning("v2 index colour sync failed for %s: %s", addr, e)
     mmu.v2_index.save()
+
+    # Phase 13.1: close the loop. If this member set was sitting in the review
+    # queue, mark it done so the next sweep stops re-proposing a cluster that
+    # is now a skill. Best-effort: the skill is already committed, and a
+    # bookkeeping miss must not be reported as a failed crystallization.
+    n4j.close_proposal_for_members(body.member_addresses, skill["skill_id"])
 
     return {"status": "crystallized", **skill}
 
@@ -1647,12 +1694,156 @@ def deprecate_skill_endpoint(skill_id: str):
     return {"status": "deprecated", "skill_id": skill_id}
 
 
+@app.post("/skills/{skill_id}/uncrystallize")
+def uncrystallize(skill_id: str, confirm: str = ""):
+    """
+    Reverse a crystallization: delete the Skill, restore its members to the
+    colours they had before, and return the proposal to the review queue.
+
+    Requires confirm=UNCRYSTALLIZE. Symmetric with /crystallize on purpose --
+    both directions restructure memory, so both are deliberate.
+    """
+    if confirm != "UNCRYSTALLIZE":
+        raise HTTPException(
+            400, "Refusing without confirm=UNCRYSTALLIZE. This deletes the Skill "
+                 "and restores its source memories."
+        )
+    info, why = n4j.uncrystallize_skill(skill_id)
+    if info is None:
+        raise HTTPException(404 if why == "no such skill" else 409, why)
+
+    for m in info["restored"]:
+        try:
+            mmu.v2_index.set_color(m["address"], m["color"])
+        except Exception as e:
+            log.warning("v2 index colour sync failed for %s: %s", m["address"], e)
+    mmu.v2_index.save()
+
+    return {"status": "uncrystallized", **info}
+
+
 @app.get("/meta_skill_candidates")
 def meta_skill_candidates(min_shared: int = 2):
     """Phase 13: skill pairs sharing source memories. Proposes only."""
     props = n4j.propose_meta_skill(min_shared=min_shared)
     return {"candidates": props, "count": len(props),
             "note": "Proposals only. Creating a meta-skill is a human decision."}
+
+
+# ───────────────────────────────────────────
+#  PHASE 13.1 -- SKILL PROPOSAL QUEUE
+# ───────────────────────────────────────────
+#
+# The human gate on /crystallize stays exactly where it was. These endpoints
+# only fix the fact that nothing ever rang the bell: candidates were computed
+# on demand by callers who never called, so no skill was ever formed from a
+# graph of 999 memories. The daemon may now queue what it notices. It still
+# cannot confirm anything.
+
+
+@app.get("/skill_proposals")
+def skill_proposals(status: Optional[str] = "pending", limit: int = 50):
+    """
+    The review queue. status filters to pending | rejected | crystallized;
+    pass status= (empty) for all of them.
+    """
+    if status == "":
+        status = None
+    if status and status not in ("pending", "rejected", "crystallized"):
+        raise HTTPException(400, "status must be pending, rejected or crystallized")
+
+    props = n4j.get_skill_proposals(status=status, limit=limit)
+    return {
+        "proposals": props,
+        "count":     len(props),
+        "note": ("Queued proposals only. Each still requires POST /crystallize "
+                 "with confirmed=true to become a Skill."),
+    }
+
+
+@app.post("/skill_proposals/sweep")
+def sweep_skill_proposals(min_score: float = 0.70, limit: int = 10):
+    """
+    Find candidates and queue the ones that clear min_score.
+
+    Writes SkillProposal nodes and nothing else -- no Memory is read-modified,
+    no Skill is created, no memory is demoted. That is what makes this safe for
+    the idle daemon to call unattended, and it is the only part of Phase 12/13
+    that is.
+
+    Idempotent: a cluster that is still dense refreshes its existing proposal
+    rather than queuing a second copy, and one already rejected stays rejected.
+    """
+    stats = n4j.queue_skill_proposals(min_score=min_score, limit=limit)
+    return {
+        "status":     "swept",
+        "min_score":  min_score,
+        **stats,
+        "note": "Nothing was crystallized. Review at GET /skill_proposals.",
+    }
+
+
+@app.post("/skill_proposals/{proposal_id}/crystallize")
+def crystallize_proposal(proposal_id: str, body: CrystallizeIn,
+                         x_mmu_source: Optional[str] = Header(None)):
+    """
+    Confirm a queued proposal by id. Same gate, fewer footguns.
+
+    member_addresses in the body is ignored: the addresses are resolved from
+    the proposal's immutable created_at stamps at write time. Addresses are
+    rewritten whenever a memory is recalled, so a reviewer carrying them from
+    an earlier listing is the failure this endpoint exists to remove.
+
+    Everything else is unchanged. confirmed=true is still required, trigger and
+    procedure are still written by a human, the memories are still demoted to
+    Blue, and no tool exposed to the model can reach this.
+    """
+    _guard_model_write(x_mmu_source)
+    if not body.confirmed:
+        raise HTTPException(
+            400,
+            "Refusing to crystallize without confirmed=true. This demotes the "
+            "source memories to Blue and is not something to trigger by accident."
+        )
+    if not body.trigger.strip() or not body.procedure.strip():
+        raise HTTPException(400, "trigger and procedure are both required")
+
+    addrs, why = n4j.get_proposal_members(proposal_id)
+    if not addrs:
+        raise HTTPException(404 if why == "no such proposal" else 409, why)
+
+    skill, why = n4j.crystallize_skill(
+        member_addresses = addrs,
+        trigger          = body.trigger,
+        procedure        = body.procedure,
+        confidence       = body.confidence,
+    )
+    if skill is None:
+        raise HTTPException(409, f"Crystallization failed; nothing was applied. {why}")
+
+    for addr in addrs:
+        try:
+            mmu.v2_index.set_color(addr, "Blue")
+        except Exception as e:
+            log.warning("v2 index colour sync failed for %s: %s", addr, e)
+    mmu.v2_index.save()
+
+    n4j.close_proposal_for_members(addrs, skill["skill_id"])
+    return {"status": "crystallized", "proposal_id": proposal_id, **skill}
+
+
+@app.post("/skill_proposals/{proposal_id}/reject")
+def reject_skill_proposal_endpoint(proposal_id: str, note: str = ""):
+    """
+    Decline a proposal so later sweeps stop re-offering it.
+
+    Permanent by design: rejection is a judgement about the cluster, and a
+    sweep that could quietly undo it would make the judgement pointless.
+    """
+    ok, reason = n4j.reject_skill_proposal(proposal_id, note=note)
+    if not ok:
+        raise HTTPException(404 if reason == "no such proposal" else 409, reason)
+    return {"status": "rejected", "proposal_id": proposal_id}
 
 
 # ───────────────────────────────────────────
@@ -1835,6 +2026,48 @@ def session_bundle(top_per_domain: int = 1):
                 f"  [{co['artifact_type']}] {co['title']}\n"
                 f"  {co['content']}"
             )
+
+    # ── Phase 13.1: pending crystallization proposals ──
+    #
+    # The human gate on /crystallize was never the problem; nothing ever rang
+    # the bell. The queue existed and only curl could see it, so proposals sat
+    # unreviewed while the model had no idea they were there.
+    #
+    # Deliberately shaped as a prompt to LOOK, not a recommendation to accept.
+    # The gate's value is that the user reads which memories would be demoted to
+    # Blue -- if the model picked the cluster, wrote the procedure, asked
+    # "shall I?", and got a yes, the confirmation would be a rubber stamp on
+    # the model's own reasoning rather than a review. So the members are named
+    # here, with the demotion stated plainly, and the model is told to argue
+    # rather than to prompt for approval.
+    #
+    # Capped at three: this rides in front of every conversation, and a wall of
+    # proposals would train the user to scroll past the whole block.
+    try:
+        pending = n4j.get_skill_proposals(status="pending", limit=3)
+    except Exception as e:
+        log.warning("session_bundle: skill proposals unavailable: %s", e)
+        pending = []
+
+    if pending:
+        lines.append("")
+        lines.append("MEMORY CLUSTERS READY FOR REVIEW (needs the user's decision):")
+        for p in pending:
+            sem = p.get("semantic_coherence")
+            sem_s = f", meaning {sem:.2f}" if isinstance(sem, (int, float)) else ""
+            lines.append(
+                f"  [{p['skill_score']:.2f} score{sem_s}] {p['proposal_id']}"
+            )
+            for prev in p.get("previews", []):
+                lines.append(f"    - {prev}")
+        lines.append(
+            "  Crystallizing one of these compresses its members into a Skill and "
+            "DEMOTES those memories to Blue. That is a change to how memory is "
+            "structured, so it is the user's call and cannot be done from any tool you "
+            "have. Use review_skills for the full list. If one looks right to you, "
+            "say which memories would be demoted and why the compression is worth "
+            "it -- do not ask for approval as though it were a formality."
+        )
 
     # Phase 8: blend in the most recently closed session's summary, if one
     # exists, so a brand new conversation can open with continuity instead
@@ -2401,13 +2634,22 @@ def _fmt_pairs(pairs):
 
 
 def _fmt_candidates(cands):
+    """
+    Phase 13.1: candidates are clusters now, not single hub memories, because
+    all three call sites share find_skill_candidates(). A cluster is only
+    meaningful shown whole -- the members are the evidence of mutual density.
+    """
     if not cands:
         return "  (none yet)"
-    return "\n".join(
-        f"  score {c['skill_score']:.2f} | {c['connections']} connections "
-        f"| coherence {c['grp_coherence']}\n    {c['preview']}"
-        for c in cands[:6]
-    )
+    out = []
+    for c in cands[:6]:
+        mix = ", ".join(f"{v}x {k}" for k, v in sorted(c.get("src_mix", {}).items()))
+        out.append(
+            f"  score {c['skill_score']:.2f} | {len(c['members'])} memories "
+            f"| coherence {c['grp_coherence']} | {mix or 'unknown source'}"
+        )
+        out.extend(f"    - {p}" for p in c.get("previews", []))
+    return "\n".join(out)
 
 
 def _fmt_outputs(outs):

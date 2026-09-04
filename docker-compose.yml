@@ -69,6 +69,11 @@ services:
       - MMU_AGING_MIN_MEMORIES=${MMU_AGING_MIN_MEMORIES:-25}
       - MMU_ANTICIPATE_MAX=${MMU_ANTICIPATE_MAX:-3}
       - MMU_ANTICIPATE_PER_SESSION=${MMU_ANTICIPATE_PER_SESSION:-5}
+      # Phase 13.1: allow a model to confirm a crystallization itself.
+      # Off by default -- crystallizing demotes its source memories to Blue,
+      # and a model that drafts a proposal should not also approve it.
+      # Reverse anything with POST /skills/{id}/uncrystallize.
+      - MMU_ALLOW_MODEL_CRYSTALLIZE=${MMU_ALLOW_MODEL_CRYSTALLIZE:-false}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:

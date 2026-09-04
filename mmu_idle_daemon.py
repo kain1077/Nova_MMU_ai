@@ -397,6 +397,20 @@ class MMUClient:
             "inspired_by":     inspired_by or [],
         })
 
+    def sweep_skill_proposals(self, min_score=0.70, limit=10):
+        """
+        Phase 13.1: queue crystallization candidates for human review.
+
+        Writes SkillProposal nodes only -- no Memory is modified and no Skill
+        is created. This is the daemon's entire involvement in crystallization
+        and the reason it is allowed to run unattended. Confirming a proposal
+        is a human action through POST /crystallize, and deliberately remains
+        absent from IDLE_TOOLS so the model cannot reach it.
+        """
+        return self._post("/skill_proposals/sweep",
+                          {"min_score": min_score, "limit": limit},
+                          timeout=60)
+
     def rate(self, address, val_type, intensity, emotion_label=None):
         """Phase 6.5 / 6.6: Rate a memory with like/dislike/clear + optional named emotion."""
         payload = {
@@ -504,6 +518,7 @@ def run_pass(depth, mmu, llm, dry_run=False):
         "saved_memories":   [],
         "artifacts":        [],
         "final_text":       "",
+        "skill_proposals":  None,
         "error":            None,
     }
 
@@ -588,6 +603,29 @@ def run_pass(depth, mmu, llm, dry_run=False):
     except Exception as e:
         log.error("Model call failed: %s", e)
         result["error"] = str(e)
+
+    # ── Step 3: crystallization sweep ──
+    #
+    # Runs after the model is done, on the graph the pass just left behind.
+    # Read-mostly: it writes SkillProposal nodes and nothing else. Nova is not
+    # consulted and cannot veto -- this is bookkeeping about the shape of the
+    # graph, not a thought she is having.
+    #
+    # Deliberately outside the try/except above and non-fatal: a pass that
+    # produced good memories is not a failed pass because the sweep tripped.
+    if not dry_run:
+        try:
+            sweep = mmu.sweep_skill_proposals()
+            result["skill_proposals"] = sweep
+            if sweep.get("created"):
+                log.info("Skill proposals: %d new, %d refreshed, %d pending total "
+                         "-- review at GET /skill_proposals",
+                         sweep.get("created", 0), sweep.get("refreshed", 0),
+                         sweep.get("pending", 0))
+            else:
+                log.info("Skill proposals: none new (%d pending)", sweep.get("pending", 0))
+        except Exception as e:
+            log.warning("Skill proposal sweep failed (pass otherwise fine): %s", e)
 
     result["elapsed_sec"] = round(time.time() - started, 1)
     log.info("IDLE PASS END | depth=%s | %ds | %d memories | %d artifacts",

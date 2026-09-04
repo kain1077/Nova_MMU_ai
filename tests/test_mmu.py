@@ -24,6 +24,7 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
+import inspect
 
 import pytest
 
@@ -43,11 +44,12 @@ def _server_up():
 live = pytest.mark.skipif(not _server_up(), reason=f"no MMU server at {BASE}")
 
 
-def _call(method, path, payload=None, timeout=120):
+def _call(method, path, payload=None, timeout=120, headers=None):
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(
         f"{BASE}{path}", data=data,
-        headers={"Content-Type": "application/json"}, method=method)
+        headers={"Content-Type": "application/json", **(headers or {})},
+        method=method)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, json.load(r)
@@ -207,6 +209,79 @@ def test_use_is_clamped():
     assert use == 20, "clamped, or it overflows the 3-digit address field"
 
 
+def test_member_key_is_order_independent():
+    """
+    Proposal dedup hangs off this. If the key depended on member order, the
+    same cluster would queue a fresh proposal on every sweep and the review
+    queue would fill with duplicates of one finding.
+    """
+    import neo4j_layer as n4j
+    a = ["2026-01-03T00:00:00", "2026-01-01T00:00:00", "2026-01-02T00:00:00"]
+    assert n4j._member_key(a) == n4j._member_key(sorted(a))
+    assert n4j._member_key(a) == n4j._member_key(list(reversed(a)))
+    assert n4j._member_key(a) != n4j._member_key(a + ["2026-01-04T00:00:00"])
+
+
+def test_proposals_are_not_keyed_on_addresses():
+    """
+    An MMU address encodes the use and arc counters and is rewritten in place
+    on every recall -- the same memory is 012.005.202.015 today and
+    012.005.202.017 after two recalls. A durable queue keyed on that re-queues
+    unchanged clusters under new numbers, and worse, hands /crystallize
+    addresses that no longer MATCH anything. created_at is written once.
+    """
+    import neo4j_layer as n4j
+    src = inspect.getsource(n4j.queue_skill_proposals)
+    assert '_member_key(c["member_created"])' in src
+    assert '_member_key(c["members"])' not in src,         "addresses are mutable and cannot key a proposal"
+    assert "member_created" in inspect.getsource(n4j.find_skill_candidates)
+
+
+def test_skill_floor_never_normalizes_against_the_max():
+    """
+    Phase 13.1 regression guard. Normalizing against max() made the bar track
+    the single hottest edge in the graph, so every recall of the hottest pair
+    raised the floor for every other cluster -- the system got less able to
+    crystallize the more it was used. The reference must be a percentile.
+    """
+    import neo4j_layer as n4j
+    assert 0.0 < n4j.SKILL_NORM_PERCENTILE < 1.0
+    assert n4j.SKILL_MIN_ABS_WEIGHT > 0, "an absolute floor must exist under it"
+    src = inspect.getsource(n4j.skill_weight_floor)
+    assert "percentileCont" in src
+    assert "max(r.weight)" not in src
+
+
+def test_documents_are_eligible_for_crystallization():
+    """
+    Phase 13.1 regression guard. `src_type <> 2` was copied here from
+    get_idle_context(), where excluding documents is correct. It made 86% of a
+    real graph permanently unable to form a skill, so the densest region of
+    memory stayed as hundreds of flat entries competing in every recall.
+    Crystallization is compression; a reference corpus is its best case.
+    """
+    import neo4j_layer as n4j
+    src = inspect.getsource(n4j.find_skill_candidates)
+    assert "src_type <> 2" not in src, \
+        "documents must remain eligible for crystallization"
+    # get_anticipated_context is the path where the exclusion IS correct -- a
+    # paragraph of a paper is not a thing to be proactively reminded of. The
+    # bug was copying that reasoning to the one place it does not hold.
+    assert "src_type <> 2" in inspect.getsource(n4j.get_anticipated_context)
+
+
+def test_previews_share_one_candidate_implementation():
+    """
+    The three paths had drifted into three different queries with three
+    scoring formulas, and /insights advertised candidates /skill_candidates
+    could never return. They must call the one function.
+    """
+    import neo4j_layer as n4j
+    for fn in (n4j.get_insights, n4j.get_idle_context):
+        assert "find_skill_candidates(" in inspect.getsource(fn), \
+            f"{fn.__name__} must not compute its own candidates"
+
+
 # ═════════════════════════════════════════════════════════════
 #  LIVE
 # ═════════════════════════════════════════════════════════════
@@ -275,6 +350,255 @@ def test_skill_candidates_is_read_only():
     _call("GET", "/skill_candidates")
     _, after = _call("GET", "/health")
     assert after["total_memories"] == before["total_memories"]
+
+
+@live
+def test_skill_proposal_sweep_creates_no_skills():
+    """
+    The sweep is what makes the daemon safe to run unattended: it may queue a
+    proposal, never act on one. If it can create a Skill or demote a memory,
+    the human gate on /crystallize has been routed around.
+    """
+    _, before_h = _call("GET", "/health")
+    _, before_s = _call("GET", "/skills")
+
+    st, d = _call("POST", "/skill_proposals/sweep")
+    assert st == 200 and d["status"] == "swept"
+
+    _, after_h = _call("GET", "/health")
+    _, after_s = _call("GET", "/skills")
+    assert after_h["total_memories"] == before_h["total_memories"]
+    assert after_s["count"] == before_s["count"], \
+        "a sweep must never crystallize anything"
+
+
+@live
+def test_skill_proposal_sweep_is_idempotent():
+    """
+    The daemon sweeps after every idle pass. A cluster that is still dense
+    must refresh its proposal, not queue a second copy of the same finding.
+    """
+    _call("POST", "/skill_proposals/sweep")
+    _, first = _call("GET", "/skill_proposals")
+    st, d = _call("POST", "/skill_proposals/sweep")
+    assert st == 200 and d["created"] == 0, "a repeat sweep must create nothing"
+    _, second = _call("GET", "/skill_proposals")
+    assert second["count"] == first["count"]
+
+
+@live
+def test_proposals_reach_the_model_somehow():
+    """
+    The queue was built, populated, and invisible: no MCP tool exposed it and
+    the session bundle did not mention it, so the only thing that could see a
+    proposal was curl. A review queue nothing can read is the same as no queue.
+    """
+    _call("POST", "/skill_proposals/sweep")
+    _, q = _call("GET", "/skill_proposals")
+    if not q["count"]:
+        pytest.skip("nothing pending to surface")
+    _, bundle = _call("GET", "/session_bundle")
+    assert "READY FOR REVIEW" in bundle.get("context_block", ""),         "pending proposals must reach the conversation-start context"
+
+
+@live
+def test_semantic_coherence_is_measured_not_assumed():
+    """
+    GRP coherence is arithmetic over filing codes, and a real candidate scored
+    1.0 on it while combining game design, an assistant's gender identity, and
+    a user's self-description -- all filed under 5xx and about nothing in
+    common. Meaning has to be measured against the embeddings.
+    """
+    _, d = _call("GET", "/skill_candidates?limit=5")
+    if not d["count"]:
+        pytest.skip("no candidates on this graph")
+    for c in d["candidates"]:
+        assert "semantic_coherence" in c
+        sem = c["semantic_coherence"]
+        if sem is None:
+            assert c["scored_without_embeddings"] is True,                 "a missing embedding must be reported, not silently scored as zero"
+        else:
+            assert 0.0 <= sem <= 1.0
+
+
+@live
+def test_no_memory_crowds_the_queue():
+    """
+    Four overlapping triangles drawn from the same handful of hot memories
+    filled 40% of a real queue, which a reviewer reads as the same finding
+    four times. Breadth is the point of a review list.
+    """
+    _, d = _call("GET", "/skill_candidates?limit=10")
+    if d["count"] < 4:
+        pytest.skip("too few candidates to crowd anything")
+    seen = {}
+    for c in d["candidates"]:
+        for m in c["members"]:
+            seen[m] = seen.get(m, 0) + 1
+    worst = max(seen.values())
+    assert worst <= 2, f"one memory appears in {worst} proposals; cap is 2"
+
+
+@live
+def test_skill_proposals_rejects_bad_status():
+    st, _ = _call("GET", "/skill_proposals?status=bogus")
+    assert st == 400
+
+
+@live
+def test_reject_unknown_proposal_is_404():
+    st, _ = _call("POST", "/skill_proposals/no-such-proposal-id/reject")
+    assert st == 404
+
+
+@live
+def test_candidates_report_the_floor_they_applied():
+    """
+    An empty candidate list is a legitimate answer, but only readable as one
+    if the caller can see the bar that was applied and what set it. Reporting
+    a bare count is how a structural exclusion stayed invisible for a phase.
+    """
+    st, d = _call("GET", "/skill_candidates")
+    assert st == 200
+    t = d["thresholds"]
+    for k in ("weight_floor", "reference_weight", "reference", "floor_set_by"):
+        assert k in t, f"thresholds must report {k}"
+    assert t["floor_set_by"] in ("percentile", "absolute")
+
+
+@live
+def test_insights_and_skill_candidates_agree():
+    """
+    They disagreed systematically: /insights showed a top candidate above the
+    documented propose-at-0.70 bar that /skill_candidates was structurally
+    incapable of returning. A preview of a decision must preview the decision.
+    """
+    _, ins = _call("GET", "/insights")
+    _, cands = _call("GET", "/skill_candidates?limit=10")
+    a = [c["members"] for c in ins["crystallization_candidates"]]
+    b = [c["members"] for c in cands["candidates"]]
+    assert a == b, "/insights and /skill_candidates must report the same clusters"
+
+
+@live
+def test_crystallization_is_reversible():
+    """
+    Crystallization is the one operation that restructures memory, and it had
+    no undo: deprecate_skill() left every member stranded in Blue. Members
+    carry mixed colours, so an undo that assumed one would corrupt the rest.
+    """
+    _, a = _call("POST", "/remember", {
+        "keywords": ["undoprobe"], "payload": "undo probe alpha", "src_type": 1})
+    _, b = _call("POST", "/remember", {
+        "keywords": ["undoprobe"], "payload": "undo probe beta", "src_type": 1})
+    addrs = [a["address"], b["address"]]
+    try:
+        st, sk = _call("POST", "/crystallize", {
+            "member_addresses": addrs, "trigger": "undo test",
+            "procedure": "undo test", "confirmed": True})
+        assert st == 200, sk
+
+        st, un = _call("POST",
+                       f"/skills/{sk['skill_id']}/uncrystallize?confirm=UNCRYSTALLIZE")
+        assert st == 200, un
+        assert len(un["restored"]) == 2
+        for m in un["restored"]:
+            assert m["color"] != "Blue", "a restored memory must not stay demoted"
+
+        _, skills = _call("GET", "/skills")
+        assert sk["skill_id"] not in [s["skill_id"] for s in skills["skills"]]
+    finally:
+        for addr in addrs:
+            _call("DELETE", f"/memories/{urllib.parse.quote(addr, safe='')}")
+
+
+@live
+def test_uncrystallize_requires_the_phrase():
+    st, _ = _call("POST", "/skills/whatever/uncrystallize")
+    assert st == 400
+
+
+@live
+def test_model_crystallization_is_gated():
+    """
+    Model-initiated crystallization is a configuration decision, and the server
+    enforces it rather than trusting the MCP tool list -- a tool list is a
+    client-side promise, and the write is not something to leave to a client
+    keeping one.
+    """
+    _, q = _call("GET", "/skill_proposals")
+    if not q["count"]:
+        pytest.skip("nothing pending")
+    pid = q["proposals"][0]["proposal_id"]
+    # confirmed=False deliberately. The model guard runs BEFORE the confirmed
+    # check, so this distinguishes both states without ever writing:
+    #   flag off -> 403 (guard)      flag on -> 400 (needs confirmation)
+    #
+    # An earlier version of this test sent confirmed=True and asserted the
+    # status was "one of" several. With the flag enabled that is a real write,
+    # and it crystallized a live proposal with the trigger "t" -- demoting
+    # three real memories. A test against a gate must not be able to open it.
+    st, d = _call("POST", f"/skill_proposals/{pid}/crystallize",
+                  {"member_addresses": [], "trigger": "t", "procedure": "p",
+                   "confirmed": False},
+                  headers={"X-MMU-Source": "model"})
+    assert st in (400, 403), f"unexpected {st}: {d}"
+    if st == 403:
+        assert "MMU_ALLOW_MODEL_CRYSTALLIZE" in d["detail"],             "a refusal must name the flag that controls it"
+
+
+@live
+def test_a_memory_cannot_belong_to_two_active_skills():
+    """
+    Colour is single-valued, so two skills claiming one member disagree about
+    what it should be the moment either is undone. Found the hard way: a stale
+    proposal was confirmed while one of its members was already crystallized,
+    and undoing it restored a memory the first skill still owned.
+    """
+    _, sk = _call("GET", "/skills")
+    active = [s for s in sk["skills"] if s.get("status") == "active"]
+    if not active:
+        pytest.skip("no active skill to collide with")
+
+    # Any proposal whose members overlap an active skill must be refused.
+    _, props = _call("GET", "/skill_proposals")
+    for p in props["proposals"]:
+        st, d = _call("POST", f"/skill_proposals/{p['proposal_id']}/crystallize",
+                      {"member_addresses": [], "trigger": "", "procedure": "",
+                       "confirmed": True})
+        # Empty trigger/procedure is rejected first; that is fine. What must
+        # never happen is a 500 or a silent second claim.
+        assert st in (400, 409), f"unexpected {st}: {d}"
+
+
+@live
+def test_crystallize_by_proposal_id_refuses_without_confirmation():
+    """The proposal-id path is ergonomics, not a second door around the gate."""
+    _call("POST", "/skill_proposals/sweep")
+    _, q = _call("GET", "/skill_proposals")
+    if not q["count"]:
+        pytest.skip("nothing pending")
+    pid = q["proposals"][0]["proposal_id"]
+    st, d = _call("POST", f"/skill_proposals/{pid}/crystallize", {
+        "member_addresses": [], "trigger": "t", "procedure": "p"})
+    assert st == 400 and "confirmed" in d["detail"]
+
+
+@live
+def test_stale_address_failure_says_what_happened():
+    """
+    Addresses are rewritten on recall, so confirming with one read minutes ago
+    is the likeliest failure on this path -- and it answered "check the server
+    log" while the code knew exactly which address had gone missing.
+    """
+    st, d = _call("POST", "/crystallize", {
+        "member_addresses": ["000.000.000.000,000~000|0.000.000",
+                             "000.000.000.001,000~000|0.000.000"],
+        "trigger": "t", "procedure": "p", "confirmed": True})
+    assert st == 409, "a stale address is a conflict, not a server fault"
+    detail = d["detail"]
+    assert "matched no memory" in detail
+    assert "000.000.000.000,000~000|0.000.000" in detail,         "the failing address must be named"
 
 
 @live

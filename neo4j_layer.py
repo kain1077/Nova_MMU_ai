@@ -18,8 +18,10 @@ Phase 4: self-correction via false_recall_count + reflection audit
 """
 
 import os
+import json
 import time
 import uuid
+import hashlib
 import logging
 from datetime import datetime
 from difflib import SequenceMatcher
@@ -94,6 +96,11 @@ CONSTRAINTS = [
     "CREATE CONSTRAINT creative_out  IF NOT EXISTS FOR (c:CreativeOutput) REQUIRE c.output_id IS UNIQUE",
     # Phase 12 -- Skill nodes (procedural memory crystallization)
     "CREATE CONSTRAINT skill_id      IF NOT EXISTS FOR (sk:Skill) REQUIRE sk.skill_id IS UNIQUE",
+    # Phase 13.1 -- queued crystallization proposals awaiting human review.
+    # member_key is unique so a repeated sweep MERGEs onto the same proposal
+    # instead of stacking duplicates of a cluster that is simply still dense.
+    "CREATE CONSTRAINT proposal_id   IF NOT EXISTS FOR (p:SkillProposal) REQUIRE p.proposal_id IS UNIQUE",
+    "CREATE CONSTRAINT proposal_key  IF NOT EXISTS FOR (p:SkillProposal) REQUIRE p.member_key IS UNIQUE",
 ]
 
 INDEXES = [
@@ -1169,9 +1176,11 @@ def fetch_payloads(addresses):
 # mirroring declarative memory becoming procedural. Source memories are never
 # deleted -- they are demoted to Blue and become the skill's root system.
 #
-# TWO-STEP BY DESIGN, and the split is structural rather than conventional:
+# THREE-STEP BY DESIGN, and the split is structural rather than conventional:
 #
 #   find_skill_candidates()  reads. Writes nothing. Safe to poll.
+#   queue_skill_proposals()  writes SkillProposal nodes only. Never touches a
+#                            Memory node. Safe for the idle daemon.
 #   crystallize_skill()      writes, atomically, and only on explicit human
 #                            confirmation.
 #
@@ -1179,22 +1188,143 @@ def fetch_payloads(addresses):
 # capability beside it. Getting it wrong is not a bug, it is an identity-model
 # change nobody approved. crystallize_skill() is deliberately NOT reachable
 # from mmu_idle_daemon.py's IDLE_TOOLS.
+#
+# ── Phase 13.1: two bugs that made crystallization unreachable ──
+#
+# Symptom: 999 memories, 724 co-recall edges, zero Skill nodes ever formed.
+#
+# 1. DOCUMENTS WERE EXCLUDED. This function carried `src_type <> 2`, copied
+#    from get_anticipated_context() where it is correct -- a paragraph of a
+#    physics paper is not a thing to be proactively *reminded* of, and that
+#    filter stays exactly where it is. The reasoning does not survive
+#    the trip. Crystallization is the opposite operation, and compressing a
+#    large reference corpus into one procedural node is exactly what a graph
+#    of 861 documents needs. The filter made 86% of memories permanently
+#    ineligible, so the densest region of the graph could never form a skill
+#    and stayed as hundreds of flat memories competing in every recall. That
+#    is a retrieval bias with a structural cause, not a tuning problem.
+#
+# 2. WEIGHTS WERE NORMALIZED AGAINST THE GRAPH MAXIMUM. That maximum is one
+#    hot edge, and it lives in whichever source class is recalled most often
+#    (conversation, observed at weight 34, against a document-to-document
+#    maximum of 9). Every population was being measured with a yardstick
+#    borrowed from another one. Worse, it was anti-scaling: each recall of the
+#    hottest pair raised the bar for every other cluster, so the system grew
+#    *less* able to crystallize the more it was used.
+#
+# The fix for (2) is a high percentile instead of the max -- it describes the
+# top of the real distribution, barely moves when one pair gets hammered, and
+# stays stable as the graph grows -- with an absolute floor underneath it so a
+# young graph still cannot manufacture a candidate out of noise.
+
+# Reference point for weight normalization. Deliberately not max().
+SKILL_NORM_PERCENTILE = 0.90
+
+# Absolute floor, applied under the normalized one. On a young or sparse graph
+# p90 can itself be 1-2, and 0.6 * that would admit noise. A pair that has not
+# been co-recalled at least this often is not evidence of anything, whatever
+# the rest of the distribution happens to look like.
+SKILL_MIN_ABS_WEIGHT = 3.0
 
 
-def find_skill_candidates(min_cluster=3, min_pairwise_norm=0.6, limit=10):
+def skill_weight_floor(min_pairwise_norm=0.6):
+    """
+    The co-recall weight a pair must clear to count toward a skill cluster.
+
+    Returns (floor, reference_weight, basis) where reference_weight is the
+    percentile the floor came from and basis names which of the two rules
+    actually bound. Callers report these rather than a bare number, so a
+    "no candidates" answer can be read as evidence instead of a shrug.
+    """
+    driver = get_driver()
+    if driver is None:
+        return SKILL_MIN_ABS_WEIGHT, 0.0, "absolute"
+    try:
+        with driver.session() as s:
+            rec = s.run("""
+                MATCH ()-[r:CO_RECALLED]-()
+                RETURN percentileCont(r.weight, $p) AS ref
+            """, p=float(SKILL_NORM_PERCENTILE)).single()
+            ref = float((rec and rec["ref"]) or 0.0)
+    except Exception as e:
+        log.warning(f"skill_weight_floor failed, using absolute floor: {e}")
+        return SKILL_MIN_ABS_WEIGHT, 0.0, "absolute"
+
+    scaled = float(min_pairwise_norm) * ref
+    if scaled >= SKILL_MIN_ABS_WEIGHT:
+        return scaled, ref, "percentile"
+    return SKILL_MIN_ABS_WEIGHT, ref, "absolute"
+
+
+def find_skill_candidates(min_cluster=3, min_pairwise_norm=0.6, limit=10,
+                          max_per_domain=2, max_member_reuse=2):
     """
     Clusters where EVERY pair is densely co-recalled -- not merely anchored on
     one popular node.
 
-    The preview queries in get_insights() and get_idle_context() answer a
-    different question: "which single memory has strong neighbours." That is
-    the right shape for showing a preview and the wrong shape for deciding to
-    crystallize, because a hub with many weak-to-each-other neighbours would
-    qualify while not being a coherent skill at all. This checks mutual
-    density: all pairs among the candidate set clear the floor.
+    The previews in get_insights() and get_idle_context() used to answer a
+    different question ("which single memory has strong neighbours"), which is
+    the right shape for a preview and the wrong shape for deciding to
+    crystallize: a hub with many weak-to-each-other neighbours would qualify
+    while not being a coherent skill at all. Both previews now call this
+    function, so the three code paths cannot drift apart again -- they had,
+    and /insights was advertising candidates this function could never return.
 
-    Weights are normalized against the graph maximum, so min_pairwise_norm is
-    on a 0-1 scale and means the same thing as skill_score elsewhere.
+    min_pairwise_norm is on a 0-1 scale against the p90 co-recall weight, not
+    the maximum. See the block comment above for why that distinction is the
+    difference between a system that can crystallize and one that cannot.
+
+    Documents are eligible. A cluster of reference chunks that are always
+    recalled together is the clearest case for compression there is; every
+    candidate reports src_mix so a reviewer can see what it is made of.
+
+    RANKING IS DONE IN THE QUERY, on the same score the caller sees. It used to
+    ORDER BY raw avg_weight and LIMIT before Python scored anything, which is
+    the max-normalization bug one layer down: raw weight is dominated by
+    whichever source class is recalled most, so the hottest corner of the graph
+    filled every slot and no document cluster ever reached the scoring step.
+
+    THREE SIGNALS, because the first two can both be satisfied by a cluster
+    that means nothing:
+
+      avg_weight_norm     they are recalled together (structural evidence)
+      grp_coherence       they share a GRP domain (filing evidence)
+      semantic_coherence  they are actually about the same thing
+
+    The third was added after a real review: a candidate scored grp_coherence
+    1.0 on nothing but arithmetic -- game design, an assistant's gender
+    identity, and a user's self-description all happen to be filed under 5xx.
+    GRP agreement is a statement about where things were filed, not about what
+    they say. Cosine over the embeddings that already exist on every node
+    answers the question the GRP code was being asked to stand in for.
+
+    Neo4j normalizes cosine to [0,1] with 0.5 = orthogonal, so it is rescaled
+    to a real 0-1 here. When any member lacks an embedding, semantic_coherence
+    is None and the score falls back to the two structural signals, with
+    scored_without_embeddings set so that is visible rather than silent.
+
+    Two caps shape the returned set, because a review queue is an attention
+    budget:
+
+      max_per_domain    one GRP domain may not own the queue. A graph that is
+                        87% one subject would otherwise propose only that
+                        subject forever -- the retrieval bias reproducing
+                        itself in the review list.
+      max_member_reuse  one memory may not appear in more than N proposals.
+                        Overlapping triangles drawn from the same four hot
+                        memories filled 4 of 10 slots with what a reviewer
+                        reads as the same finding four times.
+
+    Neither cap costs coverage: if capping would return fewer than `limit`,
+    the leftovers are filled back in by score order. Set either to 0 to
+    disable. Nothing is ever excluded outright -- this phase exists because a
+    silent structural exclusion went unnoticed for two phases.
+
+    Triangles are the unit: a mutually-dense triple is the smallest cluster
+    that can be evidence of anything. min_cluster above 3 therefore returns
+    nothing rather than a padded triangle -- growing a cluster past a triple
+    is not implemented, and quietly returning three members for a request of
+    five would be a lie about what was found.
 
     Returns [] when nothing qualifies. On a young graph that is the expected
     answer, not a failure -- do not lower the threshold to manufacture one.
@@ -1203,32 +1333,74 @@ def find_skill_candidates(min_cluster=3, min_pairwise_norm=0.6, limit=10):
     if driver is None:
         return []
     try:
-        with driver.session() as s:
-            rec = s.run("MATCH ()-[r:CO_RECALLED]-() RETURN max(r.weight) AS mx").single()
-            max_w = float((rec and rec["mx"]) or 0.0) or 1.0
-            floor = float(min_pairwise_norm) * max_w
+        floor, ref_w, _basis = skill_weight_floor(min_pairwise_norm)
+        if ref_w <= 0:
+            return []
 
-            # Triangles first: the smallest cluster that can be mutually dense.
-            # Larger clusters are grown from a qualifying triangle rather than
-            # enumerated combinatorially, which would explode on a 954-node graph.
+        # Sample generously, then apply the caps in Python. The query already
+        # sorts by score, so this is headroom for the caps rather than a
+        # second ranking pass.
+        sample = max(int(limit) * 20, 200)
+
+        with driver.session() as s:
             rows = s.run("""
                 MATCH (a:Memory)-[r1:CO_RECALLED]-(b:Memory)-[r2:CO_RECALLED]-(c:Memory)
                 MATCH (a)-[r3:CO_RECALLED]-(c)
                 WHERE a.address < b.address AND b.address < c.address
                   AND r1.weight >= $floor AND r2.weight >= $floor AND r3.weight >= $floor
                   AND a.color <> 'Blue' AND b.color <> 'Blue' AND c.color <> 'Blue'
-                  AND a.src_type <> 2 AND b.src_type <> 2 AND c.src_type <> 2
-                RETURN [a.address, b.address, c.address] AS members,
-                       (r1.weight + r2.weight + r3.weight) / 3.0 AS avg_weight,
-                       [a.payload, b.payload, c.payload] AS payloads,
-                       [toInteger(split(a.address,'.')[2]),
-                        toInteger(split(b.address,'.')[2]),
-                        toInteger(split(c.address,'.')[2])] AS grps
-                ORDER BY avg_weight DESC
+                WITH a, b, c,
+                     (r1.weight + r2.weight + r3.weight) / 3.0        AS avg_weight,
+                     toInteger(split(a.address, '.')[2])              AS ga,
+                     toInteger(split(b.address, '.')[2])              AS gb,
+                     toInteger(split(c.address, '.')[2])              AS gc
+                // Mean pairwise cosine. Null if any member lacks an embedding,
+                // which the caller reports rather than papering over.
+                WITH a, b, c, avg_weight, ga, gb, gc,
+                     (vector.similarity.cosine(a.embedding, b.embedding) +
+                      vector.similarity.cosine(b.embedding, c.embedding) +
+                      vector.similarity.cosine(a.embedding, c.embedding)) / 3.0 AS sim_raw
+                // Whole-cluster agreement on a GRP domain. For a triple this is
+                // exactly max(domain count) / 3.
+                WITH a, b, c, avg_weight, ga, gb, gc, sim_raw,
+                     CASE WHEN ga / 100 = gb / 100 AND gb / 100 = gc / 100 THEN 1.0
+                          WHEN ga / 100 = gb / 100
+                            OR gb / 100 = gc / 100
+                            OR ga / 100 = gc / 100 THEN 0.6667
+                          ELSE 0.3333 END                             AS coherence,
+                     // Clamped: a pair far above p90 is not "better than
+                     // perfect", and letting it exceed 1.0 is what made the
+                     // documented ">= 0.70 proposes" threshold meaningless.
+                     CASE WHEN avg_weight / $ref > 1.0 THEN 1.0
+                          ELSE avg_weight / $ref END                  AS avg_norm
+                // Rescale off Neo4j's 0.5-is-orthogonal convention.
+                WITH a, b, c, avg_weight, ga, gb, gc, coherence, avg_norm,
+                     CASE WHEN sim_raw IS NULL THEN null
+                          WHEN (sim_raw - 0.5) * 2 < 0 THEN 0.0
+                          WHEN (sim_raw - 0.5) * 2 > 1 THEN 1.0
+                          ELSE (sim_raw - 0.5) * 2 END                AS semantic
+                RETURN [a.address, b.address, c.address]              AS members,
+                       // Stable identity. Addresses encode the use and arc
+                       // counters and are rewritten in place as a memory is
+                       // recalled, so they cannot key anything that outlives
+                       // the moment. created_at is written once.
+                       [a.created_at, b.created_at, c.created_at]     AS member_created,
+                       avg_weight,
+                       avg_norm,
+                       coherence,
+                       semantic,
+                       CASE WHEN semantic IS NULL
+                            THEN (avg_norm * 0.5) + (coherence * 0.5)
+                            ELSE (avg_norm * 0.4) + (coherence * 0.3)
+                               + (semantic * 0.3) END                 AS skill_score,
+                       [a.payload, b.payload, c.payload]              AS payloads,
+                       [a.src_type, b.src_type, c.src_type]           AS src_types,
+                       [ga, gb, gc]                                   AS grps
+                ORDER BY skill_score DESC, avg_weight DESC
                 LIMIT $lim
-            """, floor=floor, lim=int(limit) * 3)
+            """, floor=floor, ref=float(ref_w), lim=sample)
 
-            out, seen = [], set()
+            scored, seen = [], set()
             for r in rows:
                 members = list(r["members"])
                 if len(members) < int(min_cluster):
@@ -1239,27 +1411,55 @@ def find_skill_candidates(min_cluster=3, min_pairwise_norm=0.6, limit=10):
                 seen.add(key)
 
                 grps = [g for g in (r["grps"] or []) if g is not None]
-                # Coherence here is whole-cluster agreement on a GRP domain,
-                # not the neighbour-fraction the preview queries compute. A
-                # skill spanning four domains is not a skill.
                 domains = [g // 100 for g in grps]
-                coherence = (max(domains.count(d) for d in set(domains)) / len(domains)) if domains else 0.0
-                avg_norm = float(r["avg_weight"] or 0.0) / max_w
+                # The cluster's own domain, for the cap: whichever domain most
+                # of its members belong to.
+                dom = max(set(domains), key=domains.count) if domains else None
 
-                out.append({
-                    "members":       members,
-                    "avg_weight":    round(float(r["avg_weight"] or 0.0), 3),
-                    "avg_weight_norm": round(avg_norm, 4),
-                    "grp_coherence": round(coherence, 3),
-                    "skill_score":   round((avg_norm * 0.5) + (coherence * 0.5), 4),
-                    "grps":          grps,
-                    "previews":      [(p or "")[:90] for p in (r["payloads"] or [])],
-                })
-                if len(out) >= int(limit):
-                    break
+                src_mix = {}
+                for t in (r["src_types"] or []):
+                    if t is None:
+                        continue
+                    label = SOURCE_LABELS.get(t, f"Type-{t}")
+                    src_mix[label] = src_mix.get(label, 0) + 1
 
-            out.sort(key=lambda d: -d["skill_score"])
-            return out
+                sem = r["semantic"]
+                scored.append((dom, members, {
+                    "members":            members,
+                    "member_created":     [t for t in (r["member_created"] or []) if t],
+                    "avg_weight":         round(float(r["avg_weight"] or 0.0), 3),
+                    "avg_weight_norm":    round(float(r["avg_norm"] or 0.0), 4),
+                    "grp_coherence":      round(float(r["coherence"] or 0.0), 3),
+                    "semantic_coherence": (round(float(sem), 3) if sem is not None else None),
+                    "scored_without_embeddings": sem is None,
+                    "skill_score":        round(float(r["skill_score"] or 0.0), 4),
+                    "grps":               grps,
+                    "domain":             dom,
+                    "src_mix":            src_mix,
+                    "previews":           [(p or "")[:90] for p in (r["payloads"] or [])],
+                }))
+
+        limit = int(limit)
+        out, used_dom, used_mem, overflow = [], {}, {}, []
+        for dom, members, cand in scored:          # already in score order
+            dom_ok = (not max_per_domain) or used_dom.get(dom, 0) < int(max_per_domain)
+            mem_ok = (not max_member_reuse) or all(
+                used_mem.get(m, 0) < int(max_member_reuse) for m in members
+            )
+            if dom_ok and mem_ok:
+                out.append(cand)
+                used_dom[dom] = used_dom.get(dom, 0) + 1
+                for m in members:
+                    used_mem[m] = used_mem.get(m, 0) + 1
+            else:
+                overflow.append(cand)
+            if len(out) >= limit:
+                break
+
+        # The caps trim breadth, never depth.
+        if len(out) < limit:
+            out.extend(overflow[:limit - len(out)])
+        return out
     except Exception as e:
         log.warning(f"find_skill_candidates failed: {e}")
         return []
@@ -1274,11 +1474,22 @@ def crystallize_skill(member_addresses, trigger, procedure, confidence=0.0):
     the skill's root system, and a memory that has been compressed is still the
     evidence the compression was drawn from.
 
-    Returns the skill dict, or None on failure with nothing half-applied.
+    Returns (skill_dict, None) on success, or (None, reason) on failure with
+    nothing half-applied.
+
+    The reason is returned rather than logged and swallowed. This is the one
+    path in the system that only a human ever walks, and its most likely
+    failure is the least guessable: MMU addresses encode the use and arc
+    counters and are rewritten on recall, so a member address read from the
+    queue five minutes ago may already match nothing. "Check the server log"
+    is not an acceptable answer to that when the code knows exactly which
+    addresses went missing.
     """
     driver = get_driver()
-    if driver is None or not member_addresses:
-        return None
+    if driver is None:
+        return None, "no database connection"
+    if not member_addresses:
+        return None, "no member addresses given"
 
     skill_id = str(uuid.uuid4())
     now = datetime.now().isoformat()
@@ -1288,13 +1499,37 @@ def crystallize_skill(member_addresses, trigger, procedure, confidence=0.0):
             # back rather than leaving memories demoted with no Skill to show
             # for it.
             def _tx(tx):
-                found = tx.run("""
+                live = [r["a"] for r in tx.run("""
                     MATCH (m:Memory) WHERE m.address IN $addrs
-                    RETURN count(m) AS n
-                """, addrs=list(member_addresses)).single()["n"]
-                if found != len(member_addresses):
+                    RETURN m.address AS a
+                """, addrs=list(member_addresses))]
+                if len(live) != len(member_addresses):
+                    missing = [a for a in member_addresses if a not in live]
                     raise ValueError(
-                        f"expected {len(member_addresses)} members, matched {found}"
+                        f"{len(missing)} of {len(member_addresses)} member "
+                        f"addresses matched no memory: {', '.join(missing)}. "
+                        "MMU addresses are rewritten in place when a memory is "
+                        "recalled, so a stale address is the usual cause -- "
+                        "re-read GET /skill_proposals and use the addresses it "
+                        "returns now, or confirm by proposal_id instead."
+                    )
+
+                # A memory already compressed into an active Skill cannot be
+                # compressed into a second one. Colour is single-valued, so two
+                # skills claiming the same member disagree about what it should
+                # be the moment either is undone -- which is exactly how this
+                # was found: a stale proposal was confirmed twice, and undoing
+                # the second restored a member the first still owned.
+                taken = [r["a"] for r in tx.run("""
+                    MATCH (m:Memory)-[:PROCEDURALIZED_FROM]->(sk:Skill)
+                    WHERE m.address IN $addrs AND sk.status <> 'deprecated'
+                    RETURN DISTINCT m.address AS a
+                """, addrs=list(member_addresses))]
+                if taken:
+                    raise ValueError(
+                        f"{len(taken)} member(s) already belong to an active "
+                        f"skill: {', '.join(taken)}. Uncrystallize that skill "
+                        "first, or drop these members from the cluster."
                     )
 
                 tx.run("""
@@ -1310,7 +1545,14 @@ def crystallize_skill(member_addresses, trigger, procedure, confidence=0.0):
                     MATCH (sk:Skill {skill_id: $sid})
                     MATCH (m:Memory) WHERE m.address IN $addrs
                     MERGE (m)-[:PROCEDURALIZED_FROM]->(sk)
-                    SET m.color = 'Blue'
+                    // Remember what this was before demoting it. Members here
+                    // are a mix of colours -- Green and Yellow in the first
+                    // real crystallization -- so an undo that assumed one
+                    // would corrupt the aging state of the rest. coalesce
+                    // keeps the ORIGINAL colour if this memory was somehow
+                    // demoted once before.
+                    SET m.pre_skill_color = coalesce(m.pre_skill_color, m.color),
+                        m.color           = 'Blue'
                 """, sid=skill_id, addrs=list(member_addresses))
 
                 # Clear any proposal marker for these members.
@@ -1327,10 +1569,116 @@ def crystallize_skill(member_addresses, trigger, procedure, confidence=0.0):
             "skill_id": skill_id, "trigger": trigger, "procedure": procedure,
             "confidence": float(confidence), "status": "active",
             "created_at": now, "members": list(member_addresses),
-        }
+        }, None
     except Exception as e:
         log.warning(f"crystallize_skill failed (nothing applied): {e}")
-        return None
+        return None, str(e)
+
+
+def uncrystallize_skill(skill_id):
+    """
+    Reverse a crystallization: delete the Skill and restore its members.
+
+    Returns (info, None) on success or (None, reason) on failure, with nothing
+    half-applied.
+
+    This exists because crystallization is the one operation in the system that
+    restructures memory rather than adding to it, and it was the one operation
+    with no way back. deprecate_skill() marks a Skill dead but leaves every
+    member sitting in Blue, which is the state the recall gate treats as
+    inactive -- so a skill judged wrong afterwards left its evidence buried.
+
+    Refuses while another skill extends this one, for the same reason
+    deprecate_skill() does: a live child pointing at a deleted parent is a
+    broken tree, and silently orphaning it would be worse than refusing.
+
+    Members are restored to pre_skill_color. A member crystallized before that
+    property existed has no recorded colour and is restored to Green, reported
+    in colors_guessed so the caller can say so rather than imply precision it
+    does not have.
+    """
+    driver = get_driver()
+    if driver is None:
+        return None, "no database connection"
+    try:
+        with driver.session() as s:
+            rec = s.run("""
+                MATCH (sk:Skill {skill_id: $sid}) RETURN sk.trigger AS trigger
+            """, sid=skill_id).single()
+            if not rec:
+                return None, "no such skill"
+
+            blockers = [r["cid"] for r in s.run("""
+                MATCH (child:Skill)-[:EXTENDS_SKILL]->(sk:Skill {skill_id: $sid})
+                WHERE child.status <> 'deprecated'
+                RETURN child.skill_id AS cid
+            """, sid=skill_id)]
+            if blockers:
+                return None, (f"{len(blockers)} active child skill(s) still extend "
+                              f"this one: {', '.join(blockers)}")
+
+            def _tx(tx):
+                # Only members that this skill alone owns get restored. One
+                # still compressed into another active skill stays Blue and
+                # keeps its recorded colour -- restoring it would contradict
+                # the skill that still claims it.
+                rows = [dict(r) for r in tx.run("""
+                    MATCH (m:Memory)-[:PROCEDURALIZED_FROM]->(sk:Skill {skill_id: $sid})
+                    OPTIONAL MATCH (m)-[:PROCEDURALIZED_FROM]->(other:Skill)
+                    WHERE other.skill_id <> $sid AND other.status <> 'deprecated'
+                    WITH m, count(other) AS others
+                    RETURN m.address AS address,
+                           m.pre_skill_color AS pre,
+                           m.pre_skill_color IS NULL AS guessed,
+                           others > 0 AS still_owned
+                """, sid=skill_id)]
+
+                keep = [r["address"] for r in rows if r["still_owned"]]
+                restore = [r["address"] for r in rows if not r["still_owned"]]
+
+                if restore:
+                    tx.run("""
+                        MATCH (m:Memory) WHERE m.address IN $addrs
+                        SET m.color = coalesce(m.pre_skill_color, 'Green')
+                        REMOVE m.pre_skill_color
+                    """, addrs=restore)
+
+                tx.run("""
+                    MATCH (m:Memory)-[r:PROCEDURALIZED_FROM]->(sk:Skill {skill_id: $sid})
+                    DELETE r
+                """, sid=skill_id)
+
+                rows = [dict(r, kept=(r["address"] in keep)) for r in rows]
+
+                # Reopen the proposal so the cluster returns to review rather
+                # than vanishing: undoing a crystallization is a statement that
+                # the skill was wrong, not that the pattern was imaginary.
+                tx.run("""
+                    MATCH (p:SkillProposal {skill_id: $sid})
+                    SET p.status      = 'pending',
+                        p.skill_id    = null,
+                        p.reviewed_at = null
+                """, sid=skill_id)
+
+                tx.run("MATCH (sk:Skill {skill_id: $sid}) DETACH DELETE sk", sid=skill_id)
+                return rows
+
+            restored = s.execute_write(_tx)
+
+        log.info("Uncrystallized skill %s; restored %d memories", skill_id, len(restored))
+        return {
+            "skill_id": skill_id,
+            "trigger":  rec["trigger"],
+            "restored": [{"address": r["address"], "color": r["pre"] or "Green"}
+                         for r in restored if not r["kept"]],
+            # Left demoted on purpose: another active skill still owns these.
+            "still_demoted": [r["address"] for r in restored if r["kept"]],
+            "colors_guessed": [r["address"] for r in restored
+                               if r["guessed"] and not r["kept"]],
+        }, None
+    except Exception as e:
+        log.warning(f"uncrystallize_skill failed (nothing applied): {e}")
+        return None, str(e)
 
 
 def link_skills(child_id, parent_id):
@@ -1519,6 +1867,373 @@ def get_skills(status=None):
     except Exception as e:
         log.warning(f"get_skills failed: {e}")
         return []
+
+
+# ═════════════════════════════════════════════
+#  PHASE 13.1 — SKILL PROPOSAL QUEUE
+# ═════════════════════════════════════════════
+#
+# The human gate on crystallize_skill() is correct and stays. What it lacked
+# was a doorbell: nothing ever surfaced a candidate for review, so in practice
+# the gate was never approached and no skill was ever formed. find_skill_
+# candidates() is read-only and safe to poll, but a poll nobody runs proposes
+# nothing.
+#
+# A SkillProposal is a durable, deduplicated note that a cluster looked ready.
+# The daemon may create and refresh them. It may not act on them. Turning one
+# into a Skill still requires POST /crystallize with confirmed=true, which is
+# still a human decision -- the queue changes who does the noticing, not who
+# does the deciding.
+
+
+def _member_key(member_created):
+    """
+    Stable identity for a cluster, order-independent.
+
+    Keyed on created_at, NOT on address. An MMU address encodes the use and
+    arc counters, and mmu_server rewrites it in place every time a memory is
+    recalled or ages -- the same memory is 012.005.202.015 today and
+    012.005.202.017 after two recalls. Keying a durable queue on that gives a
+    fresh key for an unchanged cluster, so every sweep would re-queue what it
+    already had and the review list would fill with the same finding wearing
+    new numbers. created_at is written once at save and never updated.
+    """
+    joined = "|".join(sorted(str(t) for t in member_created))
+    return hashlib.sha1(joined.encode("utf-8")).hexdigest()
+
+
+def _created_for_addresses(session, member_addresses):
+    """Resolve current addresses to their immutable created_at stamps."""
+    rows = session.run("""
+        MATCH (m:Memory) WHERE m.address IN $addrs RETURN m.created_at AS t
+    """, addrs=list(member_addresses))
+    return [r["t"] for r in rows if r["t"]]
+
+
+# A review queue is an attention budget, not a log. The sweep runs after every
+# idle pass, and the graph shifts between passes, so without a ceiling the
+# pending list grows for as long as nobody reviews it -- and a queue of two
+# hundred proposals is functionally the same as the empty one this phase set
+# out to fix. Existing proposals still refresh at the ceiling; only new ones
+# wait for room.
+MAX_PENDING_PROPOSALS = 25
+
+
+def queue_skill_proposals(candidates=None, min_score=0.70, limit=10,
+                          max_pending=MAX_PENDING_PROPOSALS):
+    """
+    Write pending SkillProposal nodes for candidates that clear min_score.
+
+    Touches no Memory node and creates no Skill. The default min_score matches
+    the threshold the roadmap always documented for proposing; it finally
+    means something now that skill_score is clamped to 0-1.
+
+    A proposal already marked rejected is NOT resurrected. If a reviewer has
+    said no to a cluster, the sweep re-offering it every 20 minutes would be
+    nagging, not noticing. Scores on still-pending proposals are refreshed so
+    the queue reflects the current graph rather than the day it first fired.
+
+    Stops creating new proposals once max_pending are already waiting. The
+    ceiling is on unreviewed work, not on the graph: refreshes continue, and
+    reviewing or rejecting anything makes room immediately.
+
+    Returns {"created", "refreshed", "skipped_rejected", "deferred", "pending"}.
+    """
+    driver = get_driver()
+    if driver is None:
+        return {"created": 0, "refreshed": 0, "skipped_rejected": 0,
+                "deferred": 0, "pending": 0}
+
+    if candidates is None:
+        candidates = find_skill_candidates(limit=limit)
+
+    ranked = [c for c in candidates if float(c.get("skill_score", 0)) >= float(min_score)]
+    created = refreshed = skipped = deferred = 0
+    now = datetime.now().isoformat()
+
+    try:
+        with driver.session() as s:
+            pending_now = s.run("""
+                MATCH (p:SkillProposal {status: 'pending'}) RETURN count(p) AS n
+            """).single()["n"]
+
+            for c in ranked:
+                # Room check is per-candidate: rejecting something mid-sweep
+                # should let the next one through rather than wait a pass.
+                if pending_now >= int(max_pending):
+                    known = s.run("""
+                        MATCH (p:SkillProposal {member_key: $key}) RETURN count(p) AS n
+                    """, key=_member_key(c["member_created"])).single()["n"]
+                    if not known:
+                        deferred += 1
+                        continue
+                key = _member_key(c["member_created"])
+                rec = s.run("""
+                    MERGE (p:SkillProposal {member_key: $key})
+                    ON CREATE SET p.proposal_id   = $pid,
+                                  p.members       = $members,
+                                  p.member_created = $created,
+                                  p.status        = 'pending',
+                                  p.created_at    = $now,
+                                  p.updated_at    = $now,
+                                  p.reviewed_at   = null,
+                                  p.review_note   = '',
+                                  p.skill_id      = null,
+                                  p.skill_score   = $score,
+                                  p.avg_weight    = $avgw,
+                                  p.grp_coherence = $coh,
+                                  p.semantic_coherence = $sem,
+                                  p.grps          = $grps,
+                                  p.previews      = $previews,
+                                  p.src_mix       = $srcmix
+                    // Refresh scores on a still-pending proposal so the queue
+                    // reflects the graph now. Never touch status: a rejected
+                    // proposal that is still dense must stay rejected.
+                    // Addresses drift as members are recalled; refresh the
+                    // display copy so a reviewer never sees a stale one.
+                    ON MATCH SET  p.members       = CASE WHEN p.status = 'pending'
+                                                        THEN $members ELSE p.members END,
+                                  p.updated_at    = CASE WHEN p.status = 'pending'
+                                                        THEN $now ELSE p.updated_at END,
+                                  p.skill_score   = CASE WHEN p.status = 'pending'
+                                                        THEN $score ELSE p.skill_score END,
+                                  p.avg_weight    = CASE WHEN p.status = 'pending'
+                                                        THEN $avgw ELSE p.avg_weight END,
+                                  p.grp_coherence = CASE WHEN p.status = 'pending'
+                                                        THEN $coh ELSE p.grp_coherence END,
+                                  p.semantic_coherence = CASE WHEN p.status = 'pending'
+                                                        THEN $sem ELSE p.semantic_coherence END,
+                                  p.previews      = CASE WHEN p.status = 'pending'
+                                                        THEN $previews ELSE p.previews END,
+                                  p.src_mix       = CASE WHEN p.status = 'pending'
+                                                        THEN $srcmix ELSE p.src_mix END
+                    RETURN p.status AS status, p.created_at = $now AS is_new
+                """,
+                    key=key, pid=str(uuid.uuid4()), members=list(c["members"]),
+                    created=list(c["member_created"]),
+                    now=now, score=float(c.get("skill_score", 0.0)),
+                    avgw=float(c.get("avg_weight", 0.0)),
+                    coh=float(c.get("grp_coherence", 0.0)),
+                    sem=(float(c["semantic_coherence"])
+                         if c.get("semantic_coherence") is not None else None),
+                    grps=list(c.get("grps") or []),
+                    previews=list(c.get("previews") or []),
+                    # Neo4j stores no maps on properties; JSON keeps the mix
+                    # readable without inventing a node per source class.
+                    srcmix=json.dumps(c.get("src_mix") or {}),
+                ).single()
+
+                if rec and rec["is_new"]:
+                    created += 1
+                    pending_now += 1
+                elif rec and rec["status"] == "pending":
+                    refreshed += 1
+                else:
+                    skipped += 1
+
+            pending = s.run("""
+                MATCH (p:SkillProposal {status: 'pending'}) RETURN count(p) AS n
+            """).single()["n"]
+
+        if created:
+            log.info("Queued %d new skill proposal(s); %d refreshed, %d already rejected",
+                     created, refreshed, skipped)
+        if deferred:
+            log.info("Deferred %d proposal(s): %d already pending review (ceiling %d)",
+                     deferred, pending, max_pending)
+        return {"created": created, "refreshed": refreshed,
+                "skipped_rejected": skipped, "deferred": deferred,
+                "pending": pending}
+    except Exception as e:
+        log.warning(f"queue_skill_proposals failed: {e}")
+        return {"created": 0, "refreshed": 0, "skipped_rejected": 0,
+                "deferred": 0, "pending": 0}
+
+
+def get_skill_proposals(status="pending", limit=50):
+    """
+    List queued proposals, highest score first. status=None returns all.
+
+    Members are resolved live from created_at and re-ordered to match it.
+    Two reasons, both learned the hard way:
+
+      - Addresses drift. A proposal queued days ago stored addresses that have
+        since been rewritten by recall, and handing those to /crystallize would
+        MATCH nothing.
+      - collect() does not preserve the order of the list it was matched
+        against. Returning it as-is paired each address with another member's
+        preview, so the review screen confidently mislabelled which memory was
+        which -- the one failure mode a review step cannot have.
+
+    Payloads and GRPs are read live for the same reason: a preview captured at
+    queue time describes what the memory said then, and the reviewer is being
+    asked about now.
+    """
+    driver = get_driver()
+    if driver is None:
+        return []
+    try:
+        with driver.session() as s:
+            where = "WHERE p.status = $status" if status else ""
+            rows = s.run(f"""
+                MATCH (p:SkillProposal)
+                {where}
+                OPTIONAL MATCH (m:Memory) WHERE m.created_at IN p.member_created
+                WITH p, collect({{created_at: m.created_at,
+                                 address:    m.address,
+                                 payload:    m.payload,
+                                 color:      m.color,
+                                 grp: toInteger(split(m.address, '.')[2])}}) AS live
+                RETURN p.proposal_id    AS proposal_id,
+                       p.member_key     AS member_key,
+                       p.member_created AS member_created,
+                       live             AS live_members,
+                       p.status         AS status,
+                       p.skill_score    AS skill_score,
+                       p.avg_weight     AS avg_weight,
+                       p.grp_coherence  AS grp_coherence,
+                       p.semantic_coherence AS semantic_coherence,
+                       p.src_mix        AS src_mix,
+                       p.created_at     AS created_at,
+                       p.updated_at     AS updated_at,
+                       p.reviewed_at    AS reviewed_at,
+                       p.review_note    AS review_note,
+                       p.skill_id       AS skill_id
+                ORDER BY p.skill_score DESC, p.created_at ASC
+                LIMIT $lim
+            """, status=status, lim=int(limit))
+
+            out = []
+            for r in rows:
+                d = dict(r)
+                stamps = list(d.pop("member_created") or [])
+                live = [m for m in (d.pop("live_members") or []) if m.get("created_at")]
+
+                # Restore the order the cluster was queued in.
+                order = {t: i for i, t in enumerate(stamps)}
+                live.sort(key=lambda m: order.get(m["created_at"], len(order)))
+
+                d["members"]         = [m["address"] for m in live]
+                d["previews"]        = [(m.get("payload") or "")[:90] for m in live]
+                d["grps"]            = [m["grp"] for m in live if m.get("grp") is not None]
+                d["colors"]          = [m.get("color") for m in live]
+                d["members_missing"] = len(stamps) - len(live)
+
+                try:
+                    d["src_mix"] = json.loads(d.get("src_mix") or "{}")
+                except (TypeError, ValueError):
+                    d["src_mix"] = {}
+                out.append(d)
+            return out
+    except Exception as e:
+        log.warning(f"get_skill_proposals failed: {e}")
+        return []
+
+
+def reject_skill_proposal(proposal_id, note=""):
+    """
+    Mark a proposal rejected so later sweeps stop re-offering it.
+
+    Rejection is permanent by design: it is a judgement about the cluster, and
+    a sweep that could undo it would make the judgement pointless.
+    """
+    driver = get_driver()
+    if driver is None:
+        return False, "no database connection"
+    try:
+        with driver.session() as s:
+            rec = s.run("""
+                MATCH (p:SkillProposal {proposal_id: $pid})
+                RETURN p.status AS status
+            """, pid=proposal_id).single()
+            if not rec:
+                return False, "no such proposal"
+            if rec["status"] == "crystallized":
+                return False, "that proposal already became a skill"
+
+            s.run("""
+                MATCH (p:SkillProposal {proposal_id: $pid})
+                SET p.status      = 'rejected',
+                    p.reviewed_at = $now,
+                    p.review_note = $note,
+                    p.updated_at  = $now
+            """, pid=proposal_id, now=datetime.now().isoformat(),
+                 note=(note or ""))
+        return True, "rejected"
+    except Exception as e:
+        log.warning(f"reject_skill_proposal failed: {e}")
+        return False, str(e)
+
+
+def get_proposal_members(proposal_id):
+    """
+    Current addresses for a queued proposal, resolved from the immutable
+    created_at stamps. Returns (addresses, error).
+
+    This is what makes confirm-by-proposal-id safe: the addresses are read at
+    the moment of the write instead of being carried by the reviewer from a
+    listing that may be minutes stale.
+    """
+    driver = get_driver()
+    if driver is None:
+        return [], "no database connection"
+    try:
+        with driver.session() as s:
+            rec = s.run("""
+                MATCH (p:SkillProposal {proposal_id: $pid})
+                RETURN p.member_created AS stamps, p.status AS status
+            """, pid=proposal_id).single()
+            if not rec:
+                return [], "no such proposal"
+            if rec["status"] == "crystallized":
+                return [], "that proposal has already been crystallized"
+
+            stamps = list(rec["stamps"] or [])
+            addrs = [r["a"] for r in s.run("""
+                MATCH (m:Memory) WHERE m.created_at IN $stamps
+                RETURN m.address AS a
+            """, stamps=stamps)]
+            if len(addrs) != len(stamps):
+                return [], (f"{len(stamps) - len(addrs)} of {len(stamps)} source "
+                            "memories no longer exist; this proposal is stale")
+            return addrs, None
+    except Exception as e:
+        log.warning(f"get_proposal_members failed: {e}")
+        return [], str(e)
+
+
+def close_proposal_for_members(member_addresses, skill_id):
+    """
+    Close the loop after a human crystallizes: if the confirmed member set
+    matches a queued proposal, mark it crystallized so the sweep stops
+    proposing a cluster that already became a skill.
+
+    Best-effort. Crystallization has already committed by the time this runs,
+    and a bookkeeping failure must not be reported as a failed crystallization.
+    """
+    driver = get_driver()
+    if driver is None:
+        return False
+    try:
+        with driver.session() as s:
+            # /crystallize is given addresses; the queue is keyed on created_at.
+            created = _created_for_addresses(s, member_addresses)
+            if not created:
+                return False
+            res = s.run("""
+                MATCH (p:SkillProposal {member_key: $key})
+                SET p.status      = 'crystallized',
+                    p.skill_id    = $sid,
+                    p.reviewed_at = $now,
+                    p.updated_at  = $now
+                RETURN p.proposal_id AS pid
+            """, key=_member_key(created), sid=skill_id,
+                 now=datetime.now().isoformat()).single()
+        return bool(res)
+    except Exception as e:
+        log.warning(f"close_proposal_for_members failed (skill was created): {e}")
+        return False
+
 
 
 # ═════════════════════════════════════════════
@@ -2199,78 +2914,21 @@ def get_insights() -> dict:
         """):
             growth.append({"day": r["day"], "count": r["cnt"]})
 
-        # 8. Phase 11 preview: crystallization candidates
+        # 8. Crystallization candidates.
         #
-        # Composite skill_score:
-        #   avg_co_recall_weight * 0.35
-        #   + min(connections / 10, 1.0) * 0.40
-        #   + grp_coherence * 0.25
+        # Phase 13.1: this used to run its own query -- hub-shaped ("which
+        # memory has strong neighbours"), with no source or colour filter and
+        # its own scoring formula. find_skill_candidates() asks the question
+        # that actually decides crystallization (mutual density across every
+        # pair) and applies the real filters, and the two disagreed
+        # systematically: /insights advertised a physics candidate at 0.7957,
+        # above the documented propose-at-0.70 bar, that /skill_candidates was
+        # structurally incapable of ever returning. Reporting a candidate the
+        # confirm path cannot accept is worse than reporting none.
         #
-        # grp_coherence = fraction of direct CO_RECALLED neighbors
-        #                 sharing the same GRP code as the candidate node.
-        # Threshold for human-confirmation proposal: skill_score >= 0.70
-
-        # Phase 12 fix: avg_weight is normalized against the observed maximum
-        # before scoring. It was used raw, and raw CO_RECALLED weights are
-        # unbounded integers (6.04 observed here), so skill_score routinely
-        # exceeded 1.0 -- 14 of 15 candidates did, topping out at 2.57. That
-        # made the roadmap's "propose at >= 0.70" threshold meaningless on this
-        # endpoint and made /insights disagree with /idle_prompt about the same
-        # candidates. get_idle_context() already normalized correctly; this is
-        # that formula, ported so both paths report the same thing.
-        _raw = [
-            {
-                "address":       r["address"],
-                "connections":   r["connections"] or 0,
-                "avg_weight":    r["avg_weight"] or 0.0,
-                "neighbor_grps": r["neighbor_grps"] or [],
-                "self_grp":      r["self_grp"] or 0,
-                "color":         r["color"],
-                "preview":       r["preview"] or "",
-            }
-            for r in session.run("""
-                MATCH (a:Memory)-[cr:CO_RECALLED]-(b:Memory)
-                WHERE cr.weight > 0.35
-                WITH a,
-                     count(cr)                                         AS connections,
-                     avg(cr.weight)                                    AS avg_weight,
-                     collect(toInteger(split(b.address, '.')[2]))      AS neighbor_grps
-                WHERE connections >= 2
-                RETURN a.address                              AS address,
-                       connections,
-                       round(avg_weight * 10000) / 10000      AS avg_weight,
-                       a.color                                AS color,
-                       toInteger(split(a.address, '.')[2])    AS self_grp,
-                       neighbor_grps,
-                       substring(a.payload, 0, 70)            AS preview
-                ORDER BY connections DESC, avg_weight DESC
-                LIMIT 15
-            """)
-        ]
-
-        max_w = max((c["avg_weight"] for c in _raw), default=0.0) or 1.0
-
-        crystal_candidates = []
-        for c in _raw:
-            neighbors = c["neighbor_grps"]
-            coherence = (
-                sum(1 for g in neighbors if g == c["self_grp"]) / len(neighbors)
-                if neighbors else 0.0
-            )
-            skill_score = ((c["avg_weight"] / max_w) * 0.35) \
-                          + (min(c["connections"] / 10.0, 1.0) * 0.40) \
-                          + (coherence * 0.25)
-            crystal_candidates.append({
-                "address":       c["address"],
-                "connections":   c["connections"],
-                "avg_weight":    c["avg_weight"],
-                "grp_coherence": round(coherence, 3),
-                "skill_score":   round(skill_score, 4),
-                "color":         c["color"],
-                "preview":       c["preview"],
-            })
-
-        crystal_candidates.sort(key=lambda x: x["skill_score"], reverse=True)
+        # One call, one answer. The endpoint is a preview of a real decision,
+        # so it previews the real decision.
+        crystal_candidates = find_skill_candidates(limit=10)
 
         # 9. Top keywords by frequency
         top_keywords = []
@@ -3000,50 +3658,13 @@ def get_idle_context(depth: str = "light") -> dict:
                     """)
                 }
 
-                # Crystallization preview -- normalized skill_score.
-                # Raw CO_RECALLED weights are integers (observed 1-21), so the
-                # avg_weight term is divided by the observed max before scoring.
-                raw = [
-                    {
-                        "address":       r["address"],
-                        "connections":   r["connections"] or 0,
-                        "avg_weight":    r["avg_weight"] or 0.0,
-                        "neighbor_grps": r["neighbor_grps"] or [],
-                        "self_grp":      r["self_grp"] or 0,
-                        "preview":       r["preview"] or "",
-                    }
-                    for r in s.run("""
-                        MATCH (a:Memory)-[cr:CO_RECALLED]-(b:Memory)
-                        WITH a, count(cr) AS connections, avg(cr.weight) AS avg_weight,
-                             collect(toInteger(split(b.address, '.')[2])) AS neighbor_grps
-                        WHERE connections >= 2
-                        RETURN a.address AS address,
-                               connections,
-                               avg_weight,
-                               neighbor_grps,
-                               toInteger(split(a.address, '.')[2]) AS self_grp,
-                               substring(a.payload, 0, 70) AS preview
-                        ORDER BY connections DESC
-                        LIMIT 10
-                    """)
-                ]
-                max_w = max((c["avg_weight"] for c in raw), default=0.0) or 1.0
-                candidates = []
-                for c in raw:
-                    nb = c["neighbor_grps"]
-                    coherence = (sum(1 for g in nb if g == c["self_grp"]) / len(nb)) if nb else 0.0
-                    score = ((c["avg_weight"] / max_w) * 0.35) \
-                            + (min(c["connections"] / 10.0, 1.0) * 0.40) \
-                            + (coherence * 0.25)
-                    candidates.append({
-                        "address":       c["address"],
-                        "connections":   c["connections"],
-                        "grp_coherence": round(coherence, 3),
-                        "skill_score":   round(score, 4),
-                        "preview":       c["preview"],
-                    })
-                candidates.sort(key=lambda x: x["skill_score"], reverse=True)
-                ctx["crystallization_candidates"] = candidates
+                # Crystallization preview. Phase 13.1: same single source
+                # of truth as /insights and /skill_candidates. This path was
+                # the loosest of the three -- no weight floor at all, so any
+                # memory with two neighbours scored -- which meant Nova was
+                # being shown "candidates" during idle cognition that no
+                # confirm path would accept.
+                ctx["crystallization_candidates"] = find_skill_candidates(limit=10)
 
             # ── Deep only: prior artifacts, open threads, gaps ───────
             if depth == "deep":

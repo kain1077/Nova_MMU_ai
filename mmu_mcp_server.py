@@ -43,6 +43,10 @@ _SESSION_HEADERS = {"X-MMU-Session": _SESSION_ID}
 if _MMU_API_KEY:
     _SESSION_HEADERS["X-MMU-Key"] = _MMU_API_KEY
 
+# Whether the model is allowed to confirm a crystallization. Must be read
+# before TOOLS is built, since it decides whether that tool is offered.
+ALLOW_CRYSTALLIZE = os.environ.get("MMU_ALLOW_MODEL_CRYSTALLIZE", "false").lower() == "true"
+
 # ── Tool registry ─────────────────────────────────────
 
 TOOLS = [
@@ -221,6 +225,30 @@ TOOLS = [
         }
     },
     {
+        "name": "review_skills",
+        "description": (
+            "Read the pending skill-crystallization proposals: clusters of memories "
+            "the system has noticed are densely recalled together and semantically "
+            "related, which may be worth compressing into a single Skill. "
+            "Use when asked about skills, skill proposals, crystallization, what is "
+            "ready to crystallize, or what patterns are forming in memory. "
+            "READ ONLY -- this cannot crystallize, reject, or change anything. "
+            "Crystallizing demotes the source memories and requires the user's explicit "
+            "confirmation outside this tool."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "How many proposals to return, highest score first. Default 5.",
+                    "default": 5
+                }
+            },
+            "required": []
+        }
+    },
+    {
         "name": "rate_memory",
         "description": (
             "Express how a memory feels to you -- positive (like) or negative (dislike). "
@@ -273,6 +301,41 @@ TOOLS = [
         }
     }
 ]
+
+# Only offered when explicitly enabled. Crystallizing demotes its source
+# memories, so by default no tool here can do it and the user confirms through
+# mmu_review.py instead. See MODEL_MAY_CRYSTALLIZE in mmu_server.py -- the
+# server enforces this too, so removing the check here changes nothing.
+if ALLOW_CRYSTALLIZE:
+    TOOLS.append({
+        "name": "crystallize_skill",
+        "description": (
+            "Confirm a pending skill proposal, turning it into a Skill. "
+            "THIS IS A WRITE AND IT RESTRUCTURES MEMORY: the source memories are "
+            "compressed into the new Skill and DEMOTED to Blue, the state the "
+            "recall gate treats as inactive. Read the proposal with review_skills "
+            "first, say which memories will be demoted, and only proceed if the "
+            "compression is genuinely worth losing their individual recall. "
+            "Prefer leaving a proposal pending over crystallizing a doubtful one."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "proposal_id": {"type": "string",
+                                "description": "proposal_id from review_skills."},
+                "trigger":     {"type": "string",
+                                "description": "When this skill should fire. "
+                                               "A situation, not a topic."},
+                "procedure":   {"type": "string",
+                                "description": "What to actually do when it fires. "
+                                               "Concrete steps, not a summary of "
+                                               "the source memories."},
+                "confidence":  {"type": "number", "default": 0.7},
+            },
+            "required": ["proposal_id", "trigger", "procedure"],
+        },
+    })
+
 
 # ── MMU REST calls ────────────────────────────────────
 
@@ -335,6 +398,90 @@ def mmu_rate(address, val_type, intensity=5, emotion_label=None):
         return f"Rated '{val_type}'{label_str} (intensity {intensity}). Address updated: {old} -> {new}"
     except Exception as e:
         return f"[MMU rate error: {e}]"
+
+def mmu_skill_proposals(limit=5):
+    """
+    Read the crystallization review queue.
+
+    READ ONLY, and that is the whole design. Crystallizing demotes the source
+    memories to Blue -- it restructures memory rather than adding to it -- so
+    the confirm step is a human POST to /crystallize and is deliberately not
+    reachable from any tool exposed here. This tool exists so the queue can be
+    discussed, not actioned.
+    """
+    try:
+        r = requests.get(f"{MMU_BASE}/skill_proposals",
+                         params={"status": "pending", "limit": limit},
+                         headers=_SESSION_HEADERS, timeout=10)
+        data = r.json()
+        props = data.get("proposals", [])
+        if not props:
+            return ("No skill proposals are pending review. Clusters are queued "
+                    "automatically when they become dense and coherent enough; "
+                    "an empty queue means nothing currently clears the bar.")
+
+        lines = [f"{len(props)} skill proposal(s) awaiting the user's review:", ""]
+        for i, p in enumerate(props, 1):
+            sem = p.get("semantic_coherence")
+            sem_s = f"{sem:.2f}" if isinstance(sem, (int, float)) else "n/a"
+            mix = ", ".join(f"{v}x {k}" for k, v in sorted((p.get("src_mix") or {}).items()))
+            lines.append(
+                f"[{i}] score {p['skill_score']:.2f} "
+                f"(co-recall {p.get('avg_weight')}, domain {p.get('grp_coherence')}, "
+                f"meaning {sem_s}) | {mix}"
+            )
+            lines.append(f"    proposal_id: {p['proposal_id']}")
+            if p.get("members_missing"):
+                lines.append(f"    WARNING: {p['members_missing']} member(s) no longer exist")
+            for addr, prev in zip(p.get("members", []), p.get("previews", [])):
+                lines.append(f"    - {addr}")
+                lines.append(f"      {prev}")
+            lines.append("")
+
+        lines.append(
+            "These are proposals only. Nothing has been written. Crystallizing one "
+            "compresses its members into a Skill and DEMOTES them to Blue, which "
+            "changes how memory is structured -- so it needs the user's explicit "
+            "confirmation and cannot be done from this tool. You may read them, "
+            "argue for or against one, and draft the trigger and procedure text. "
+            "Say plainly which members would be demoted when you do."
+        )
+        return "\n".join(lines)
+    except Exception as e:
+        return f"[MMU skill proposals error: {e}]"
+
+
+def mmu_crystallize(proposal_id, trigger, procedure, confidence=0.7):
+    """
+    Confirm a queued proposal. Only reachable when MMU_ALLOW_MODEL_CRYSTALLIZE
+    is set; the server enforces the same flag independently.
+
+    Tagged X-MMU-Source: model so the server can tell who asked. That tag is
+    the point -- it means enabling this is a deliberate configuration rather
+    than something a client can decide for itself.
+    """
+    try:
+        r = requests.post(
+            f"{MMU_BASE}/skill_proposals/{proposal_id}/crystallize",
+            json={"member_addresses": [], "trigger": trigger,
+                  "procedure": procedure, "confidence": confidence,
+                  "confirmed": True},
+            headers={**_SESSION_HEADERS, "X-MMU-Source": "model"},
+            timeout=30,
+        )
+        data = r.json()
+        if r.status_code != 200:
+            return f"[MMU crystallize refused: {data.get('detail', r.status_code)}]"
+        return (
+            f"Crystallized skill {data['skill_id']} from {len(data['members'])} "
+            f"memories, which are now Blue.\n"
+            f"Trigger: {data['trigger']}\n"
+            f"This can be undone: POST /skills/{data['skill_id']}/uncrystallize"
+            f"?confirm=UNCRYSTALLIZE"
+        )
+    except Exception as e:
+        return f"[MMU crystallize error: {e}]"
+
 
 def mmu_health():
     try:
@@ -416,6 +563,22 @@ def handle(msg):
                 src_type=arguments.get("src_type", 1),
                 source_url=arguments.get("source_url"),
             )
+
+        elif name == "review_skills":
+            text = mmu_skill_proposals(limit=arguments.get("limit", 5))
+
+        elif name == "crystallize_skill":
+            if not ALLOW_CRYSTALLIZE:
+                text = ("Crystallization is not enabled for tool use. It demotes "
+                        "the source memories, so it is confirmed by a human "
+                        "through mmu_review.py.")
+            else:
+                text = mmu_crystallize(
+                    proposal_id = arguments.get("proposal_id", ""),
+                    trigger     = arguments.get("trigger", ""),
+                    procedure   = arguments.get("procedure", ""),
+                    confidence  = arguments.get("confidence", 0.7),
+                )
 
         elif name == "rate_memory":
             text = mmu_rate(

@@ -21,6 +21,25 @@ creative_outputs_export.json
 insights_before.json
 insights_after.json
 
+# The v2 index IS the memory, in plaintext. It normally lives on the Docker
+# volume, but a host-run instance writes it beside the code.
+memory_index_v2.json
+*_index_v2.json
+
+# ── Your documents ───────────────────────────────────
+# /ingest reads source material from here, and it is mounted read-only into the
+# container. Whatever you put in it is yours and is very unlikely to be
+# something you meant to publish -- unpublished papers, notes, client work.
+# The directory ships; its contents never do.
+documents/*
+!documents/.gitkeep
+
+# ── Nested repositories ──────────────────────────────
+# Another git repo inside this one is committed as a bare pointer, without any
+# of its files, which is almost never what anyone intends. Ignore it here and
+# keep it somewhere else.
+MMU_ai/
+
 # Benchmark output
 scratchpad/
 
