@@ -529,6 +529,63 @@ def test_a_crystallized_skill_is_actually_retrievable():
 
 
 @live
+def test_crystallize_can_create_a_branch():
+    """
+    Phase 13.2. link_skills() and POST /skills/{id}/link existed from Phase 13,
+    but nothing a model could reach exposed them, so "crystallize these as
+    branches off that skill" was not an instruction the system could carry out.
+    A tree built by remembering to call /link afterwards does not get built.
+    """
+    made = []
+    addrs = []
+    try:
+        for tag in ("parentprobe", "childprobe"):
+            pair = []
+            for n in ("one", "two"):
+                _, m = _call("POST", "/remember", {
+                    "keywords": [tag, n],
+                    "payload": f"{tag} {n}: a probe memory for tree tests.",
+                    "src_type": 1})
+                pair.append(m["address"])
+            addrs += pair
+            _, sk = _call("POST", "/crystallize", {
+                "member_addresses": pair,
+                "trigger": f"asked about {tag}",
+                "procedure": f"Handle {tag}.",
+                "confirmed": True,
+                "extends": made[0] if made else None})
+            made.append(sk["skill_id"])
+
+        # The child names its parent, and the tree reflects it.
+        _, skills = _call("GET", "/skills")
+        child = next(s for s in skills["skills"] if s["skill_id"] == made[1])
+        assert made[0] in (child.get("extends") or []),             "a skill created with extends= must actually be linked"
+
+        _, tree = _call("GET", f"/skill_tree?root={made[0]}")
+        kids = tree["tree"][0]["children"]
+        assert [k["skill_id"] for k in kids] == [made[1]]
+    finally:
+        for sid in reversed(made):
+            _call("POST", f"/skills/{sid}/uncrystallize?confirm=UNCRYSTALLIZE")
+        for addr in addrs:
+            _call("DELETE", f"/memories/{urllib.parse.quote(addr, safe='')}")
+
+
+@live
+def test_proposals_report_the_queue_not_the_page():
+    """
+    The review tool said "5 proposals awaiting review" while 17 were queued,
+    because it counted the page. Proposals are score-ordered, so one dense
+    corpus owned that page -- and the honest reading of the output was that
+    every proposal was about one topic, which was false.
+    """
+    st, d = _call("GET", "/skill_proposals?limit=1")
+    assert st == 200
+    assert "total" in d, "the queue size must be reported alongside the page"
+    assert d["total"] >= d["count"]
+
+
+@live
 def test_skill_reindex_is_safe_to_rerun():
     """Anything crystallized before Phase 13.2 has no embedding and no
     keywords; the backfill must be idempotent, not just present."""

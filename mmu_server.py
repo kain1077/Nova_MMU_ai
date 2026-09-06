@@ -334,6 +334,11 @@ class CrystallizeIn(BaseModel):
     procedure:        str
     confidence:       float = 0.0
     confirmed:        bool  = False   # must be explicitly true
+    # Phase 13.2: optional parent, so a branch can be created in one step.
+    # A tree built by remembering to call /link afterwards is a tree that
+    # mostly does not get built -- the first four skills anyone tried to
+    # branch off a root ended up with no edges at all.
+    extends:          Optional[str] = None
 
 
 class RecallIn(BaseModel):
@@ -543,6 +548,29 @@ def _skill_embedding_text(trigger, procedure):
     and it carries the most weight for matching.
     """
     return f"{trigger or ''}\n{procedure or ''}".strip()
+
+
+def _link_parent(skill_id, parent_id):
+    """
+    Attach a freshly created skill under a parent, if one was named.
+
+    Best-effort and reported rather than raised: the skill is already committed
+    and correct on its own, and a bad parent id should not look like a failed
+    crystallization. Returns the parent id on success, or a string explaining
+    why not, which the caller passes straight back so a wrong id is visible
+    instead of silently producing an orphan.
+    """
+    if not parent_id:
+        return None
+    try:
+        if n4j.link_skills(skill_id, parent_id):
+            return parent_id
+        return f"not linked: no skill with id {parent_id}"
+    except ValueError as e:
+        return f"not linked: {e}"
+    except Exception as e:
+        log.warning("link to parent %s failed for %s: %s", parent_id, skill_id, e)
+        return f"not linked: {e}"
 
 
 def _index_skill(skill_id, trigger, procedure):
@@ -1752,6 +1780,7 @@ def crystallize(body: CrystallizeIn, x_mmu_source: Optional[str] = Header(None))
 
     # Phase 13.2: a skill nothing can retrieve is a skill that does not exist.
     skill["indexed"] = _index_skill(skill["skill_id"], body.trigger, body.procedure)
+    skill["extends"] = _link_parent(skill["skill_id"], body.extends)
 
     return {"status": "crystallized", **skill}
 
@@ -1875,6 +1904,11 @@ def skill_proposals(status: Optional[str] = "pending", limit: int = 50):
     return {
         "proposals": props,
         "count":     len(props),
+        # The queue size, not the page size. A caller that reports len(props)
+        # as "the proposals" describes a page as if it were the whole queue --
+        # and since these are score-ordered, one dense corpus can own a page
+        # while the queue is far more varied.
+        "total":     n4j.count_skill_proposals(status=status),
         "note": ("Queued proposals only. Each still requires POST /crystallize "
                  "with confirmed=true to become a Skill."),
     }
@@ -1949,6 +1983,7 @@ def crystallize_proposal(proposal_id: str, body: CrystallizeIn,
 
     n4j.close_proposal_for_members(addrs, skill["skill_id"])
     skill["indexed"] = _index_skill(skill["skill_id"], body.trigger, body.procedure)
+    skill["extends"] = _link_parent(skill["skill_id"], body.extends)
     return {"status": "crystallized", "proposal_id": proposal_id, **skill}
 
 

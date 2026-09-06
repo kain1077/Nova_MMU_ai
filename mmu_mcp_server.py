@@ -22,6 +22,40 @@ import json
 import uuid
 import requests
 
+def _load_env_file():
+    """
+    Load .env from this file's directory into os.environ, without overriding
+    anything already set.
+
+    Every other component gets .env through docker-compose, which injects it
+    into the container. This one is a HOST process launched by the chat client,
+    so it never saw those variables -- MMU_ALLOW_MODEL_CRYSTALLIZE was set in
+    .env, read correctly by the container, and invisible here. The tool it
+    controls was silently never registered, which looks exactly like a model
+    declining to use it.
+
+    Real environment variables still win, so an MCP config that sets one
+    explicitly keeps working.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+    except FileNotFoundError:
+        pass
+    except Exception:
+        # A malformed .env must not stop the MCP server from starting; the
+        # defaults below are all still valid.
+        pass
+
+
+_load_env_file()
+
 MMU_BASE = os.environ.get("MMU_BASE", "http://127.0.0.1:8765")
 
 # Session bundle cached on initialize — returned by get_session_context
@@ -331,6 +365,13 @@ if ALLOW_CRYSTALLIZE:
                                                "Concrete steps, not a summary of "
                                                "the source memories."},
                 "confidence":  {"type": "number", "default": 0.7},
+                "extends":     {"type": "string",
+                                "description": "Optional skill_id of a parent "
+                                               "skill this one specialises. Use "
+                                               "it to build a tree: several "
+                                               "narrow skills branching off one "
+                                               "general one. Cycles and "
+                                               "self-links are rejected."},
             },
             "required": ["proposal_id", "trigger", "procedure"],
         },
@@ -399,15 +440,19 @@ def mmu_rate(address, val_type, intensity=5, emotion_label=None):
     except Exception as e:
         return f"[MMU rate error: {e}]"
 
-def mmu_skill_proposals(limit=5):
+def mmu_skill_proposals(limit=10):
     """
     Read the crystallization review queue.
 
-    READ ONLY, and that is the whole design. Crystallizing demotes the source
-    memories to Blue -- it restructures memory rather than adding to it -- so
-    the confirm step is a human POST to /crystallize and is deliberately not
-    reachable from any tool exposed here. This tool exists so the queue can be
-    discussed, not actioned.
+    Read-only. Whether confirming is reachable at all depends on
+    MMU_ALLOW_MODEL_CRYSTALLIZE; by default it is not, and the confirm step is
+    a human action through mmu_review.py.
+
+    Reports the queue TOTAL alongside what it shows. It previously said
+    "5 proposals awaiting review" while 17 were queued, because it counted the
+    page rather than the queue. The top of that page was six clusters from one
+    corpus, so the honest reading of the output was "all the proposals are
+    about one topic" -- which was false, and led to exactly that conclusion.
     """
     try:
         r = requests.get(f"{MMU_BASE}/skill_proposals",
@@ -420,7 +465,26 @@ def mmu_skill_proposals(limit=5):
                     "automatically when they become dense and coherent enough; "
                     "an empty queue means nothing currently clears the bar.")
 
-        lines = [f"{len(props)} skill proposal(s) awaiting the user's review:", ""]
+        total = data.get("total", len(props))
+        header = f"{len(props)} of {total} pending skill proposal(s)"
+        if total > len(props):
+            header += f" (highest-scoring first; ask for limit={total} to see all)"
+        lines = [header + ":", ""]
+
+        # Say so when one domain dominates the page. Proposals are ordered by
+        # score, and a dense single-topic corpus wins that ordering, so a page
+        # can be entirely one subject while the queue is not.
+        doms = {}
+        for p in props:
+            for g in (p.get("grps") or []):
+                doms[g // 100] = doms.get(g // 100, 0) + 1
+        if doms and max(doms.values()) / max(sum(doms.values()), 1) > 0.7:
+            top = max(doms, key=doms.get)
+            lines.append(
+                f"NOTE: this page is dominated by GRP {top}xx. That reflects "
+                f"score ordering, not the whole queue."
+            )
+            lines.append("")
         for i, p in enumerate(props, 1):
             sem = p.get("semantic_coherence")
             sem_s = f"{sem:.2f}" if isinstance(sem, (int, float)) else "n/a"
@@ -451,7 +515,7 @@ def mmu_skill_proposals(limit=5):
         return f"[MMU skill proposals error: {e}]"
 
 
-def mmu_crystallize(proposal_id, trigger, procedure, confidence=0.7):
+def mmu_crystallize(proposal_id, trigger, procedure, confidence=0.7, extends=None):
     """
     Confirm a queued proposal. Only reachable when MMU_ALLOW_MODEL_CRYSTALLIZE
     is set; the server enforces the same flag independently.
@@ -465,16 +529,23 @@ def mmu_crystallize(proposal_id, trigger, procedure, confidence=0.7):
             f"{MMU_BASE}/skill_proposals/{proposal_id}/crystallize",
             json={"member_addresses": [], "trigger": trigger,
                   "procedure": procedure, "confidence": confidence,
-                  "confirmed": True},
+                  "extends": extends, "confirmed": True},
             headers={**_SESSION_HEADERS, "X-MMU-Source": "model"},
             timeout=30,
         )
         data = r.json()
         if r.status_code != 200:
             return f"[MMU crystallize refused: {data.get('detail', r.status_code)}]"
+        ext = data.get("extends")
+        branch = ""
+        if ext and not str(ext).startswith("not linked"):
+            branch = f"Branched under parent skill {ext}.\n"
+        elif ext:
+            branch = f"WARNING: {ext}\n"
         return (
             f"Crystallized skill {data['skill_id']} from {len(data['members'])} "
             f"memories, which are now Blue.\n"
+            f"{branch}"
             f"Trigger: {data['trigger']}\n"
             f"This can be undone: POST /skills/{data['skill_id']}/uncrystallize"
             f"?confirm=UNCRYSTALLIZE"
@@ -578,6 +649,7 @@ def handle(msg):
                     trigger     = arguments.get("trigger", ""),
                     procedure   = arguments.get("procedure", ""),
                     confidence  = arguments.get("confidence", 0.7),
+                    extends     = arguments.get("extends"),
                 )
 
         elif name == "rate_memory":

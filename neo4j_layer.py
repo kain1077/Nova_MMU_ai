@@ -2348,6 +2348,22 @@ def get_skill_proposals(status="pending", limit=50):
         return []
 
 
+def count_skill_proposals(status="pending"):
+    """How many proposals exist, independent of any page limit."""
+    driver = get_driver()
+    if driver is None:
+        return 0
+    try:
+        with driver.session() as s:
+            where = "WHERE p.status = $status" if status else ""
+            rec = s.run(f"MATCH (p:SkillProposal) {where} RETURN count(p) AS n",
+                        status=status).single()
+            return int(rec["n"]) if rec else 0
+    except Exception as e:
+        log.warning(f"count_skill_proposals failed: {e}")
+        return 0
+
+
 def reject_skill_proposal(proposal_id, note=""):
     """
     Mark a proposal rejected so later sweeps stop re-offering it.
