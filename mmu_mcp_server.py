@@ -440,6 +440,40 @@ def mmu_rate(address, val_type, intensity=5, emotion_label=None):
     except Exception as e:
         return f"[MMU rate error: {e}]"
 
+def _existing_skills_block():
+    """
+    The skills that already exist, with FULL ids.
+
+    Needed because crystallize_skill takes an `extends` parent id and nothing
+    listed skills, so the only way to branch was to be handed an id from
+    outside the conversation. A tree cannot be built by someone who cannot see
+    it, and the ids shown in summaries are truncated, which matched nothing.
+
+    Also the fastest way to understand a 409 on crystallize: a proposal whose
+    members already belong to one of these cannot be crystallized again.
+    """
+    try:
+        r = requests.get(f"{MMU_BASE}/skill_tree", headers=_SESSION_HEADERS, timeout=10)
+        tree = r.json().get("tree", [])
+    except Exception:
+        return ""
+    if not tree:
+        return ""
+
+    out = ["Existing skills (use a skill_id as `extends` to branch under one):"]
+
+    def walk(node, depth):
+        out.append(f"  {'  ' * depth}{node['skill_id']}")
+        out.append(f"  {'  ' * depth}   {(node.get('trigger') or '')[:88]}")
+        for kid in node.get("children", []):
+            walk(kid, depth + 1)
+
+    for root in tree:
+        walk(root, 0)
+    out.append("")
+    return "\n".join(out) + "\n"
+
+
 def mmu_skill_proposals(limit=10):
     """
     Read the crystallization review queue.
@@ -454,6 +488,7 @@ def mmu_skill_proposals(limit=10):
     corpus, so the honest reading of the output was "all the proposals are
     about one topic" -- which was false, and led to exactly that conclusion.
     """
+    existing = _existing_skills_block()
     try:
         r = requests.get(f"{MMU_BASE}/skill_proposals",
                          params={"status": "pending", "limit": limit},
@@ -461,15 +496,17 @@ def mmu_skill_proposals(limit=10):
         data = r.json()
         props = data.get("proposals", [])
         if not props:
-            return ("No skill proposals are pending review. Clusters are queued "
+            return (existing +
+                    "No skill proposals are pending review. Clusters are queued "
                     "automatically when they become dense and coherent enough; "
                     "an empty queue means nothing currently clears the bar.")
 
         total = data.get("total", len(props))
+        lines_prefix = existing
         header = f"{len(props)} of {total} pending skill proposal(s)"
         if total > len(props):
             header += f" (highest-scoring first; ask for limit={total} to see all)"
-        lines = [header + ":", ""]
+        lines = [lines_prefix + header + ":", ""]
 
         # Say so when one domain dominates the page. Proposals are ordered by
         # score, and a dense single-topic corpus wins that ordering, so a page

@@ -572,6 +572,28 @@ def test_crystallize_can_create_a_branch():
 
 
 @live
+def test_skill_ids_accept_an_unambiguous_prefix():
+    """
+    Skill ids are UUIDs and are displayed truncated nearly everywhere -- tree
+    views, summaries, logs. Requiring all 36 characters made the one form
+    anybody actually has in front of them the one form that did not work, so a
+    branch became a second root.
+    """
+    _, skills = _call("GET", "/skills")
+    if len(skills["skills"]) < 1:
+        pytest.skip("no skills to resolve")
+    full = skills["skills"][0]["skill_id"]
+
+    # A prefix that matches nothing is an error, not a guess.
+    st, d = _call("POST", f"/skills/{full}/link?parent_id=zzzzzznope")
+    assert st == 404 and "no skill with id" in d["detail"]
+
+    # A self-link via prefix is still a self-link.
+    st, d = _call("POST", f"/skills/{full[:8]}/link?parent_id={full[:8]}")
+    assert st == 400, "prefix resolution must not defeat the self-link check"
+
+
+@live
 def test_proposals_report_the_queue_not_the_page():
     """
     The review tool said "5 proposals awaiting review" while 17 were queued,

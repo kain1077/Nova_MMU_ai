@@ -1899,6 +1899,44 @@ def get_skills_needing_index():
         return []
 
 
+def resolve_skill_id(value):
+    """
+    Accept a full skill_id or an unambiguous prefix. Returns (skill_id, error).
+
+    Skill ids are UUIDs and get displayed truncated almost everywhere -- tree
+    views, summaries, logs. Requiring the full 36 characters means the id
+    someone actually has in front of them is the one form that does not work,
+    which is how a branch ends up as a second root.
+
+    An ambiguous prefix is an error, never a guess: silently picking one of two
+    matching skills would attach a branch to the wrong parent.
+    """
+    value = (value or "").strip()
+    if not value:
+        return None, "no skill id given"
+    driver = get_driver()
+    if driver is None:
+        return None, "no database connection"
+    try:
+        with driver.session() as s:
+            hits = [r["sid"] for r in s.run("""
+                MATCH (sk:Skill)
+                WHERE sk.skill_id = $v OR sk.skill_id STARTS WITH $v
+                RETURN sk.skill_id AS sid
+                ORDER BY CASE WHEN sk.skill_id = $v THEN 0 ELSE 1 END
+                LIMIT 5
+            """, v=value)]
+        if not hits:
+            return None, f"no skill with id {value}"
+        if hits[0] == value or len(hits) == 1:
+            return hits[0], None
+        return None, (f"{len(hits)} skills start with {value}: "
+                      f"{', '.join(h[:12] for h in hits)}. Use more characters.")
+    except Exception as e:
+        log.warning(f"resolve_skill_id failed: {e}")
+        return None, str(e)
+
+
 def link_skills(child_id, parent_id):
     """
     Phase 13: child EXTENDS_SKILL parent.

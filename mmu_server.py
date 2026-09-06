@@ -562,9 +562,12 @@ def _link_parent(skill_id, parent_id):
     """
     if not parent_id:
         return None
+    resolved, why = n4j.resolve_skill_id(parent_id)
+    if not resolved:
+        return f"not linked: {why}"
     try:
-        if n4j.link_skills(skill_id, parent_id):
-            return parent_id
+        if n4j.link_skills(skill_id, resolved):
+            return resolved
         return f"not linked: no skill with id {parent_id}"
     except ValueError as e:
         return f"not linked: {e}"
@@ -1800,7 +1803,19 @@ def skill_tree(root: Optional[str] = None):
 
 @app.post("/skills/{skill_id}/link")
 def link_skill(skill_id: str, parent_id: str):
-    """Phase 13: make skill_id extend parent_id. Rejects self-links and cycles."""
+    """
+    Phase 13: make skill_id extend parent_id. Rejects self-links and cycles.
+
+    Both ids accept an unambiguous prefix, since the truncated form is what
+    anyone actually has in front of them.
+    """
+    child, why = n4j.resolve_skill_id(skill_id)
+    if not child:
+        raise HTTPException(404, why)
+    parent, why = n4j.resolve_skill_id(parent_id)
+    if not parent:
+        raise HTTPException(404, why)
+    skill_id, parent_id = child, parent
     try:
         ok = n4j.link_skills(skill_id, parent_id)
     except ValueError as e:
