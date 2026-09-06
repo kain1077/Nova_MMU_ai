@@ -52,6 +52,42 @@ def _load_env_file():
         # A malformed .env must not stop the MCP server from starting; the
         # defaults below are all still valid.
         pass
+# Modification time of this file as it was when Python imported it. Compared
+# against the file on disk at every tool call: if disk is newer, this process
+# is running code that no longer exists and the client has not been restarted.
+#
+# This process cannot reload itself -- the chat client owns its lifetime -- so
+# detection is the whole remedy. It is worth having because the failure is
+# otherwise completely silent: a tool added an hour ago is simply absent, and
+# the model looks like it is refusing to use it.
+try:
+    _SOURCE_PATH = os.path.abspath(__file__)
+    _SOURCE_MTIME = os.path.getmtime(_SOURCE_PATH)
+except Exception:
+    _SOURCE_PATH, _SOURCE_MTIME = None, None
+
+
+def _staleness_warning():
+    """A loud prefix when this process predates its own source file."""
+    if not _SOURCE_PATH or _SOURCE_MTIME is None:
+        return ""
+    try:
+        current = os.path.getmtime(_SOURCE_PATH)
+    except Exception:
+        return ""
+    if current <= _SOURCE_MTIME:
+        return ""
+    import datetime as _dt
+    edited = _dt.datetime.fromtimestamp(current).strftime("%Y-%m-%d %H:%M")
+    return (
+        "!! STALE MCP SERVER. This process loaded its code before "
+        f"{edited}, and mmu_mcp_server.py has been edited since. Tools added "
+        "in that edit are NOT available in this session, however many times "
+        "they are attempted. Nothing here can fix that -- the chat client must "
+        "be restarted to reload the MCP server. Say so rather than retrying.\n\n"
+    )
+
+
 
 
 _load_env_file()
@@ -500,6 +536,35 @@ def mmu_rate(address, val_type, intensity=5, emotion_label=None):
     except Exception as e:
         return f"[MMU rate error: {e}]"
 
+def _tool_inventory():
+    """
+    What this process can actually do to skills.
+
+    Stated explicitly because the alternative is inferring it from failures.
+    A model that does not know link_skill exists will reach for the only
+    branching route it does know -- uncrystallize and rebuild -- which changes
+    the skill id, re-enters the member-overlap refusals, and loops.
+    """
+    have = {t["name"] for t in TOOLS}
+    lines = ["Skill tools available in THIS session:"]
+    for name, what in (
+        ("review_skills",       "read the queue and the existing tree"),
+        ("crystallize_skill",   "create a skill (optionally under a parent, via extends)"),
+        ("link_skill",          "branch an EXISTING skill under a parent, no rebuild"),
+        ("unlink_skill",        "detach a skill from its parent, no rebuild"),
+        ("uncrystallize_skill", "delete a skill and restore its memories"),
+    ):
+        lines.append(f"  {'YES' if name in have else 'NO '}  {name} -- {what}")
+    if "link_skill" not in have:
+        lines.append(
+            "  Branching an existing skill is NOT possible in this session. Do "
+            "not uncrystallize and rebuild to get around it: that changes the "
+            "skill id and re-enters the overlap refusals. Report it instead."
+        )
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
 def _existing_skills_block():
     """
     The skills that already exist, with FULL ids.
@@ -550,7 +615,7 @@ def mmu_skill_proposals(limit=10):
     corpus, so the honest reading of the output was "all the proposals are
     about one topic" -- which was false, and led to exactly that conclusion.
     """
-    existing = _existing_skills_block()
+    existing = _staleness_warning() + _tool_inventory() + _existing_skills_block()
     try:
         r = requests.get(f"{MMU_BASE}/skill_proposals",
                          params={"status": "pending", "limit": limit},
