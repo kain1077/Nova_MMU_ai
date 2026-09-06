@@ -1825,6 +1825,31 @@ def link_skill(skill_id: str, parent_id: str):
     return {"status": "linked", "child": skill_id, "parent": parent_id}
 
 
+@app.post("/skills/{skill_id}/unlink")
+def unlink_skill_endpoint(skill_id: str, parent_id: Optional[str] = None):
+    """
+    Detach a skill from its parent, making it a root again.
+
+    Both ids accept an unambiguous prefix. Omit parent_id to detach from every
+    parent. Reparenting used to require uncrystallizing and rebuilding, which
+    changes the skill_id and destroys work in order to change one edge.
+    """
+    child, why = n4j.resolve_skill_id(skill_id)
+    if not child:
+        raise HTTPException(404, why)
+    parent = None
+    if parent_id:
+        parent, why = n4j.resolve_skill_id(parent_id)
+        if not parent:
+            raise HTTPException(404, why)
+
+    removed, why = n4j.unlink_skill(child, parent)
+    if why:
+        raise HTTPException(404 if why == "no such skill" else 409, why)
+    return {"status": "unlinked", "skill_id": child,
+            "parent_id": parent, "edges_removed": removed}
+
+
 @app.post("/skills/{skill_id}/deprecate")
 def deprecate_skill_endpoint(skill_id: str):
     """

@@ -572,6 +572,61 @@ def test_crystallize_can_create_a_branch():
 
 
 @live
+def test_an_existing_skill_can_be_branched_without_rebuilding():
+    """
+    Branching used to be possible only at creation, through crystallize_skill's
+    `extends`. An already-created skill could therefore be branched only by
+    uncrystallizing and rebuilding it -- which mints a new skill_id and
+    re-enters the overlap checks. Observed consequence: 21 identical POSTs to
+    one blocked proposal, and a tree that stayed flat.
+    """
+    made, addrs = [], []
+    try:
+        for tag in ("linkparent", "linkchild"):
+            pair = []
+            for n in ("one", "two"):
+                _, m = _call("POST", "/remember", {
+                    "keywords": [tag, n],
+                    "payload": f"{tag} {n}: probe memory for link tests.",
+                    "src_type": 1})
+                pair.append(m["address"])
+            addrs += pair
+            _, sk = _call("POST", "/crystallize", {
+                "member_addresses": pair, "trigger": f"asked about {tag}",
+                "procedure": f"Handle {tag}.", "confirmed": True})
+            made.append(sk["skill_id"])
+        parent, child = made
+
+        # Link by prefix, without recreating anything.
+        st, d = _call("POST", f"/skills/{child[:8]}/link?parent_id={parent[:8]}")
+        assert st == 200 and d["parent"] == parent
+
+        # Idempotent: linking twice is not an error and makes one edge.
+        st, _ = _call("POST", f"/skills/{child[:8]}/link?parent_id={parent[:8]}")
+        assert st == 200
+        _, tree = _call("GET", f"/skill_tree?root={parent}")
+        assert len(tree["tree"][0]["children"]) == 1
+
+        # The ids are unchanged -- that is the point of not rebuilding.
+        _, skills = _call("GET", "/skills")
+        ids = [s["skill_id"] for s in skills["skills"]]
+        assert parent in ids and child in ids
+
+        # Detach without destroying.
+        st, d = _call("POST", f"/skills/{child}/unlink")
+        assert st == 200 and d["edges_removed"] == 1
+        _, skills = _call("GET", "/skills")
+        assert child in [s["skill_id"] for s in skills["skills"]],             "unlink must not delete the skill"
+    finally:
+        for sid in reversed(made):
+            _call("POST", f"/skills/{sid}/unlink")
+        for sid in reversed(made):
+            _call("POST", f"/skills/{sid}/uncrystallize?confirm=UNCRYSTALLIZE")
+        for addr in addrs:
+            _call("DELETE", f"/memories/{urllib.parse.quote(addr, safe='')}")
+
+
+@live
 def test_blocked_proposals_are_marked_and_ranked_last():
     """
     Crystallizing takes its members out of circulation, so overlapping

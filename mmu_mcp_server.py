@@ -377,6 +377,46 @@ if ALLOW_CRYSTALLIZE:
         },
     })
     TOOLS.append({
+        "name": "link_skill",
+        "description": (
+            "Make one existing skill a branch of another, building the skill "
+            "tree. Use this to organise skills you have already created -- it "
+            "does NOT recreate anything, so ids stay stable and no memory "
+            "changes colour. Prefer this over uncrystallizing and remaking a "
+            "skill just to change its parent. Self-links and cycles are "
+            "refused."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "skill_id":  {"type": "string",
+                              "description": "The child: the more specific skill. "
+                                             "A unique prefix is accepted."},
+                "parent_id": {"type": "string",
+                              "description": "The parent: the more general skill "
+                                             "it specialises."},
+            },
+            "required": ["skill_id", "parent_id"],
+        },
+    })
+    TOOLS.append({
+        "name": "unlink_skill",
+        "description": (
+            "Detach a skill from its parent, making it a root again. The skill "
+            "and its memories are untouched -- use this to reparent rather "
+            "than uncrystallizing and rebuilding."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "skill_id":  {"type": "string", "description": "The child to detach."},
+                "parent_id": {"type": "string",
+                              "description": "Optional. Omit to detach from all parents."},
+            },
+            "required": ["skill_id"],
+        },
+    })
+    TOOLS.append({
         "name": "uncrystallize_skill",
         "description": (
             "Reverse a crystallization. Deletes the Skill and restores its "
@@ -480,7 +520,9 @@ def _existing_skills_block():
     if not tree:
         return ""
 
-    out = ["Existing skills (use a skill_id as `extends` to branch under one):"]
+    out = ["Existing skills. Branch a NEW one under a parent with `extends` on "
+           "crystallize_skill; branch an EXISTING one with link_skill (no "
+           "rebuild needed):"]
 
     def walk(node, depth):
         out.append(f"  {'  ' * depth}{node['skill_id']}")
@@ -618,6 +660,52 @@ def mmu_crystallize(proposal_id, trigger, procedure, confidence=0.7, extends=Non
         return f"[MMU crystallize error: {e}]"
 
 
+def mmu_link_skill(skill_id, parent_id):
+    """
+    Branch an existing skill under a parent, without recreating it.
+
+    This is the operation whose absence caused the loop. Branching was only
+    possible via crystallize_skill's `extends`, i.e. only at creation, so an
+    already-created skill could be branched only by destroying and rebuilding
+    it -- which changes the id and re-enters the overlap checks.
+    """
+    try:
+        r = requests.post(
+            f"{MMU_BASE}/skills/{skill_id}/link",
+            params={"parent_id": parent_id},
+            headers={**_SESSION_HEADERS, "X-MMU-Source": "model"},
+            timeout=30,
+        )
+        data = r.json()
+        if r.status_code != 200:
+            return f"[MMU link refused: {data.get('detail', r.status_code)}]"
+        return (f"Linked: {data['child']} now extends {data['parent']}. "
+                f"Check the shape with review_skills.")
+    except Exception as e:
+        return f"[MMU link error: {e}]"
+
+
+def mmu_unlink_skill(skill_id, parent_id=None):
+    """Detach a skill from its parent, making it a root again."""
+    try:
+        params = {}
+        if parent_id:
+            params["parent_id"] = parent_id
+        r = requests.post(
+            f"{MMU_BASE}/skills/{skill_id}/unlink",
+            params=params,
+            headers={**_SESSION_HEADERS, "X-MMU-Source": "model"},
+            timeout=30,
+        )
+        data = r.json()
+        if r.status_code != 200:
+            return f"[MMU unlink refused: {data.get('detail', r.status_code)}]"
+        return (f"Unlinked {data['skill_id']}: {data['edges_removed']} parent "
+                f"link(s) removed. The skill itself is untouched.")
+    except Exception as e:
+        return f"[MMU unlink error: {e}]"
+
+
 def mmu_uncrystallize(skill_id):
     """
     Reverse a crystallization: delete the Skill and restore its members.
@@ -747,6 +835,20 @@ def handle(msg):
                     confidence  = arguments.get("confidence", 0.7),
                     extends     = arguments.get("extends"),
                 )
+
+        elif name == "link_skill":
+            if not ALLOW_CRYSTALLIZE:
+                text = "Editing the skill tree is not enabled for tool use."
+            else:
+                text = mmu_link_skill(arguments.get("skill_id", ""),
+                                      arguments.get("parent_id", ""))
+
+        elif name == "unlink_skill":
+            if not ALLOW_CRYSTALLIZE:
+                text = "Editing the skill tree is not enabled for tool use."
+            else:
+                text = mmu_unlink_skill(arguments.get("skill_id", ""),
+                                        arguments.get("parent_id"))
 
         elif name == "uncrystallize_skill":
             if not ALLOW_CRYSTALLIZE:

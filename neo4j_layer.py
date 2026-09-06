@@ -1544,8 +1544,12 @@ def crystallize_skill(member_addresses, trigger, procedure, confidence=0.0):
                 if taken:
                     raise ValueError(
                         f"{len(taken)} member(s) already belong to an active "
-                        f"skill: {', '.join(taken)}. Uncrystallize that skill "
-                        "first, or drop these members from the cluster."
+                        f"skill: {', '.join(taken)}. This will fail identically "
+                        "every time until that changes -- retrying is not a "
+                        "path forward. Either uncrystallize the skill that owns "
+                        "them, or pick a different proposal; the review queue "
+                        "marks which proposals are blocked and lists the "
+                        "unblocked ones first."
                     )
 
                 tx.run("""
@@ -1972,6 +1976,41 @@ def link_skills(child_id, parent_id):
     except Exception as e:
         log.warning(f"link_skills failed: {e}")
         return False
+
+
+def unlink_skill(child_id, parent_id=None):
+    """
+    Detach a skill from its parent, making it a root again.
+
+    Reparenting previously meant uncrystallizing and rebuilding, which changes
+    the skill_id, re-enters the overlap checks, and destroys work to change one
+    edge. Detaching is the cheap operation and should be reachable as one.
+
+    parent_id=None removes every EXTENDS_SKILL edge from this skill.
+    Returns (removed_count, error).
+    """
+    driver = get_driver()
+    if driver is None:
+        return 0, "no database connection"
+    try:
+        with driver.session() as s:
+            if not s.run("MATCH (sk:Skill {skill_id:$cid}) RETURN count(sk) AS n",
+                         cid=child_id).single()["n"]:
+                return 0, "no such skill"
+            if parent_id:
+                rec = s.run("""
+                    MATCH (c:Skill {skill_id:$cid})-[r:EXTENDS_SKILL]->(p:Skill {skill_id:$pid})
+                    DELETE r RETURN count(r) AS n
+                """, cid=child_id, pid=parent_id).single()
+            else:
+                rec = s.run("""
+                    MATCH (c:Skill {skill_id:$cid})-[r:EXTENDS_SKILL]->(:Skill)
+                    DELETE r RETURN count(r) AS n
+                """, cid=child_id).single()
+        return int(rec["n"]) if rec else 0, None
+    except Exception as e:
+        log.warning(f"unlink_skill failed: {e}")
+        return 0, str(e)
 
 
 def get_skill_tree(root_skill_id=None):
