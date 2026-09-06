@@ -1853,7 +1853,10 @@ def uncrystallize(skill_id: str, confirm: str = ""):
             400, "Refusing without confirm=UNCRYSTALLIZE. This deletes the Skill "
                  "and restores its source memories."
         )
-    info, why = n4j.uncrystallize_skill(skill_id)
+    resolved, why = n4j.resolve_skill_id(skill_id)
+    if not resolved:
+        raise HTTPException(404, why)
+    info, why = n4j.uncrystallize_skill(resolved)
     if info is None:
         raise HTTPException(404 if why == "no such skill" else 409, why)
 

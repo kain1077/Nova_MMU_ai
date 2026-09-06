@@ -376,6 +376,26 @@ if ALLOW_CRYSTALLIZE:
             "required": ["proposal_id", "trigger", "procedure"],
         },
     })
+    TOOLS.append({
+        "name": "uncrystallize_skill",
+        "description": (
+            "Reverse a crystallization. Deletes the Skill and restores its "
+            "source memories to the colours they had before, returning the "
+            "proposal to the review queue. Use this to undo a skill whose "
+            "trigger or procedure turned out wrong, or to free members that "
+            "are blocking a better proposal. Refuses while another active "
+            "skill extends this one."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "skill_id": {"type": "string",
+                             "description": "skill_id to reverse. An unambiguous "
+                                            "prefix is accepted."},
+            },
+            "required": ["skill_id"],
+        },
+    })
 
 
 # ── MMU REST calls ────────────────────────────────────
@@ -532,6 +552,13 @@ def mmu_skill_proposals(limit=10):
                 f"meaning {sem_s}) | {mix}"
             )
             lines.append(f"    proposal_id: {p['proposal_id']}")
+            if p.get("blocked"):
+                who = ", ".join(b["skill_id"][:8] for b in p.get("blocked_by", []))
+                lines.append(
+                    f"    CANNOT CRYSTALLIZE: member(s) already belong to active "
+                    f"skill {who}. A memory cannot be compressed into two skills. "
+                    f"Uncrystallize that skill first, or leave this one."
+                )
             if p.get("members_missing"):
                 lines.append(f"    WARNING: {p['members_missing']} member(s) no longer exist")
             for addr, prev in zip(p.get("members", []), p.get("previews", [])):
@@ -589,6 +616,38 @@ def mmu_crystallize(proposal_id, trigger, procedure, confidence=0.7, extends=Non
         )
     except Exception as e:
         return f"[MMU crystallize error: {e}]"
+
+
+def mmu_uncrystallize(skill_id):
+    """
+    Reverse a crystallization: delete the Skill and restore its members.
+
+    Gated by the same flag as crystallize. Creating without being able to
+    reverse is the worse asymmetry of the two -- it lets a mistake become
+    permanent for whoever holds the undo, and the natural next move after a
+    bad skill ("undo it and remake it properly") is then unavailable. This is
+    also the strictly safer half: it restores memories rather than demoting
+    them.
+    """
+    try:
+        r = requests.post(
+            f"{MMU_BASE}/skills/{skill_id}/uncrystallize",
+            params={"confirm": "UNCRYSTALLIZE"},
+            headers={**_SESSION_HEADERS, "X-MMU-Source": "model"},
+            timeout=30,
+        )
+        data = r.json()
+        if r.status_code != 200:
+            return f"[MMU uncrystallize refused: {data.get('detail', r.status_code)}]"
+        kept = data.get("still_demoted") or []
+        note = (f" {len(kept)} member(s) stayed demoted because another active "
+                f"skill still owns them." if kept else "")
+        return (f"Uncrystallized {data['skill_id']}. "
+                f"{len(data['restored'])} memory/memories restored to their "
+                f"previous colour. Any matching proposal returns to the "
+                f"review queue.{note}")
+    except Exception as e:
+        return f"[MMU uncrystallize error: {e}]"
 
 
 def mmu_health():
@@ -688,6 +747,13 @@ def handle(msg):
                     confidence  = arguments.get("confidence", 0.7),
                     extends     = arguments.get("extends"),
                 )
+
+        elif name == "uncrystallize_skill":
+            if not ALLOW_CRYSTALLIZE:
+                text = ("Reversing a crystallization is not enabled for tool "
+                        "use. Ask for it to be undone through mmu_review.py.")
+            else:
+                text = mmu_uncrystallize(arguments.get("skill_id", ""))
 
         elif name == "rate_memory":
             text = mmu_rate(

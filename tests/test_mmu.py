@@ -572,6 +572,39 @@ def test_crystallize_can_create_a_branch():
 
 
 @live
+def test_blocked_proposals_are_marked_and_ranked_last():
+    """
+    Crystallizing takes its members out of circulation, so overlapping
+    proposals 409 forever. Five of seventeen were already impossible --
+    including the top three by score -- and the queue reported all seventeen as
+    plain "pending". A review queue that leads with work nothing can confirm
+    spends the reviewer's attention on exactly the wrong items.
+    """
+    st, d = _call("GET", "/skill_proposals?limit=50")
+    assert st == 200
+    props = d["proposals"]
+    if not props:
+        pytest.skip("nothing pending")
+
+    for p in props:
+        assert "blocked" in p and "blocked_by" in p
+        if p["blocked"]:
+            assert p["blocked_by"], "blocked must name what blocks it"
+
+    # Every unblocked proposal comes before every blocked one.
+    flags = [p["blocked"] for p in props]
+    assert flags == sorted(flags), "actionable proposals must rank first"
+
+    # And a blocked one really is refused, rather than merely labelled.
+    blocked = next((p for p in props if p["blocked"]), None)
+    if blocked:
+        st, _ = _call("POST", f"/skill_proposals/{blocked['proposal_id']}/crystallize",
+                      {"member_addresses": [], "trigger": "t", "procedure": "p",
+                       "confirmed": True})
+        assert st == 409
+
+
+@live
 def test_skill_ids_accept_an_unambiguous_prefix():
     """
     Skill ids are UUIDs and are displayed truncated nearly everywhere -- tree

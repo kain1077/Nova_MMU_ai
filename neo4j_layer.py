@@ -2340,7 +2340,23 @@ def get_skill_proposals(status="pending", limit=50):
                                  payload:    m.payload,
                                  color:      m.color,
                                  grp: toInteger(split(m.address, '.')[2])}}) AS live
-                RETURN p.proposal_id    AS proposal_id,
+                // A member already compressed into an active Skill cannot be
+                // compressed into a second one, so this proposal can never be
+                // confirmed while that skill exists. Saying so here is the
+                // difference between a queue and a list of things to try.
+                OPTIONAL MATCH (bm:Memory)-[:PROCEDURALIZED_FROM]->(bsk:Skill)
+                WHERE bm.created_at IN p.member_created
+                  AND bsk.status <> 'deprecated'
+                // Filter the nulls OUT here, not in Python. An OPTIONAL
+                // MATCH that finds nothing still collects one all-null map, so
+                // size(blockers) was 1 for every proposal and the ordering
+                // below silently did nothing.
+                WITH p, live,
+                     [b IN collect(DISTINCT {{skill_id: bsk.skill_id,
+                                             trigger:  bsk.trigger}})
+                      WHERE b.skill_id IS NOT NULL] AS blockers
+                RETURN blockers         AS blockers,
+                       p.proposal_id    AS proposal_id,
                        p.member_key     AS member_key,
                        p.member_created AS member_created,
                        live             AS live_members,
@@ -2355,7 +2371,12 @@ def get_skill_proposals(status="pending", limit=50):
                        p.reviewed_at    AS reviewed_at,
                        p.review_note    AS review_note,
                        p.skill_id       AS skill_id
-                ORDER BY p.skill_score DESC, p.created_at ASC
+                // Actionable proposals first. Score still orders within each
+                // group, but a review queue that leads with items nothing can
+                // confirm wastes the reviewer's attention on the ones ranked
+                // highest -- which is exactly what happened: the top three by
+                // score were all blocked.
+                ORDER BY size(blockers) ASC, p.skill_score DESC, p.created_at ASC
                 LIMIT $lim
             """, status=status, lim=int(limit))
 
@@ -2374,6 +2395,11 @@ def get_skill_proposals(status="pending", limit=50):
                 d["grps"]            = [m["grp"] for m in live if m.get("grp") is not None]
                 d["colors"]          = [m.get("color") for m in live]
                 d["members_missing"] = len(stamps) - len(live)
+
+                blockers = [b for b in (d.pop("blockers", None) or [])
+                            if b.get("skill_id")]
+                d["blocked_by"] = blockers
+                d["blocked"]    = bool(blockers)
 
                 try:
                     d["src_mix"] = json.loads(d.get("src_mix") or "{}")
