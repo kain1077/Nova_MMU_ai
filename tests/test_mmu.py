@@ -13,8 +13,23 @@ Two tiers, deliberately:
     pytest tests/ -v                     # pure only, if nothing is running
     MMU_TEST_BASE=http://127.0.0.1:8766 pytest tests/ -v
 
-WARNING: point MMU_TEST_BASE at a TEST instance. The live tests write memories.
-They clean up after themselves, but do not aim them at a graph you care about.
+The live tests write memories, and every /recall they make ages every memory it
+does not return. That is not destructive -- aged memories go Green -> Yellow and
+come back on the next recall -- but it is a real change to a real graph, and a
+long enough test run can push memories to Blue.
+
+So the default target is port 8766, the second-instance convention, and NOT 8765,
+which is where a real graph usually lives. Aiming the live tests at 8765 needs an
+explicit opt-in:
+
+    MMU_TEST_ALLOW_PRODUCTION=1 MMU_TEST_BASE=http://127.0.0.1:8765 pytest tests/
+
+This default used to be 8765, which meant a bare `pytest tests/` on a machine
+running MMU normally silently exercised the user's own memories. It aged four of
+them before anyone noticed, and turned up an index-drift bug on the way -- a good
+outcome from a bad default, but the default was still backwards.
+
+[Running a second instance] in the README covers standing up something disposable.
 """
 
 import os
@@ -30,10 +45,29 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-BASE = os.environ.get("MMU_TEST_BASE", "http://127.0.0.1:8765")
+# Defaults to the second-instance port on purpose. See the module docstring.
+BASE = os.environ.get("MMU_TEST_BASE", "http://127.0.0.1:8766")
+
+# The port a normal MMU install listens on, and therefore the one the live tests
+# must not touch without being told to.
+PRODUCTION_PORT = "8765"
+ALLOW_PRODUCTION = os.environ.get("MMU_TEST_ALLOW_PRODUCTION", "").strip() not in ("", "0", "false", "False")
+
+_AIMED_AT_PRODUCTION = f":{PRODUCTION_PORT}" in BASE and not ALLOW_PRODUCTION
+
+_PRODUCTION_REASON = (
+    f"refusing to run live tests against {BASE}: port {PRODUCTION_PORT} is the "
+    f"default MMU port. These tests write memories and age the ones they don't "
+    f"return. Point MMU_TEST_BASE at a throwaway instance, or set "
+    f"MMU_TEST_ALLOW_PRODUCTION=1 if this really is disposable."
+)
 
 
 def _server_up():
+    # Checked only when the target is allowed, so a refused target costs no
+    # request at all -- the same ordering the benchmark harness uses.
+    if _AIMED_AT_PRODUCTION:
+        return False
     try:
         with urllib.request.urlopen(f"{BASE}/health", timeout=3) as r:
             return r.status == 200
@@ -41,7 +75,18 @@ def _server_up():
         return False
 
 
-live = pytest.mark.skipif(not _server_up(), reason=f"no MMU server at {BASE}")
+_LIVE_OK = _server_up()
+
+live = pytest.mark.skipif(
+    not _LIVE_OK,
+    reason=(_PRODUCTION_REASON if _AIMED_AT_PRODUCTION else f"no MMU server at {BASE}"),
+)
+
+if _AIMED_AT_PRODUCTION:
+    # A skip reason is easy to miss in a quiet run, and this one is the
+    # difference between "the live tests didn't run" and "the live tests ran
+    # against your real graph".
+    print(f"\n!! {_PRODUCTION_REASON}\n", file=sys.stderr)
 
 
 def _call(method, path, payload=None, timeout=120, headers=None):

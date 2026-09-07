@@ -501,9 +501,10 @@ aging state machine -- need nothing running, and are the ones that catch a regre
 before it reaches a container. The **live** tests hit a running server and skip
 themselves automatically when nothing is listening.
 
-Point the live tests at a throwaway instance, never at a graph you care about -- they
-write memories, and although they clean up after themselves, that is not a guarantee
-worth betting your graph on:
+**The live tests default to port 8766, not 8765.** They write memories, and every
+`/recall` they make ages every memory it *doesn't* return — Green to Yellow, and far
+enough to Blue. So a bare `pytest tests/` runs the pure tier and skips the live tier
+unless a throwaway instance is listening on 8766:
 
 ```bash
 MMU_TEST_BASE=http://127.0.0.1:8766 pytest tests/ -v
@@ -514,6 +515,13 @@ shell syntax that PowerShell doesn't have:
 
 ```powershell
 $env:MMU_TEST_BASE = "http://127.0.0.1:8766"; pytest tests/ -v
+```
+
+Pointing them at 8765 is refused before any request is made. If that instance really is
+disposable, opt in explicitly:
+
+```bash
+MMU_TEST_ALLOW_PRODUCTION=1 MMU_TEST_BASE=http://127.0.0.1:8765 pytest tests/ -v
 ```
 
 [Running a second instance](#running-a-second-instance) covers standing one up.

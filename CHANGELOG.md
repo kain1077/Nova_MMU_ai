@@ -6,6 +6,26 @@ between minor versions, and will say so here when they do.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The live tests no longer default to the production port.** `MMU_TEST_BASE`
+  defaulted to `http://127.0.0.1:8765`, so a bare `pytest tests/` on a machine running
+  MMU normally silently exercised the user's own graph — writing memories and aging
+  every memory each `/recall` didn't return. It now defaults to 8766, and aiming the
+  live tests at 8765 is refused before any request unless `MMU_TEST_ALLOW_PRODUCTION=1`
+  is set. Found by walking into it: four memories went Green → Yellow before anyone
+  noticed.
+
+### Known issue found while doing that
+
+- **Aging can rewrite a memory's address without the v2 index following.** `use` is
+  encoded into the address by `_gen_addr`, so incrementing it changes the address; the
+  index drops the old card and does not always add the new one. The memory stays in
+  Neo4j, counted by every graph query, and is invisible to recall. `POST
+  /index_repair?apply=true` reinstates it. This is very likely the mechanism behind the
+  node `index_repair`'s own docstring describes as having "sat in that state since
+  August". Not yet fixed at the source.
+
 ### Added
 
 - **LongMemEval benchmark harness** in `bench/`. Runs MMU against two baselines —
