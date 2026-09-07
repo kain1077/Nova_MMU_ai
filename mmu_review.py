@@ -2,7 +2,7 @@
 """
 mmu_review.py -- the human side of crystallization.
 
-Phase 12 made confirming a skill a human decision and Phase 13.1 gave that
+Phase 12 made confirming a routine a human decision and Phase 13.1 gave that
 decision a queue. This is the terminal for it. Nothing here is reachable by a
 model: it is a local script you run, and every write asks first.
 
@@ -14,7 +14,7 @@ model: it is a local script you run, and every write asks first.
     python mmu_review.py --sweep         look for new candidates now
 
 Confirming is deliberately a conversation, not a flag. Crystallizing compresses
-memories into a Skill and DEMOTES them to Blue, which changes how memory is
+memories into a Routine and DEMOTES them to Blue, which changes how memory is
 structured rather than adding to it -- so the script shows exactly what will be
 demoted and makes you type the word before it writes anything.
 
@@ -146,12 +146,12 @@ def cmd_crystallize(n):
         sys.exit(1)
 
     print(f"{BOLD}This will:{RESET}")
-    print(f"  - create one Skill from these {len(p['members'])} memories")
+    print(f"  - create one Routine from these {len(p['members'])} memories")
     print(f"  - DEMOTE all {len(p['members'])} of them to Blue")
-    print(f"  {DIM}Blue memories stay as the skill's root system and are never "
+    print(f"  {DIM}Blue memories stay as the routine's root system and are never "
           f"deleted, but the recall gate treats them as inactive.{RESET}")
     print()
-    print("Two things only you can write. The trigger is when this skill should "
+    print("Two things only you can write. The trigger is when this routine should "
           "fire; the procedure is what to actually do.")
     print()
 
@@ -225,7 +225,7 @@ def cmd_sweep():
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Review and confirm MMU skill crystallization proposals.")
+        description="Review and confirm MMU routine crystallization proposals.")
     ap.add_argument("n", nargs="?", type=int, help="proposal number from the listing")
     ap.add_argument("--crystallize", action="store_true", help="confirm proposal n")
     ap.add_argument("--reject", action="store_true", help="decline proposal n")

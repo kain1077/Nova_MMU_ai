@@ -23,7 +23,7 @@ runs entirely on your own machine.
   searchable with page-level provenance. Reference material never ages.
 - **Proactive suggestions.** Recall can carry a small "you might also want" list drawn
   from connections across different domains.
-- **Skills.** Memories that cluster densely can be crystallized into a `Skill` node —
+- **Routines.** Memories that cluster densely can be crystallized into a `Routine` node —
   with human confirmation, never automatically.
 
 Everything runs locally. See [Privacy](#privacy).
@@ -238,19 +238,34 @@ text. Its judgment is a filter; a verbatim dump has none.
 
 ---
 
-## Skills
+## Routines
 
 Memories that are always recalled together are evidence of a pattern. MMU can compress
-such a cluster into a **Skill** — a `trigger` (when this applies) and a `procedure` (what
+such a cluster into a **Routine** — a `trigger` (when this applies) and a `procedure` (what
 to do), stored as one node and delivered instead of its source memories.
 
+> **Why "Routine" and not "Skill".** This was called a Skill until v0.1.2. That collided
+> with [Agent Skills](https://modelcontextprotocol.io), the `SKILL.md` files a person
+> writes to tell a model how to do something — and since MMU is an MCP server usually
+> attached to a model that also has those, both meanings arrived in one context window at
+> once. They are near-opposites: an Agent Skill is authored by a human and lives in a
+> file; a Routine is *emergent*, derived by compressing memories that kept surfacing
+> together, and lives only as a graph node. "Routine" also happens to describe the node
+> better, since it is literally a trigger paired with a procedure.
+>
+> **The HTTP API still says `skill`** — `/skills`, `/skill_proposals`, `skill_id`.
+> Renaming the wire format would break every stored URL and require a graph migration,
+> for a cosmetic gain. The rename covers what a human or a model reads: this document and
+> the MCP tool names. If you see `skill_id` come back from an endpoint, it is a Routine's
+> id.
+
 The source memories are **never deleted**. They are demoted to Blue and become the
-skill's root system: still there, still findable directly, no longer competing in every
+routine's root system: still there, still findable directly, no longer competing in every
 recall. On a graph where one large corpus dominates, that is the point — the compression
 is worth less than the un-biasing.
 
 **Nothing crystallizes on its own.** The idle daemon looks for dense, coherent clusters
-and queues them as proposals; turning one into a Skill is a human decision, because it
+and queues them as proposals; turning one into a Routine is a human decision, because it
 restructures memory rather than adding to it.
 
 ```
@@ -270,23 +285,23 @@ Everything is reversible:
 curl -X POST "http://127.0.0.1:8765/skills/<skill_id>/uncrystallize?confirm=UNCRYSTALLIZE"
 ```
 
-That deletes the Skill, restores each member to the colour it had before, and returns the
+That deletes the Routine, restores each member to the colour it had before, and returns the
 proposal to the queue.
 
-Skills form a tree. A narrow skill can extend a general one, so a common topic resolves
+Routines form a tree. A narrow routine can extend a general one, so a common topic resolves
 through one node instead of a dozen memories:
 
 ```bash
 curl -X POST "http://127.0.0.1:8765/skills/<child>/link?parent_id=<parent>"
 ```
 
-Ids accept an unambiguous prefix. Cycles and self-links are refused, and a skill with an
+Ids accept an unambiguous prefix. Cycles and self-links are refused, and a routine with an
 active child cannot be deleted out from under it.
 
 ### Letting a model do it
 
 `MMU_ALLOW_MODEL_CRYSTALLIZE=true` gives your model tools to review, create, branch and
-reverse skills itself. **Off by default, and the default is the recommendation:** a model
+reverse routines itself. **Off by default, and the default is the recommendation:** a model
 that drafts a proposal can then approve its own draft, and the review stops being a
 review. It is enforced server-side, not merely by hiding the tool.
 
@@ -356,7 +371,7 @@ worth knowing early:
 | `MMU_SEMANTIC_FLOOR` | `0.0` | Drop weak keyword hits. `0.0` = off. |
 | `MMU_ANTICIPATE_MAX` | `3` | Proactive suggestions per recall. `0` = off. |
 | `MMU_BIND` | `127.0.0.1` | Interface the ports bind to. `0.0.0.0` exposes to your LAN. |
-| `MMU_ALLOW_MODEL_CRYSTALLIZE` | `false` | Let a model create and reverse skills itself. See [Skills](#skills). |
+| `MMU_ALLOW_MODEL_CRYSTALLIZE` | `false` | Let a model create and reverse routines itself. See [Routines](#routines). |
 | `MMU_API_KEY` | *(unset)* | Shared secret. Required on every endpoint but `/health` when set. |
 | `MMU_CORS_ORIGINS` | *(empty)* | Browser origins allowed. Empty disables CORS. |
 
@@ -555,7 +570,7 @@ Detail lives in `phase_packages/`, which documents how each piece came to be and
         |
   mmu_mcp_server.py        stdio MCP -> HTTP
         |
-  mmu_server.py            FastAPI: recall, remember, ingest, skills
+  mmu_server.py            FastAPI: recall, remember, ingest, routines
         |            \
   light_index_v2.py   neo4j_layer.py
   (fast keyword gate)  (graph, vectors, aging)
@@ -567,10 +582,91 @@ Detail lives in `phase_packages/`, which documents how each piece came to be and
 between conversations. It is the only component that talks to a chat model; the server
 itself calls only `/v1/embeddings`.
 
+### Recall flow
+
+What `POST /recall` actually does. The detail worth noticing is the `alt` block: the
+semantic stage runs **only when the keyword gate found nothing topical**. Semantic recall
+fills gaps; it never takes over from a real keyword hit, and folded-in semantic
+candidates are weighted strictly below keyword ones so they cannot outrank them.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Client as MCP client / curl
+    participant API as mmu_server
+    participant Gate as light_index_v2
+    participant Emb as embeddings endpoint
+    participant Neo as Neo4j
+
+    Client->>API: POST /recall {prompt, top_k}
+    API->>Gate: gate(prompt)
+    Gate-->>API: direct hits + pinned (all Red)
+
+    alt gate found nothing topical
+        API->>Emb: embed(prompt)
+        Emb-->>API: query vector
+        API->>Neo: semantic_search(vector)
+        Neo-->>API: candidates + similarity
+    else gate found direct hits
+        Note over API: semantic search skipped entirely
+    end
+
+    API->>Gate: expand(direct) via CO_RECALLED
+    Gate-->>API: expanded set + cold addresses
+    opt any cold
+        API->>Neo: graph_recall for the cold ones
+    end
+
+    Note over API: fold semantic in below keyword weight,<br/>drop below semantic floor, tiebreak on similarity
+    API->>Neo: hydrate payloads
+    API->>Neo: match_routines(vector, terms)
+    Note over API: a matched Routine REPLACES its own members
+
+    API->>API: age every memory NOT returned
+    API-->>Client: memories + routines + anticipated + read_ms
+```
+
+That last step is the one that surprises people: recall is **not** side-effect-free. Every
+call ages the memories it did not return, which is how disuse is measured — and why the
+test suite and the benchmark harness both refuse to run against a graph you care about.
+
+### Remember and ingest
+
+Two ways in. `/remember` writes one memory; `/ingest` chunks a document into many, and
+refuses to write anything until you have seen a dry run.
+
+```mermaid
+flowchart TD
+    subgraph direct["POST /remember"]
+        A1["keywords + payload"] --> A2["get_next_con()<br/>monotonic :Counter node"]
+        A2 --> A3["_gen_addr(con, pri, grp, use, ...)"]
+    end
+
+    subgraph doc["POST /ingest"]
+        B1["file under /docs<br/>mounted READ-ONLY"] --> B2["chunk_text()"]
+        B2 --> B3{"dry_run?"}
+        B3 -->|"yes, the default advice"| B4["report chunk count<br/>+ samples, write NOTHING"]
+        B3 -->|"no"| B5["extract_keywords per chunk"]
+        B5 --> A2
+    end
+
+    A3 --> C1["write_memory to Neo4j"]
+    C1 --> C2["v2_index.add() + bake_similar()"]
+    C2 --> C3["index.save()"]
+    C3 --> C4["embed payload"]
+    C4 --> C5["write_embedding, keyed by address"]
+
+    C5 --> D["recallable by keyword AND meaning"]
+```
+
+`bake_similar()` is not optional bookkeeping: without it a memory has a card but no
+neighbours, so it is findable by a direct hit and never arrives through expansion.
+Embedding happens **after** the node exists, because `write_embedding` matches on address.
+
 ### Memory lifecycle
 
 The diagram above is what MMU is made of. This is what actually happens to one memory,
-from the moment it's saved to the moment it might become part of a Skill.
+from the moment it's saved to the moment it might become part of a Routine.
 
 ```mermaid
 flowchart TD
@@ -590,8 +686,8 @@ flowchart TD
     J -.->|"recalled anytime, by any query"| H
 
     C -->|"shows up in the same recall<br/>as other memories, repeatedly"| K["Dense cluster forms<br/>(CO_RECALLED edges)"]
-    K --> L["Surfaced as a Skill candidate —<br/>never created automatically"]
-    L -->|"you confirm it"| M[("Skill node created")]
+    K --> L["Surfaced as a Routine candidate —<br/>never created automatically"]
+    L -->|"you confirm it"| M[("Routine node created")]
     M --> N["Member memories demoted to Blue"]
 ```
 
@@ -600,6 +696,52 @@ archiving (Yellow → Blue) requires **both** sustained disuse and real elapsed 
 count alone -- the thresholds are `MMU_ARCHIVE_MIN_DAYS` and `MMU_AGING_MIN_MEMORIES` in
 [Configuration](#configuration). And crystallization only ever runs with a human
 confirming it; nothing in this diagram happens unattended.
+
+### Deployment view
+
+What runs where, and what crosses a boundary. The dashed edges are the only outbound
+network calls MMU makes — both to an endpoint you run.
+
+```mermaid
+flowchart LR
+    subgraph external["Your machine, outside Docker"]
+        MC["MCP client<br/>Claude, LM Studio, ..."]
+        LM["embeddings endpoint<br/>:1234/v1"]
+    end
+
+    subgraph host["Host-side Python, optional"]
+        BR["mmu_mcp_server.py<br/>stdio MCP to HTTP"]
+        ID["mmu_idle_daemon.py<br/>background cognition"]
+        RV["mmu_review.py<br/>routine review CLI"]
+    end
+
+    subgraph docker["Docker network"]
+        SRV["mmu-server<br/>FastAPI :8765"]
+        NEO[("neo4j :7687<br/>graph + vector index")]
+        VOL[("mmu-data volume<br/>v2 keyword index")]
+    end
+
+    DOCS["./documents<br/>mounted READ-ONLY"]
+
+    MC <-->|stdio| BR
+    BR -->|HTTP| SRV
+    ID -->|HTTP| SRV
+    RV -->|HTTP| SRV
+    ID -.->|"chat completions"| LM
+
+    SRV --> NEO
+    SRV --> VOL
+    SRV -.->|"/v1/embeddings only"| LM
+    DOCS -->|":ro"| SRV
+```
+
+Two things this is meant to make obvious. **The idle daemon is the only component that
+talks to a chat model** — the server itself calls nothing but `/v1/embeddings`. And
+`./documents` is mounted read-only, so `/ingest` can read your originals and cannot reach
+outside that directory or modify anything in it.
+
+Ports bind to `127.0.0.1` by default, not `0.0.0.0`. See [Security](#security) before
+changing `MMU_BIND`.
 
 ### Why Neo4j and not SQLite
 
@@ -610,8 +752,8 @@ of memories with embeddings on them, that cost would not be justified.
 What it buys is the part that isn't storage. MMU's behaviour is mostly *edges*:
 `CO_RECALLED` weights that build up between memories retrieved together, `SIMILAR_TO`
 between fuzzy-matched keywords, the density-of-cluster calculation that nominates a group
-of memories for crystallization into a Skill, and the parent/child structure of the
-skill tree itself. Those are traversals over a graph that changes shape as you use it.
+of memories for crystallization into a Routine, and the parent/child structure of the
+routine tree itself. Those are traversals over a graph that changes shape as you use it.
 In SQLite they'd be recursive CTEs over a join table, hand-maintained — writable, but the
 schema would end up being a graph database with extra steps, and the crystallization
 sweep is the piece that would suffer most.
@@ -641,7 +783,7 @@ first ones that exist.
 The design point worth knowing before the results land: one of the baselines is flat
 vector search over **the same embeddings MMU uses**, with the graph switched off. The gap
 between that and MMU is what the graph layer is actually worth — the `CO_RECALLED`
-weights, the keyword gate, the skills. If there's no gap, there's no gap, and that gets
+weights, the keyword gate, the routines. If there's no gap, there's no gap, and that gets
 published too. A benchmark that can only flatter the thing it measures isn't one.
 
 See [bench/README.md](bench/README.md). Note that it erases the graph it runs against, so
@@ -664,12 +806,12 @@ reader doesn't have to go find it.
   validated against a real instance that size and the from-scratch second-instance test
   described in [Running a second instance](#running-a-second-instance). Nobody has thrown
   10,000 memories or concurrent multi-user load at it, and it isn't built for that yet.
-- **Skill crystallization reaches real candidates now, but the confirm-and-write path is
+- **Routine crystallization reaches real candidates now, but the confirm-and-write path is
   still lightly exercised end to end.** Three bugs made it structurally unreachable until
   Phase 13.1/13.2 fixed them (documents were excluded from candidates, edge weights were
   normalized against the wrong population, and the model-crystallize flag wasn't reaching
   the process that read it). Candidates surface correctly now. Confirming one and watching
-  it demote member memories into a Skill has been validated at the mechanism level, not
+  it demote member memories into a Routine has been validated at the mechanism level, not
   worn in by repeated real use yet.
 - **CON numbers no longer get reused, but only going forward.** They used to come from
   `max(existing)+1`, which handed the same number back out if the highest-numbered memory

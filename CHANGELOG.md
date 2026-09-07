@@ -4,7 +4,56 @@ Notable changes, newest first. Versions follow [semantic versioning](https://sem
 with the caveat that MMU is pre-1.0 — the HTTP API and the graph schema can still change
 between minor versions, and will say so here when they do.
 
-## [Unreleased]
+## [0.1.2] — 2026-09-07
+
+Second pass on outside review. Four issues filed by @kumilange; two of them turned out to
+have already been fixed by pushing the local history, which is its own finding — see below.
+
+### Changed
+
+- **"Skill" is now "Routine"** on every surface a human or a model reads
+  ([#2](https://github.com/kain1077/Nova_MMU_ai/issues/2)). The old name collided with
+  Agent Skills — the `SKILL.md` files a person writes to instruct a model — and since MMU
+  is an MCP server usually attached to a model that also has those, both meanings landed
+  in one context window. They are near-opposites: an Agent Skill is authored and lives in
+  a file, a Routine is emergent and lives only as a graph node. "Routine" also describes
+  the node better, being literally a trigger paired with a procedure.
+
+  MCP tools renamed: `review_skills` → `review_routines`, `crystallize_skill` →
+  `crystallize_routine`, `link_skill` → `link_routine`, `unlink_skill` →
+  `unlink_routine`, `uncrystallize_skill` → `uncrystallize_routine`. **Update your MCP
+  client config if you had these tools enabled.** README and `mmu_review.py` output
+  follow.
+
+  **The HTTP API and the graph are unchanged** — `/skills`, `/skill_proposals`,
+  `skill_id`, the `:Skill` label. Renaming the wire format would break every stored URL
+  and need a graph migration for a cosmetic gain. `review_routines` says so in its own
+  description, so a model that sees `skill_id` come back knows what it is.
+
+### Added
+
+- **Three more Mermaid diagrams in the README**
+  ([#1](https://github.com/kain1077/Nova_MMU_ai/issues/1)): recall flow, remember/ingest
+  flow, and a deployment view, alongside the existing memory-lifecycle diagram. The
+  recall diagram makes explicit something the prose never said: the semantic stage runs
+  **only when the keyword gate finds nothing topical**, so semantic recall fills gaps
+  rather than competing with keyword hits. All four are parse-checked against Mermaid
+  itself, not eyeballed.
+
+- **LongMemEval benchmark harness** in `bench/`. Runs MMU against two baselines —
+  BM25 and flat vector search over the same embeddings with the graph switched off —
+  over identical haystacks with identical scoring. Reports retrieval recall@k, which
+  needs no model and is exactly reproducible, separately from QA accuracy, which
+  depends on a reader and a judge and is not comparable across runs.
+
+  The flat-vector baseline is the one that matters: the gap between it and MMU is what
+  the graph layer is worth, and if there is no gap that gets published too.
+
+  The harness erases the graph it runs against, so it refuses to touch one that
+  hasn't been explicitly marked disposable — port 8765 is refused outright, a graph
+  with no sentinel memory is refused, and a graph over 200 memories with no sentinel
+  is refused regardless. 22 tests cover the loader, scoring and the guards, none of
+  which need a running service. Not yet run against the real dataset.
 
 ### Fixed
 
@@ -59,22 +108,29 @@ between minor versions, and will say so here when they do.
   is set. Found by walking into it: four memories went Green → Yellow before anyone
   noticed.
 
-### Added
+### Removed
 
-- **LongMemEval benchmark harness** in `bench/`. Runs MMU against two baselines —
-  BM25 and flat vector search over the same embeddings with the graph switched off —
-  over identical haystacks with identical scoring. Reports retrieval recall@k, which
-  needs no model and is exactly reproducible, separately from QA accuracy, which
-  depends on a reader and a judge and is not comparable across runs.
+- **`Extra/light_index_v2.py`** ([#3](https://github.com/kain1077/Nova_MMU_ai/issues/3)),
+  a stale duplicate of the root module missing `touch()` and the `touched_at` migration.
+  Nothing imported it. The broader `migrations/` `tools/` `dev/` reorganisation in that
+  issue is declined for now: `mmu_mcp_server.py`'s path sits in every user's MCP config,
+  the `dev/` part is already moot since the PowerShell scripts were deleted in v0.1.1,
+  and `Extra/` is five files.
 
-  The flat-vector baseline is the one that matters: the gap between it and MMU is what
-  the graph layer is worth, and if there is no gap that gets published too.
+### Fixed by publishing, not by patching
 
-  The harness erases the graph it runs against, so it refuses to touch one that
-  hasn't been explicitly marked disposable — port 8765 is refused outright, a graph
-  with no sentinel memory is refused, and a graph over 200 memories with no sentinel
-  is refused regardless. 22 tests cover the loader, scoring and the guards, none of
-  which need a running service. Not yet run against the real dataset.
+Both of these were real on GitHub and never real in the local repository. The GitHub repo
+was created separately and had files *uploaded* into it, and the upload skipped dotfiles —
+so `.env.example`, `.gitignore` and `documents/.gitkeep` existed locally, were correctly
+tracked, and were simply absent from the published tree. Pushing the actual history fixed
+all three at once.
+
+- **`.env.example` is back** ([#4](https://github.com/kain1077/Nova_MMU_ai/issues/4)) —
+  the install instructions referenced a file the published repo did not contain.
+- **`.gitignore` is back, and `tests/__pycache__/` is gone** (#3). Without the
+  `.gitignore`, a fresh clone was one `git add -A` away from committing its own `.env`.
+- **`documents/.gitkeep` is back** — nobody filed this one, but without it the
+  `${MMU_DOC_HOST:-./documents}:/docs:ro` mount had no directory to bind.
 
 ## [0.1.1] — 2026-09-07
 
@@ -154,5 +210,6 @@ Everything below predates the changelog and is summarized rather than itemized.
 - Self-check on every server start, reporting Neo4j connectivity, vector index state, and
   configured-vs-actual embedding dimension.
 
+[0.1.2]: https://github.com/kain1077/Nova_MMU_ai/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/kain1077/Nova_MMU_ai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/kain1077/Nova_MMU_ai/releases/tag/v0.1.0
