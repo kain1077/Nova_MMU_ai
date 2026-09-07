@@ -675,8 +675,12 @@ reader doesn't have to go find it.
   `max(existing)+1`, which handed the same number back out if the highest-numbered memory
   was deleted. They now come from a monotonic `:Counter` node that is never recomputed
   from the population. An existing graph seeds that counter from its current maximum on
-  first run, so nothing gets renumbered — but any CON collision that already happened
-  before you upgraded stays as it is, since MMU has no way to know it occurred.
+  first run, so nothing gets renumbered — but any collision that already happened before
+  you upgraded stays. Those are detectable (group by the CON segment of the address and
+  look for counts above one) and not repairable: nothing records which memory held the
+  number first, so there is no principled way to decide which one keeps it. The
+  development graph carries five such pairs, deliberately left alone — no consumer
+  outside MMU treats a CON as an identifier, so the collisions cost nothing.
 - **A Session node isn't a conversation.** `/recall` mints a fresh session UUID per call,
   not per conversation, so `/session_resume` reflects one call's memories, not a whole
   chat's.

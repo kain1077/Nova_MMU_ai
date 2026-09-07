@@ -57,9 +57,10 @@ README rather than left to be inferred.
   time: deleting the highest-numbered memory handed that same number to the next write, so
   anything outside MMU holding the old CON silently pointed at a different memory. The
   number now comes from a monotonic `:Counter` node that is never recomputed from the
-  population. Existing graphs seed the counter from their current maximum on first run —
-  nothing is renumbered, and no collision that already happened can be detected or
-  repaired retroactively.
+  population. Existing graphs seed the counter from their current maximum on first run, so
+  nothing is renumbered. Collisions that predate the fix remain: they can be found by
+  grouping on the CON segment of the address, but not repaired, since nothing records
+  which memory held the number first.
 
 ### Changed
 
