@@ -1,0 +1,1517 @@
+[
+ {
+  "question_id": "q0",
+  "question": "What bird do I have?",
+  "answer": "Bartholomew",
+  "question_type": "single-session-user",
+  "answer_session_ids": [
+   "q0_s5"
+  ],
+  "haystack_session_ids": [
+   "q0_s0",
+   "q0_s1",
+   "q0_s2",
+   "q0_s3",
+   "q0_s4",
+   "q0_s5",
+   "q0_s6",
+   "q0_s7"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "Rotate the tires every 5,000 miles."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The gutters need clearing."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Book the dentist appointment."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The sourdough starter needs feeding."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The sourdough starter needs feeding."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "I have a peregrine falcon named Bartholomew."
+    },
+    {
+     "role": "assistant",
+     "content": "Noted."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Renew the passport before travel."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The sourdough starter needs feeding."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "q1",
+  "question": "What car do I drive?",
+  "answer": "1987 Volvo 240",
+  "question_type": "multi-session",
+  "answer_session_ids": [
+   "q1_s5"
+  ],
+  "haystack_session_ids": [
+   "q1_s0",
+   "q1_s1",
+   "q1_s2",
+   "q1_s3",
+   "q1_s4",
+   "q1_s5",
+   "q1_s6",
+   "q1_s7"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "Renew the passport before travel."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The sourdough starter needs feeding."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Renew the passport before travel."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Rotate the tires every 5,000 miles."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The sourdough starter needs feeding."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "I have a 1987 Volvo 240 wagon."
+    },
+    {
+     "role": "assistant",
+     "content": "Noted."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The sourdough starter needs feeding."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The gutters need clearing."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "q2",
+  "question": "What am I allergic to?",
+  "answer": "shellfish",
+  "question_type": "temporal-reasoning",
+  "answer_session_ids": [
+   "q2_s6"
+  ],
+  "haystack_session_ids": [
+   "q2_s0",
+   "q2_s1",
+   "q2_s2",
+   "q2_s3",
+   "q2_s4",
+   "q2_s5",
+   "q2_s6",
+   "q2_s7"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "The sourdough starter needs feeding."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Rotate the tires every 5,000 miles."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The sourdough starter needs feeding."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Renew the passport before travel."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The gutters need clearing."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The sourdough starter needs feeding."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "I have a allergy to shellfish."
+    },
+    {
+     "role": "assistant",
+     "content": "Noted."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Renew the passport before travel."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "q3",
+  "question": "Where is the cabin?",
+  "answer": "Lake Tenkiller",
+  "question_type": "knowledge-update",
+  "answer_session_ids": [
+   "q3_s1"
+  ],
+  "haystack_session_ids": [
+   "q3_s0",
+   "q3_s1",
+   "q3_s2",
+   "q3_s3",
+   "q3_s4",
+   "q3_s5",
+   "q3_s6",
+   "q3_s7"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "Rotate the tires every 5,000 miles."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "I have a cabin on Lake Tenkiller."
+    },
+    {
+     "role": "assistant",
+     "content": "Noted."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Book the dentist appointment."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Book the dentist appointment."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Renew the passport before travel."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The sourdough starter needs feeding."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Renew the passport before travel."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Renew the passport before travel."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "q4",
+  "question": "What is my brother's name?",
+  "answer": "Desmond",
+  "question_type": "abstention",
+  "answer_session_ids": [
+   "q4_s6"
+  ],
+  "haystack_session_ids": [
+   "q4_s0",
+   "q4_s1",
+   "q4_s2",
+   "q4_s3",
+   "q4_s4",
+   "q4_s5",
+   "q4_s6",
+   "q4_s7"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "The sourdough starter needs feeding."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Rotate the tires every 5,000 miles."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The sourdough starter needs feeding."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Renew the passport before travel."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Rotate the tires every 5,000 miles."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Quarterly taxes are due the fifteenth."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "I have a brother named Desmond."
+    },
+    {
+     "role": "assistant",
+     "content": "Noted."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The gutters need clearing."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "q5",
+  "question": "What bird do I have?",
+  "answer": "Bartholomew",
+  "question_type": "single-session-user",
+  "answer_session_ids": [
+   "q5_s2"
+  ],
+  "haystack_session_ids": [
+   "q5_s0",
+   "q5_s1",
+   "q5_s2",
+   "q5_s3",
+   "q5_s4",
+   "q5_s5",
+   "q5_s6",
+   "q5_s7"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "Renew the passport before travel."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The sourdough starter needs feeding."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "I have a peregrine falcon named Bartholomew."
+    },
+    {
+     "role": "assistant",
+     "content": "Noted."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Renew the passport before travel."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Quarterly taxes are due the fifteenth."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Renew the passport before travel."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Book the dentist appointment."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Rotate the tires every 5,000 miles."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "q6",
+  "question": "What car do I drive?",
+  "answer": "1987 Volvo 240",
+  "question_type": "multi-session",
+  "answer_session_ids": [
+   "q6_s1"
+  ],
+  "haystack_session_ids": [
+   "q6_s0",
+   "q6_s1",
+   "q6_s2",
+   "q6_s3",
+   "q6_s4",
+   "q6_s5",
+   "q6_s6",
+   "q6_s7"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "Renew the passport before travel."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "I have a 1987 Volvo 240 wagon."
+    },
+    {
+     "role": "assistant",
+     "content": "Noted."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Renew the passport before travel."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Book the dentist appointment."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Rotate the tires every 5,000 miles."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Quarterly taxes are due the fifteenth."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The sourdough starter needs feeding."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Renew the passport before travel."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "q7",
+  "question": "What am I allergic to?",
+  "answer": "shellfish",
+  "question_type": "temporal-reasoning",
+  "answer_session_ids": [
+   "q7_s1"
+  ],
+  "haystack_session_ids": [
+   "q7_s0",
+   "q7_s1",
+   "q7_s2",
+   "q7_s3",
+   "q7_s4",
+   "q7_s5",
+   "q7_s6",
+   "q7_s7"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "Renew the passport before travel."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "I have a allergy to shellfish."
+    },
+    {
+     "role": "assistant",
+     "content": "Noted."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The sourdough starter needs feeding."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Renew the passport before travel."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Rotate the tires every 5,000 miles."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The gutters need clearing."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Book the dentist appointment."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Renew the passport before travel."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "q8",
+  "question": "Where is the cabin?",
+  "answer": "Lake Tenkiller",
+  "question_type": "knowledge-update",
+  "answer_session_ids": [
+   "q8_s6"
+  ],
+  "haystack_session_ids": [
+   "q8_s0",
+   "q8_s1",
+   "q8_s2",
+   "q8_s3",
+   "q8_s4",
+   "q8_s5",
+   "q8_s6",
+   "q8_s7"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "Quarterly taxes are due the fifteenth."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The gutters need clearing."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Renew the passport before travel."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The gutters need clearing."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Quarterly taxes are due the fifteenth."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Quarterly taxes are due the fifteenth."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "I have a cabin on Lake Tenkiller."
+    },
+    {
+     "role": "assistant",
+     "content": "Noted."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Rotate the tires every 5,000 miles."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "q9",
+  "question": "What is my brother's name?",
+  "answer": "Desmond",
+  "question_type": "abstention",
+  "answer_session_ids": [
+   "q9_s2"
+  ],
+  "haystack_session_ids": [
+   "q9_s0",
+   "q9_s1",
+   "q9_s2",
+   "q9_s3",
+   "q9_s4",
+   "q9_s5",
+   "q9_s6",
+   "q9_s7"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "Book the dentist appointment."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Rotate the tires every 5,000 miles."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "I have a brother named Desmond."
+    },
+    {
+     "role": "assistant",
+     "content": "Noted."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The sourdough starter needs feeding."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Renew the passport before travel."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Quarterly taxes are due the fifteenth."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Renew the passport before travel."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The gutters need clearing."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "q10",
+  "question": "What bird do I have?",
+  "answer": "Bartholomew",
+  "question_type": "single-session-user",
+  "answer_session_ids": [
+   "q10_s5"
+  ],
+  "haystack_session_ids": [
+   "q10_s0",
+   "q10_s1",
+   "q10_s2",
+   "q10_s3",
+   "q10_s4",
+   "q10_s5",
+   "q10_s6",
+   "q10_s7"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "Book the dentist appointment."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The gutters need clearing."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Quarterly taxes are due the fifteenth."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Renew the passport before travel."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The sourdough starter needs feeding."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "I have a peregrine falcon named Bartholomew."
+    },
+    {
+     "role": "assistant",
+     "content": "Noted."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The sourdough starter needs feeding."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Renew the passport before travel."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "q11",
+  "question": "What car do I drive?",
+  "answer": "1987 Volvo 240",
+  "question_type": "multi-session",
+  "answer_session_ids": [
+   "q11_s6"
+  ],
+  "haystack_session_ids": [
+   "q11_s0",
+   "q11_s1",
+   "q11_s2",
+   "q11_s3",
+   "q11_s4",
+   "q11_s5",
+   "q11_s6",
+   "q11_s7"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "Rotate the tires every 5,000 miles."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Quarterly taxes are due the fifteenth."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Rotate the tires every 5,000 miles."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The gutters need clearing."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The gutters need clearing."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The sourdough starter needs feeding."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "I have a 1987 Volvo 240 wagon."
+    },
+    {
+     "role": "assistant",
+     "content": "Noted."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Book the dentist appointment."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "q12",
+  "question": "What am I allergic to?",
+  "answer": "shellfish",
+  "question_type": "temporal-reasoning",
+  "answer_session_ids": [
+   "q12_s1"
+  ],
+  "haystack_session_ids": [
+   "q12_s0",
+   "q12_s1",
+   "q12_s2",
+   "q12_s3",
+   "q12_s4",
+   "q12_s5",
+   "q12_s6",
+   "q12_s7"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "Renew the passport before travel."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "I have a allergy to shellfish."
+    },
+    {
+     "role": "assistant",
+     "content": "Noted."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Renew the passport before travel."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Quarterly taxes are due the fifteenth."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Quarterly taxes are due the fifteenth."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Book the dentist appointment."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Quarterly taxes are due the fifteenth."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Renew the passport before travel."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "q13",
+  "question": "Where is the cabin?",
+  "answer": "Lake Tenkiller",
+  "question_type": "knowledge-update",
+  "answer_session_ids": [
+   "q13_s7"
+  ],
+  "haystack_session_ids": [
+   "q13_s0",
+   "q13_s1",
+   "q13_s2",
+   "q13_s3",
+   "q13_s4",
+   "q13_s5",
+   "q13_s6",
+   "q13_s7"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "Renew the passport before travel."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The gutters need clearing."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The sourdough starter needs feeding."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The sourdough starter needs feeding."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Quarterly taxes are due the fifteenth."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The gutters need clearing."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Book the dentist appointment."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "I have a cabin on Lake Tenkiller."
+    },
+    {
+     "role": "assistant",
+     "content": "Noted."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "q14",
+  "question": "What is my brother's name?",
+  "answer": "Desmond",
+  "question_type": "abstention",
+  "answer_session_ids": [
+   "q14_s1"
+  ],
+  "haystack_session_ids": [
+   "q14_s0",
+   "q14_s1",
+   "q14_s2",
+   "q14_s3",
+   "q14_s4",
+   "q14_s5",
+   "q14_s6",
+   "q14_s7"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "The sourdough starter needs feeding."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "I have a brother named Desmond."
+    },
+    {
+     "role": "assistant",
+     "content": "Noted."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Book the dentist appointment."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Book the dentist appointment."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Quarterly taxes are due the fifteenth."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Book the dentist appointment."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Renew the passport before travel."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Book the dentist appointment."
+    },
+    {
+     "role": "assistant",
+     "content": "Understood."
+    }
+   ]
+  ]
+ }
+]

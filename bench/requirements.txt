@@ -1,0 +1,12 @@
+# Benchmark harness dependencies.
+#
+#   pip install -r bench/requirements.txt
+#
+# The harness also imports `ingest` from the repo root for MMU's own keyword
+# extraction, so run it from the repo root rather than from inside bench/.
+
+-r ../requirements-host.txt
+
+# Flat-vector baseline. Pure-Python cosine over thousands of turns per instance
+# is minutes of arithmetic that numpy does in milliseconds.
+numpy>=1.24

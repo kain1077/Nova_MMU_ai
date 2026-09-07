@@ -559,6 +559,40 @@ Detail lives in `phase_packages/`, which documents how each piece came to be and
 between conversations. It is the only component that talks to a chat model; the server
 itself calls only `/v1/embeddings`.
 
+### Memory lifecycle
+
+The diagram above is what MMU is made of. This is what actually happens to one memory,
+from the moment it's saved to the moment it might become part of a Skill.
+
+```mermaid
+flowchart TD
+    A["You tell it something,<br/>or it notices something<br/>worth keeping on its own"] --> B["save_memory"]
+    B --> C[("Memory node written to the graph<br/>state: Green (active)")]
+
+    C --> D{"A query comes in"}
+    D --> E["Keyword gate (light_index_v2)<br/>answers most queries in milliseconds"]
+    E -->|"no strong match"| F["Semantic embedding search<br/>finds it by meaning, not just words"]
+    E -->|"strong match"| G["Memory returned"]
+    F --> G
+    G --> H["Recalled memory strengthens —<br/>its clock resets"]
+    H -.-> C
+
+    C -->|"goes unused, real time passes"| I["Yellow: pre-hold"]
+    I -->|"still unused"| J["Blue: dormant / archived"]
+    J -.->|"recalled anytime, by any query"| H
+
+    C -->|"shows up in the same recall<br/>as other memories, repeatedly"| K["Dense cluster forms<br/>(CO_RECALLED edges)"]
+    K --> L["Surfaced as a Skill candidate —<br/>never created automatically"]
+    L -->|"you confirm it"| M[("Skill node created")]
+    M --> N["Member memories demoted to Blue"]
+```
+
+Two things worth being explicit about, because the diagram can't say them on its own:
+archiving (Yellow → Blue) requires **both** sustained disuse and real elapsed time, not
+count alone -- the thresholds are `MMU_ARCHIVE_MIN_DAYS` and `MMU_AGING_MIN_MEMORIES` in
+[Configuration](#configuration). And crystallization only ever runs with a human
+confirming it; nothing in this diagram happens unattended.
+
 ### Why Neo4j and not SQLite
 
 A fair question, and the honest answer is that at 1,000 memories SQLite would be fine.
@@ -586,14 +620,29 @@ issue tracker is the place to say so.
 
 ### Benchmarks
 
-There are none yet, and that's the most legitimate gap in this project. Comparable systems
-publish LoCoMo and LongMemEval numbers; MMU publishes recall latency against one person's
-graph, which tells you it's fast and tells you nothing about whether it *remembers well*.
-`mmu_recall_speed_test.py` measures speed, not quality.
+**There are no quality numbers yet, and that's the most legitimate gap in this project.**
+Comparable systems publish LoCoMo and LongMemEval results; MMU publishes recall latency
+against one person's graph, which tells you it's fast and tells you nothing about whether
+it *remembers well*. `mmu_recall_speed_test.py` measures speed, not quality.
 
-A LongMemEval run is the planned next substantial piece of work. Until it exists, treat
-every retrieval-quality claim here as the author's own observation on the author's own
-data — which is exactly the kind of claim a benchmark is for replacing.
+The harness for fixing that is in [`bench/`](bench/) — LongMemEval against MMU and two
+baselines, scored identically. It's tested end to end on a synthetic fixture and has not
+yet been run against the real dataset, so the first numbers it produces will also be the
+first ones that exist.
+
+The design point worth knowing before the results land: one of the baselines is flat
+vector search over **the same embeddings MMU uses**, with the graph switched off. The gap
+between that and MMU is what the graph layer is actually worth — the `CO_RECALLED`
+weights, the keyword gate, the skills. If there's no gap, there's no gap, and that gets
+published too. A benchmark that can only flatter the thing it measures isn't one.
+
+See [bench/README.md](bench/README.md). Note that it erases the graph it runs against, so
+it refuses to touch anything that hasn't been explicitly marked disposable — read that
+section before pointing it anywhere.
+
+Until those numbers exist, treat every retrieval-quality claim here as the author's own
+observation on the author's own data, which is exactly the kind of claim a benchmark
+replaces.
 
 ---
 

@@ -4,6 +4,25 @@ Notable changes, newest first. Versions follow [semantic versioning](https://sem
 with the caveat that MMU is pre-1.0 — the HTTP API and the graph schema can still change
 between minor versions, and will say so here when they do.
 
+## [Unreleased]
+
+### Added
+
+- **LongMemEval benchmark harness** in `bench/`. Runs MMU against two baselines —
+  BM25 and flat vector search over the same embeddings with the graph switched off —
+  over identical haystacks with identical scoring. Reports retrieval recall@k, which
+  needs no model and is exactly reproducible, separately from QA accuracy, which
+  depends on a reader and a judge and is not comparable across runs.
+
+  The flat-vector baseline is the one that matters: the gap between it and MMU is what
+  the graph layer is worth, and if there is no gap that gets published too.
+
+  The harness erases the graph it runs against, so it refuses to touch one that
+  hasn't been explicitly marked disposable — port 8765 is refused outright, a graph
+  with no sentinel memory is refused, and a graph over 200 memories with no sentinel
+  is refused regardless. 22 tests cover the loader, scoring and the guards, none of
+  which need a running service. Not yet run against the real dataset.
+
 ## [0.1.1] — 2026-09-07
 
 Response to the project's first outside review. Most of this is the reviewer's list, acted

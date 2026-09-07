@@ -59,3 +59,7 @@ venv/
 .idea/
 Thumbs.db
 desktop.ini
+
+# Benchmark output: checkpoints, per-run JSON and reports. The harness is
+# tracked; what it produces on someone's machine is not.
+bench/results/
