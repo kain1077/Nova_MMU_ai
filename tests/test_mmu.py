@@ -331,6 +331,32 @@ def test_save_recall_roundtrip():
 
 
 @live
+def test_index_and_graph_agree():
+    """
+    The v2 index is the read path and Neo4j is the record. A memory in the
+    graph but absent from the index is invisible to recall while still being
+    counted by every graph query -- present everywhere except where it matters.
+    One node sat in that state from August until a delete test happened to
+    compare the two totals.
+    """
+    st, d = _call("POST", "/index_repair")
+    assert st == 200
+    assert d["missing_count"] == 0, f"invisible to recall: {d['missing']}"
+    assert d["phantom_count"] == 0, f"indexed but gone: {d['phantom']}"
+
+
+@live
+def test_index_repair_reports_before_it_writes():
+    """Default is dry-run; a repair that writes on inspection is not one you
+    can safely point at a live graph to find out what is wrong."""
+    _, before = _call("GET", "/health")
+    st, d = _call("POST", "/index_repair")
+    assert st == 200 and d["status"] == "dry-run"
+    _, after = _call("GET", "/health")
+    assert after["total_memories"] == before["total_memories"]
+
+
+@live
 def test_deleted_memory_leaves_no_phantom():
     """A delete must clear the v2 index too, or it haunts every later recall."""
     _, saved = _call("POST", "/remember", {

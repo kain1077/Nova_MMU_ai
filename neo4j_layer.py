@@ -1043,6 +1043,35 @@ def vector_index_info():
         return None
 
 
+def get_index_source_rows():
+    """
+    Every memory as the v2 index needs it: address, colour, priority, src_type
+    and keyword terms.
+
+    Same projection rebuild_from_neo4j() uses, exposed separately so drift can
+    be repaired incrementally. A full rebuild also discards the shortcut cache
+    and resets the generation counter, which is a heavy price for reinstating
+    one card.
+    """
+    driver = get_driver()
+    if driver is None:
+        return []
+    try:
+        with driver.session() as s:
+            return [dict(r) for r in s.run("""
+                MATCH (m:Memory)
+                OPTIONAL MATCH (m)-[:HAS_KEYWORD]->(k:Keyword)
+                RETURN m.address  AS address,
+                       m.color    AS color,
+                       m.priority AS priority,
+                       m.src_type AS src_type,
+                       collect(DISTINCT k.term) AS keywords
+            """)]
+    except Exception as e:
+        log.warning(f"get_index_source_rows failed: {e}")
+        return []
+
+
 def get_memory_count():
     """Return total Memory node count for CON address segment generation."""
     driver = get_driver()

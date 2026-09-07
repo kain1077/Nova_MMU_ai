@@ -1932,6 +1932,70 @@ def meta_skill_candidates(min_shared: int = 2):
 # cannot confirm anything.
 
 
+@app.post("/index_repair")
+def index_repair(apply: bool = False):
+    """
+    Reconcile the v2 index against Neo4j. Reports by default; pass apply=true
+    to write.
+
+    Two kinds of drift, and they fail differently:
+
+      MISSING   in Neo4j, absent from the index. Invisible to recall, because
+                the index IS the read path -- but still counted by every graph
+                query, so the memory looks present everywhere except where it
+                matters. One node had been in this state since August, found
+                only because a delete test compared the two totals.
+
+      PHANTOM   in the index, absent from Neo4j. Occupies a slot in the gate
+                and can be ranked into a result whose payload no longer exists.
+
+    Incremental on purpose: rebuild_from_neo4j() would fix both and also
+    discard the shortcut cache and reset the generation counter, which is a
+    heavy price for reinstating one card.
+    """
+    rows = n4j.get_index_source_rows()
+    if not rows:
+        raise HTTPException(503, "Could not read memories from Neo4j.")
+
+    graph = {r["address"]: r for r in rows if r["address"]}
+    indexed = set(mmu.v2_index.shortcut_cache.keys())
+
+    missing = [a for a in graph if a not in indexed]
+    phantom = [a for a in indexed if a not in graph]
+
+    result = {
+        "status":       "repaired" if apply else "dry-run",
+        "neo4j_total":  len(graph),
+        "index_total":  len(indexed),
+        "missing":      sorted(missing),
+        "phantom":      sorted(phantom),
+        "missing_count": len(missing),
+        "phantom_count": len(phantom),
+    }
+    if not apply:
+        result["note"] = ("Nothing was written. Re-run with apply=true to fix."
+                          if (missing or phantom) else "Index and graph agree.")
+        return result
+
+    for addr in missing:
+        r = graph[addr]
+        kws = [k for k in (r["keywords"] or []) if k]
+        mmu.v2_index.add(addr, kws,
+                         color=r["color"] or "Green",
+                         priority=r["priority"] if r["priority"] is not None else 5,
+                         src_type=r["src_type"] or 0)
+        # Without this the card exists but has no neighbours, so the memory is
+        # findable directly and never arrives through expansion.
+        mmu.v2_index.bake_similar(addr, kws)
+    for addr in phantom:
+        mmu.v2_index.remove(addr)
+
+    mmu.v2_index.save()
+    result["note"] = (f"Added {len(missing)}, removed {len(phantom)}. "
+                      "Index and graph now agree.")
+    return result
+
+
 @app.get("/skill_proposals")
 def skill_proposals(status: Optional[str] = "pending", limit: int = 50):
     """

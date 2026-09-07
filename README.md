@@ -222,6 +222,63 @@ text. Its judgment is a filter; a verbatim dump has none.
 
 ---
 
+## Skills
+
+Memories that are always recalled together are evidence of a pattern. MMU can compress
+such a cluster into a **Skill** — a `trigger` (when this applies) and a `procedure` (what
+to do), stored as one node and delivered instead of its source memories.
+
+The source memories are **never deleted**. They are demoted to Blue and become the
+skill's root system: still there, still findable directly, no longer competing in every
+recall. On a graph where one large corpus dominates, that is the point — the compression
+is worth less than the un-biasing.
+
+**Nothing crystallizes on its own.** The idle daemon looks for dense, coherent clusters
+and queues them as proposals; turning one into a Skill is a human decision, because it
+restructures memory rather than adding to it.
+
+```
+python mmu_review.py                    # what is waiting
+python mmu_review.py 1                  # inspect proposal 1 in full
+python mmu_review.py 1 --crystallize    # confirm it — asks for trigger and procedure
+python mmu_review.py 1 --reject         # decline, permanently
+python mmu_review.py --sweep            # look for new candidates now
+```
+
+Confirming shows exactly which memories will be demoted and requires you to type
+`CRYSTALLIZE`. You write the trigger and the procedure — nothing else does.
+
+Everything is reversible:
+
+```bash
+curl -X POST "http://127.0.0.1:8765/skills/<skill_id>/uncrystallize?confirm=UNCRYSTALLIZE"
+```
+
+That deletes the Skill, restores each member to the colour it had before, and returns the
+proposal to the queue.
+
+Skills form a tree. A narrow skill can extend a general one, so a common topic resolves
+through one node instead of a dozen memories:
+
+```bash
+curl -X POST "http://127.0.0.1:8765/skills/<child>/link?parent_id=<parent>"
+```
+
+Ids accept an unambiguous prefix. Cycles and self-links are refused, and a skill with an
+active child cannot be deleted out from under it.
+
+### Letting a model do it
+
+`MMU_ALLOW_MODEL_CRYSTALLIZE=true` gives your model tools to review, create, branch and
+reverse skills itself. **Off by default, and the default is the recommendation:** a model
+that drafts a proposal can then approve its own draft, and the review stops being a
+review. It is enforced server-side, not merely by hiding the tool.
+
+Useful for testing the whole loop, and the reason reversal is available to the model too
+— being able to create without being able to undo is the worse half to hand out.
+
+---
+
 ## Privacy
 
 **Your data stays on your machine.** Memories live in a Neo4j container on your own
@@ -283,6 +340,7 @@ worth knowing early:
 | `MMU_SEMANTIC_FLOOR` | `0.0` | Drop weak keyword hits. `0.0` = off. |
 | `MMU_ANTICIPATE_MAX` | `3` | Proactive suggestions per recall. `0` = off. |
 | `MMU_BIND` | `127.0.0.1` | Interface the ports bind to. `0.0.0.0` exposes to your LAN. |
+| `MMU_ALLOW_MODEL_CRYSTALLIZE` | `false` | Let a model create and reverse skills itself. See [Skills](#skills). |
 | `MMU_API_KEY` | *(unset)* | Shared secret. Required on every endpoint but `/health` when set. |
 | `MMU_CORS_ORIGINS` | *(empty)* | Browser origins allowed. Empty disables CORS. |
 
@@ -371,6 +429,20 @@ back. If it's happening too aggressively, raise `MMU_ARCHIVE_MIN_DAYS`.
 curl http://127.0.0.1:8765/health
 curl http://127.0.0.1:8765/embedding_status
 ```
+
+---
+
+**`/health` shows different totals for the index and Neo4j.**
+The v2 index is the read path; Neo4j is the record. A memory in the graph but missing
+from the index is invisible to recall while still being counted everywhere else. Check
+and fix:
+
+```bash
+curl -X POST http://127.0.0.1:8765/index_repair
+curl -X POST "http://127.0.0.1:8765/index_repair?apply=true"
+```
+
+The first reports; only the second writes.
 
 ---
 
