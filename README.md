@@ -518,6 +518,95 @@ Detail lives in `phase_packages/`, which documents how each piece came to be and
 between conversations. It is the only component that talks to a chat model; the server
 itself calls only `/v1/embeddings`.
 
+That is the map of the parts. The two diagrams below are the parts in motion — what
+actually happens during a recall, and how a memory changes over its life.
+
+### The recall path
+
+Worth knowing before you read it: the keyword gate and the semantic layer are not an
+either/or. When embeddings are on, the prompt is embedded on every recall. What the
+keyword gate decides is only whether a *vector search* runs — that happens when the gate
+found nothing topical. When the gate did find hits, the embedding is still used, to score
+those hits and break ties.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as MCP client
+    participant X as mmu_mcp_server.py
+    participant S as mmu_server.py
+    participant K as light_index_v2.py
+    participant E as your embeddings endpoint
+    participant N as neo4j_layer.py + Neo4j
+
+    C->>X: recall_memory(prompt)
+    X->>S: POST /recall
+    S->>K: gate(prompt)
+    K-->>S: keyword hits + every pinned (Red) memory
+    S->>K: expand(hits) - co-recall neighbours
+    opt MMU_EMBEDDING_ENABLED
+        S->>E: embed(prompt)
+        E-->>S: vector, or None on error - recall degrades to keyword-only
+        alt keyword gate found nothing
+            S->>N: vector index search (ANN)
+            N-->>S: semantic candidates, scaled by MMU_SEMANTIC_WEIGHT
+        else keyword gate found hits
+            S->>N: similarity_for_addresses(hits)
+            N-->>S: per-hit scores used as a floor and a tiebreak
+        end
+    end
+    S->>K: rank() - merge, dedup by address, trim to top_k
+    S->>N: match_skills() - a Skill replaces its members in context_block
+    S->>N: get_anticipated_context() - proactive suggestions, computed here
+    S->>N: age memories - see the lifecycle diagram
+    S-->>X: context_block + memories
+    X-->>C: context_block
+```
+
+If the embeddings endpoint is unreachable, `embed()` returns nothing and recall continues
+keyword-only rather than failing.
+
+### The memory lifecycle
+
+Memories carry a colour. Aging is not a background job — it runs inside every recall, and
+it walks every memory, not just the ones that matched.
+
+```mermaid
+stateDiagram-v2
+    direction LR
+
+    Green: Green - active
+    Yellow: Yellow - cooling
+    Blue: Blue - archived
+    Red: Red - pinned, never ages
+
+    [*] --> Green: remembered
+    [*] --> Red: POST /pin
+
+    Green --> Yellow: unused, count reaches MMU_HOLD_THRESH
+    Green --> Blue: archive rule
+    Yellow --> Blue: archive rule
+    Blue --> Yellow: recalled
+    Yellow --> Green: recalled
+    Green --> Green: recalled, use count resets to 0
+    Blue --> Green: uncrystallize, restores the colour it had
+
+    note right of Blue
+        Archiving needs all three, or it does not happen:
+          use count reached MMU_ARCHIVE_THRESH
+          the memory has touch data at all
+          days since touch reached MMU_ARCHIVE_MIN_DAYS
+        Crystallizing a Skill also sends its members here,
+        recording the colour each one had so it can be undone.
+    end note
+
+    note left of Green
+        Aging runs on every recall, over all memories.
+        It is skipped entirely below MMU_AGING_MIN_MEMORIES.
+        Red memories and ingested documents never age.
+    end note
+```
+
 ---
 
 ## Known Limitations
