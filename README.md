@@ -679,8 +679,15 @@ reader doesn't have to go find it.
   you upgraded stays. Those are detectable (group by the CON segment of the address and
   look for counts above one) and not repairable: nothing records which memory held the
   number first, so there is no principled way to decide which one keeps it. The
-  development graph carries five such pairs, deliberately left alone — no consumer
-  outside MMU treats a CON as an identifier, so the collisions cost nothing.
+  development graph carries five such pairs, deliberately left alone.
+
+  They are not merely cosmetic, and an earlier version of this section wrongly said they
+  cost nothing. Because `use` is encoded into the address and clamps at
+  `MMU_ARCHIVE_THRESH`, two memories sharing a CON eventually *converge on the same
+  address* — which is what produced the index drift fixed in
+  [CHANGELOG.md](CHANGELOG.md). What makes them harmless now is that the rename path
+  refuses to move a memory onto an occupied address, so a collision costs one held `use`
+  increment instead of a card. Left alone on that basis, not on the basis of being inert.
 - **A Session node isn't a conversation.** `/recall` mints a fresh session UUID per call,
   not per conversation, so `/session_resume` reflects one call's memories, not a whole
   chat's.
