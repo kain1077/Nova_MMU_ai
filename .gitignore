@@ -1,0 +1,15 @@
+# Python bytecode and build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+
+# Local configuration. The template is tracked on purpose.
+.env
+!.env.example
+
+# Default MMU_DOC_HOST mount — your own source documents.
+documents/
