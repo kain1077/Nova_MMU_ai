@@ -162,10 +162,10 @@ DOC_ROOT = _env.get("MMU_DOC_ROOT", "/docs")
 # Stage 1 only fetches URLs the caller names; no model chooses its own targets.
 WEB_ENABLED = _env.get("MMU_WEB_ENABLED", "false").lower() == "true"
 
-# Phase 13.2: how many skills a single recall may deliver. Small on purpose --
-# a skill substitutes for its source memories, so several firing at once
+# Phase 13.2: how many routines a single recall may deliver. Small on purpose --
+# a routine substitutes for its source memories, so several firing at once
 # withholds a lot of context on the strength of a similarity score.
-SKILL_RECALL_MAX = int(_env.get("MMU_SKILL_RECALL_MAX", "2"))
+ROUTINE_RECALL_MAX = int(_env.get("MMU_ROUTINE_RECALL_MAX", "2"))
 
 # Phase 13.1: whether a model may confirm a crystallization itself.
 #
@@ -180,7 +180,7 @@ SKILL_RECALL_MAX = int(_env.get("MMU_SKILL_RECALL_MAX", "2"))
 # than only in the MCP tool list: a tool list is a client-side promise, and the
 # server should not depend on a client keeping one.
 #
-# Reverse anything a model gets wrong with POST /skills/{id}/uncrystallize.
+# Reverse anything a model gets wrong with POST /routines/{id}/uncrystallize.
 MODEL_MAY_CRYSTALLIZE = _env.get("MMU_ALLOW_MODEL_CRYSTALLIZE", "false").lower() == "true"
 
 
@@ -336,7 +336,7 @@ class CrystallizeIn(BaseModel):
     confirmed:        bool  = False   # must be explicitly true
     # Phase 13.2: optional parent, so a branch can be created in one step.
     # A tree built by remembering to call /link afterwards is a tree that
-    # mostly does not get built -- the first four skills anyone tried to
+    # mostly does not get built -- the first four routines anyone tried to
     # branch off a root ended up with no edges at all.
     extends:          Optional[str] = None
 
@@ -535,9 +535,9 @@ class EmbeddingClient:
 EMB = EmbeddingClient()
 
 
-def _skill_embedding_text(trigger, procedure):
+def _routine_embedding_text(trigger, procedure):
     """
-    The single canonical definition of "what text represents a skill".
+    The single canonical definition of "what text represents a routine".
 
     Same discipline as _embedding_text() for memories, and for the same reason:
     vectors are only comparable if the text that produced them was assembled
@@ -550,11 +550,11 @@ def _skill_embedding_text(trigger, procedure):
     return f"{trigger or ''}\n{procedure or ''}".strip()
 
 
-def _link_parent(skill_id, parent_id):
+def _link_parent(routine_id, parent_id):
     """
-    Attach a freshly created skill under a parent, if one was named.
+    Attach a freshly created routine under a parent, if one was named.
 
-    Best-effort and reported rather than raised: the skill is already committed
+    Best-effort and reported rather than raised: the routine is already committed
     and correct on its own, and a bad parent id should not look like a failed
     crystallization. Returns the parent id on success, or a string explaining
     why not, which the caller passes straight back so a wrong id is visible
@@ -562,46 +562,46 @@ def _link_parent(skill_id, parent_id):
     """
     if not parent_id:
         return None
-    resolved, why = n4j.resolve_skill_id(parent_id)
+    resolved, why = n4j.resolve_routine_id(parent_id)
     if not resolved:
         return f"not linked: {why}"
     try:
-        if n4j.link_skills(skill_id, resolved):
+        if n4j.link_routines(routine_id, resolved):
             return resolved
-        return f"not linked: no skill with id {parent_id}"
+        return f"not linked: no routine with id {parent_id}"
     except ValueError as e:
         return f"not linked: {e}"
     except Exception as e:
-        log.warning("link to parent %s failed for %s: %s", parent_id, skill_id, e)
+        log.warning("link to parent %s failed for %s: %s", parent_id, routine_id, e)
         return f"not linked: {e}"
 
 
-def _index_skill(skill_id, trigger, procedure):
+def _index_routine(routine_id, trigger, procedure):
     """
-    Make a skill retrievable: embed it and link it into the Keyword graph.
+    Make a routine retrievable: embed it and link it into the Keyword graph.
 
-    Best-effort and never raises. A skill that fails to index is still a
-    perfectly good skill, it is just invisible until /skills/reindex catches
+    Best-effort and never raises. A routine that fails to index is still a
+    perfectly good routine, it is just invisible until /routines/reindex catches
     it -- exactly how an un-embedded memory is treated. Failing the
     crystallization over it would undo a human's decision for a reason that
     has nothing to do with the decision.
     """
     embedded = keyworded = 0
-    text = _skill_embedding_text(trigger, procedure)
+    text = _routine_embedding_text(trigger, procedure)
     try:
         vec = EMB.embed(text)
-        if vec and n4j.write_skill_embedding(skill_id, vec):
+        if vec and n4j.write_routine_embedding(routine_id, vec):
             embedded = 1
         elif not vec:
-            log.warning("No embedding for skill %s -- reindex will catch it", skill_id)
+            log.warning("No embedding for routine %s -- reindex will catch it", routine_id)
     except Exception as e:
-        log.warning("Skill embedding failed for %s (skill still created): %s", skill_id, e)
+        log.warning("Routine embedding failed for %s (routine still created): %s", routine_id, e)
 
     try:
         terms = ingest.extract_keywords(text)
-        keyworded = n4j.link_skill_keywords(skill_id, terms)
+        keyworded = n4j.link_routine_keywords(routine_id, terms)
     except Exception as e:
-        log.warning("Skill keyword linking failed for %s: %s", skill_id, e)
+        log.warning("Routine keyword linking failed for %s: %s", routine_id, e)
 
     return {"embedded": bool(embedded), "keywords": keyworded}
 
@@ -1414,37 +1414,37 @@ def recall(body: RecallIn):
     mmu._current_session_id = str(uuid.uuid4())
     results = mmu.recall(body.prompt, top_k=body.top_k, skip_pinned=body.skip_pinned)
 
-    # ── Phase 13.2: deliver matching skills ──
+    # ── Phase 13.2: deliver matching routines ──
     #
-    # This is the half of crystallization that was never built. A Skill had no
+    # This is the half of crystallization that was never built. A Routine had no
     # keywords and no embedding, so nothing could retrieve it; crystallizing
-    # three memories changed recall by zero bytes, and the 636-character skill
+    # three memories changed recall by zero bytes, and the 636-character routine
     # that was 11% of its source was never delivered in place of it.
     #
-    # A matched skill REPLACES its own members in the delivered context. That
-    # substitution is the entire point -- a skill that arrives alongside
+    # A matched routine REPLACES its own members in the delivered context. That
+    # substitution is the entire point -- a routine that arrives alongside
     # everything it compressed has added text rather than saved it. Members are
     # never deleted, and a direct query for one still finds it; they are only
     # withheld from this block, and `replaced_members` says which.
-    skills, replaced = [], set()
+    routines, replaced = [], set()
     try:
         qvec = EMB.embed(body.prompt) if EMB.enabled else None
-        skills = n4j.match_skills(
+        routines = n4j.match_routines(
             query_vector = qvec,
             terms        = ingest.extract_keywords(body.prompt),
-            limit        = SKILL_RECALL_MAX,
+            limit        = ROUTINE_RECALL_MAX,
         )
-        if skills:
-            for sk in skills:
+        if routines:
+            for sk in routines:
                 replaced.update(a for a in (sk.get("members") or []) if a)
-            n4j.record_skill_invocation([sk["skill_id"] for sk in skills])
+            n4j.record_routine_invocation([sk["routine_id"] for sk in routines])
     except Exception as e:
-        log.warning("skill matching failed (recall unaffected): %s", e)
+        log.warning("routine matching failed (recall unaffected): %s", e)
 
     context_lines = []
-    for sk in skills:
+    for sk in routines:
         context_lines.append(
-            f"[SKILL | {sk['via']} {sk['score']:.2f} | {sk['skill_id']}]\n"
+            f"[ROUTINE | {sk['via']} {sk['score']:.2f} | {sk['routine_id']}]\n"
             f"  When: {sk['trigger']}\n"
             f"  Do:   {sk['procedure']}"
         )
@@ -1503,7 +1503,7 @@ def recall(body: RecallIn):
         # Reported separately from `memories` for the same reason `anticipated`
         # is: these did not surface the way a memory surfaces, and blending them
         # would misrepresent why each is here.
-        "skills":        [{k: v for k, v in sk.items() if k != "members"}
+        "routines":        [{k: v for k, v in sk.items() if k != "members"}
                           # Only what this recall ACTUALLY withheld. Reporting
                           # every member regardless claimed credit for saving
                           # context that was never going to be delivered --
@@ -1512,7 +1512,7 @@ def recall(body: RecallIn):
                           # whether crystallizing was worth it.
                           | {"replaced_members": [a for a in (sk.get("members") or [])
                                                   if a in withheld]}
-                          for sk in skills],
+                          for sk in routines],
         "anticipated":   anticipated,
         "read_path":     getattr(mmu, "_last_read_path", "v2"),
         "read_ms":       getattr(mmu, "_last_read_ms", 0)
@@ -1696,8 +1696,8 @@ def ingest_document(body: IngestIn, x_mmu_session: Optional[str] = Header(None))
 # ───────────────────────────────────────────
 
 
-@app.get("/skill_candidates")
-def skill_candidates(min_cluster: int = 3, min_pairwise: float = 0.6, limit: int = 10):
+@app.get("/routine_candidates")
+def routine_candidates(min_cluster: int = 3, min_pairwise: float = 0.6, limit: int = 10):
     """
     Propose step. READ ONLY -- writes nothing, touches no Memory node.
 
@@ -1705,13 +1705,13 @@ def skill_candidates(min_cluster: int = 3, min_pairwise: float = 0.6, limit: int
     list on a young graph is the expected answer, not a failure; the threshold
     is not to be lowered to manufacture a candidate.
     """
-    cands = n4j.find_skill_candidates(
+    cands = n4j.find_routine_candidates(
         min_cluster=min_cluster, min_pairwise_norm=min_pairwise, limit=limit
     )
     # Phase 13.1: report the floor and which rule set it. An empty list is a
     # legitimate answer, but only readable as one if the caller can see the bar
     # that was actually applied and what it was derived from.
-    floor, ref_w, basis = n4j.skill_weight_floor(min_pairwise)
+    floor, ref_w, basis = n4j.routine_weight_floor(min_pairwise)
     return {
         "candidates": cands,
         "count":      len(cands),
@@ -1720,7 +1720,7 @@ def skill_candidates(min_cluster: int = 3, min_pairwise: float = 0.6, limit: int
             "min_pairwise_norm": min_pairwise,
             "weight_floor":      round(floor, 3),
             "reference_weight":  round(ref_w, 3),
-            "reference":         f"p{int(n4j.SKILL_NORM_PERCENTILE * 100)} of CO_RECALLED weight",
+            "reference":         f"p{int(n4j.ROUTINE_NORM_PERCENTILE * 100)} of CO_RECALLED weight",
             "floor_set_by":      basis,
         },
         "note": ("No cluster currently meets the mutual-density bar. This is a "
@@ -1737,9 +1737,9 @@ def crystallize(body: CrystallizeIn, x_mmu_source: Optional[str] = Header(None))
     anything else in this API.
 
     This is the one endpoint that restructures memory rather than adding to it:
-    source memories are demoted to Blue and become the skill's root system.
+    source memories are demoted to Blue and become the routine's root system.
     It is intentionally NOT wired into mmu_idle_daemon.py's IDLE_TOOLS -- Nova
-    may propose and may argue for a skill, but confirming is the user's.
+    may propose and may argue for a routine, but confirming is the user's.
     """
     _guard_model_write(x_mmu_source)
     if not body.confirmed:
@@ -1749,17 +1749,17 @@ def crystallize(body: CrystallizeIn, x_mmu_source: Optional[str] = Header(None))
             "source memories to Blue and is not something to trigger by accident."
         )
     if len(body.member_addresses) < 2:
-        raise HTTPException(400, "A skill needs at least 2 source memories")
+        raise HTTPException(400, "A routine needs at least 2 source memories")
     if not body.trigger.strip() or not body.procedure.strip():
         raise HTTPException(400, "trigger and procedure are both required")
 
-    skill, why = n4j.crystallize_skill(
+    routine, why = n4j.crystallize_routine(
         member_addresses = body.member_addresses,
         trigger          = body.trigger,
         procedure        = body.procedure,
         confidence       = body.confidence,
     )
-    if skill is None:
+    if routine is None:
         # 409, not 500: the usual cause is a stale address, which is a conflict
         # with the current graph rather than a server fault -- and the reviewer
         # can fix it in one step if told what actually happened.
@@ -1777,97 +1777,97 @@ def crystallize(body: CrystallizeIn, x_mmu_source: Optional[str] = Header(None))
 
     # Phase 13.1: close the loop. If this member set was sitting in the review
     # queue, mark it done so the next sweep stops re-proposing a cluster that
-    # is now a skill. Best-effort: the skill is already committed, and a
+    # is now a routine. Best-effort: the routine is already committed, and a
     # bookkeeping miss must not be reported as a failed crystallization.
-    n4j.close_proposal_for_members(body.member_addresses, skill["skill_id"])
+    n4j.close_proposal_for_members(body.member_addresses, routine["routine_id"])
 
-    # Phase 13.2: a skill nothing can retrieve is a skill that does not exist.
-    skill["indexed"] = _index_skill(skill["skill_id"], body.trigger, body.procedure)
-    skill["extends"] = _link_parent(skill["skill_id"], body.extends)
+    # Phase 13.2: a routine nothing can retrieve is a routine that does not exist.
+    routine["indexed"] = _index_routine(routine["routine_id"], body.trigger, body.procedure)
+    routine["extends"] = _link_parent(routine["routine_id"], body.extends)
 
-    return {"status": "crystallized", **skill}
-
-
-@app.get("/skills")
-def list_skills(status: Optional[str] = None):
-    """List Skill nodes. status filters to candidate | active | deprecated."""
-    skills = n4j.get_skills(status=status)
-    return {"skills": skills, "count": len(skills)}
+    return {"status": "crystallized", **routine}
 
 
-@app.get("/skill_tree")
-def skill_tree(root: Optional[str] = None):
-    """Phase 13: the EXTENDS_SKILL tree, or the whole forest."""
-    return {"tree": n4j.get_skill_tree(root_skill_id=root)}
+@app.get("/routines")
+def list_routines(status: Optional[str] = None):
+    """List Routine nodes. status filters to candidate | active | deprecated."""
+    routines = n4j.get_routines(status=status)
+    return {"routines": routines, "count": len(routines)}
 
 
-@app.post("/skills/{skill_id}/link")
-def link_skill(skill_id: str, parent_id: str):
+@app.get("/routine_tree")
+def routine_tree(root: Optional[str] = None):
+    """Phase 13: the EXTENDS_ROUTINE tree, or the whole forest."""
+    return {"tree": n4j.get_routine_tree(root_routine_id=root)}
+
+
+@app.post("/routines/{routine_id}/link")
+def link_routine(routine_id: str, parent_id: str):
     """
-    Phase 13: make skill_id extend parent_id. Rejects self-links and cycles.
+    Phase 13: make routine_id extend parent_id. Rejects self-links and cycles.
 
     Both ids accept an unambiguous prefix, since the truncated form is what
     anyone actually has in front of them.
     """
-    child, why = n4j.resolve_skill_id(skill_id)
+    child, why = n4j.resolve_routine_id(routine_id)
     if not child:
         raise HTTPException(404, why)
-    parent, why = n4j.resolve_skill_id(parent_id)
+    parent, why = n4j.resolve_routine_id(parent_id)
     if not parent:
         raise HTTPException(404, why)
-    skill_id, parent_id = child, parent
+    routine_id, parent_id = child, parent
     try:
-        ok = n4j.link_skills(skill_id, parent_id)
+        ok = n4j.link_routines(routine_id, parent_id)
     except ValueError as e:
         raise HTTPException(400, str(e))
     if not ok:
-        raise HTTPException(404, "one or both skills not found")
-    return {"status": "linked", "child": skill_id, "parent": parent_id}
+        raise HTTPException(404, "one or both routines not found")
+    return {"status": "linked", "child": routine_id, "parent": parent_id}
 
 
-@app.post("/skills/{skill_id}/unlink")
-def unlink_skill_endpoint(skill_id: str, parent_id: Optional[str] = None):
+@app.post("/routines/{routine_id}/unlink")
+def unlink_routine_endpoint(routine_id: str, parent_id: Optional[str] = None):
     """
-    Detach a skill from its parent, making it a root again.
+    Detach a routine from its parent, making it a root again.
 
     Both ids accept an unambiguous prefix. Omit parent_id to detach from every
     parent. Reparenting used to require uncrystallizing and rebuilding, which
-    changes the skill_id and destroys work in order to change one edge.
+    changes the routine_id and destroys work in order to change one edge.
     """
-    child, why = n4j.resolve_skill_id(skill_id)
+    child, why = n4j.resolve_routine_id(routine_id)
     if not child:
         raise HTTPException(404, why)
     parent = None
     if parent_id:
-        parent, why = n4j.resolve_skill_id(parent_id)
+        parent, why = n4j.resolve_routine_id(parent_id)
         if not parent:
             raise HTTPException(404, why)
 
-    removed, why = n4j.unlink_skill(child, parent)
+    removed, why = n4j.unlink_routine(child, parent)
     if why:
-        raise HTTPException(404 if why == "no such skill" else 409, why)
-    return {"status": "unlinked", "skill_id": child,
+        raise HTTPException(404 if why == "no such routine" else 409, why)
+    return {"status": "unlinked", "routine_id": child,
             "parent_id": parent, "edges_removed": removed}
 
 
-@app.post("/skills/{skill_id}/deprecate")
-def deprecate_skill_endpoint(skill_id: str):
+@app.post("/routines/{routine_id}/deprecate")
+def deprecate_routine_endpoint(routine_id: str):
     """
-    Phase 13: deprecate a skill, refusing while an active child extends it.
+    Phase 13: deprecate a routine, refusing while an active child extends it.
 
-    Rejects loudly rather than silently succeeding -- a live skill extending a
+    Rejects loudly rather than silently succeeding -- a live routine extending a
     deprecated parent is a broken tree nothing downstream would catch.
     """
-    ok, reason = n4j.deprecate_skill(skill_id)
+    ok, reason = n4j.deprecate_routine(routine_id)
     if not ok:
-        raise HTTPException(404 if reason == "no such skill" else 409, reason)
-    return {"status": "deprecated", "skill_id": skill_id}
+        raise HTTPException(404 if reason == "no such routine" else 409, reason)
+    return {"status": "deprecated", "routine_id": routine_id}
 
 
-@app.post("/skills/{skill_id}/uncrystallize")
-def uncrystallize(skill_id: str, confirm: str = ""):
+@app.post("/routines/{routine_id}/uncrystallize")
+def uncrystallize(routine_id: str, confirm: str = ""):
     """
-    Reverse a crystallization: delete the Skill, restore its members to the
+    Reverse a crystallization: delete the Routine, restore its members to the
     colours they had before, and return the proposal to the review queue.
 
     Requires confirm=UNCRYSTALLIZE. Symmetric with /crystallize on purpose --
@@ -1875,15 +1875,15 @@ def uncrystallize(skill_id: str, confirm: str = ""):
     """
     if confirm != "UNCRYSTALLIZE":
         raise HTTPException(
-            400, "Refusing without confirm=UNCRYSTALLIZE. This deletes the Skill "
+            400, "Refusing without confirm=UNCRYSTALLIZE. This deletes the Routine "
                  "and restores its source memories."
         )
-    resolved, why = n4j.resolve_skill_id(skill_id)
+    resolved, why = n4j.resolve_routine_id(routine_id)
     if not resolved:
         raise HTTPException(404, why)
-    info, why = n4j.uncrystallize_skill(resolved)
+    info, why = n4j.uncrystallize_routine(resolved)
     if info is None:
-        raise HTTPException(404 if why == "no such skill" else 409, why)
+        raise HTTPException(404 if why == "no such routine" else 409, why)
 
     for m in info["restored"]:
         try:
@@ -1895,39 +1895,39 @@ def uncrystallize(skill_id: str, confirm: str = ""):
     return {"status": "uncrystallized", **info}
 
 
-@app.post("/skills/reindex")
-def reindex_skills():
+@app.post("/routines/reindex")
+def reindex_routines():
     """
-    Embed and keyword-link any active skill that lacks either.
+    Embed and keyword-link any active routine that lacks either.
 
     Needed for anything crystallized before Phase 13.2, and as the recovery
     path when the embedding service was down at creation time. Safe to re-run.
     """
-    pending = n4j.get_skills_needing_index()
+    pending = n4j.get_routines_needing_index()
     done = []
     for sk in pending:
-        r = _index_skill(sk["skill_id"], sk["trigger"], sk["procedure"])
-        done.append({"skill_id": sk["skill_id"], **r})
-    return {"status": "reindexed", "count": len(done), "skills": done,
+        r = _index_routine(sk["routine_id"], sk["trigger"], sk["procedure"])
+        done.append({"routine_id": sk["routine_id"], **r})
+    return {"status": "reindexed", "count": len(done), "routines": done,
             "note": ("Nothing needed indexing." if not done else
-                     "These skills are now retrievable through /recall.")}
+                     "These routines are now retrievable through /recall.")}
 
 
-@app.get("/meta_skill_candidates")
-def meta_skill_candidates(min_shared: int = 2):
-    """Phase 13: skill pairs sharing source memories. Proposes only."""
-    props = n4j.propose_meta_skill(min_shared=min_shared)
+@app.get("/meta_routine_candidates")
+def meta_routine_candidates(min_shared: int = 2):
+    """Phase 13: routine pairs sharing source memories. Proposes only."""
+    props = n4j.propose_meta_routine(min_shared=min_shared)
     return {"candidates": props, "count": len(props),
-            "note": "Proposals only. Creating a meta-skill is a human decision."}
+            "note": "Proposals only. Creating a meta-routine is a human decision."}
 
 
 # ───────────────────────────────────────────
-#  PHASE 13.1 -- SKILL PROPOSAL QUEUE
+#  PHASE 13.1 -- ROUTINE PROPOSAL QUEUE
 # ───────────────────────────────────────────
 #
 # The human gate on /crystallize stays exactly where it was. These endpoints
 # only fix the fact that nothing ever rang the bell: candidates were computed
-# on demand by callers who never called, so no skill was ever formed from a
+# on demand by callers who never called, so no routine was ever formed from a
 # graph of 999 memories. The daemon may now queue what it notices. It still
 # cannot confirm anything.
 
@@ -1996,8 +1996,8 @@ def index_repair(apply: bool = False):
     return result
 
 
-@app.get("/skill_proposals")
-def skill_proposals(status: Optional[str] = "pending", limit: int = 50):
+@app.get("/routine_proposals")
+def routine_proposals(status: Optional[str] = "pending", limit: int = 50):
     """
     The review queue. status filters to pending | rejected | crystallized;
     pass status= (empty) for all of them.
@@ -2007,7 +2007,7 @@ def skill_proposals(status: Optional[str] = "pending", limit: int = 50):
     if status and status not in ("pending", "rejected", "crystallized"):
         raise HTTPException(400, "status must be pending, rejected or crystallized")
 
-    props = n4j.get_skill_proposals(status=status, limit=limit)
+    props = n4j.get_routine_proposals(status=status, limit=limit)
     return {
         "proposals": props,
         "count":     len(props),
@@ -2015,35 +2015,35 @@ def skill_proposals(status: Optional[str] = "pending", limit: int = 50):
         # as "the proposals" describes a page as if it were the whole queue --
         # and since these are score-ordered, one dense corpus can own a page
         # while the queue is far more varied.
-        "total":     n4j.count_skill_proposals(status=status),
+        "total":     n4j.count_routine_proposals(status=status),
         "note": ("Queued proposals only. Each still requires POST /crystallize "
-                 "with confirmed=true to become a Skill."),
+                 "with confirmed=true to become a Routine."),
     }
 
 
-@app.post("/skill_proposals/sweep")
-def sweep_skill_proposals(min_score: float = 0.70, limit: int = 10):
+@app.post("/routine_proposals/sweep")
+def sweep_routine_proposals(min_score: float = 0.70, limit: int = 10):
     """
     Find candidates and queue the ones that clear min_score.
 
-    Writes SkillProposal nodes and nothing else -- no Memory is read-modified,
-    no Skill is created, no memory is demoted. That is what makes this safe for
+    Writes RoutineProposal nodes and nothing else -- no Memory is read-modified,
+    no Routine is created, no memory is demoted. That is what makes this safe for
     the idle daemon to call unattended, and it is the only part of Phase 12/13
     that is.
 
     Idempotent: a cluster that is still dense refreshes its existing proposal
     rather than queuing a second copy, and one already rejected stays rejected.
     """
-    stats = n4j.queue_skill_proposals(min_score=min_score, limit=limit)
+    stats = n4j.queue_routine_proposals(min_score=min_score, limit=limit)
     return {
         "status":     "swept",
         "min_score":  min_score,
         **stats,
-        "note": "Nothing was crystallized. Review at GET /skill_proposals.",
+        "note": "Nothing was crystallized. Review at GET /routine_proposals.",
     }
 
 
-@app.post("/skill_proposals/{proposal_id}/crystallize")
+@app.post("/routine_proposals/{proposal_id}/crystallize")
 def crystallize_proposal(proposal_id: str, body: CrystallizeIn,
                          x_mmu_source: Optional[str] = Header(None)):
     """
@@ -2072,13 +2072,13 @@ def crystallize_proposal(proposal_id: str, body: CrystallizeIn,
     if not addrs:
         raise HTTPException(404 if why == "no such proposal" else 409, why)
 
-    skill, why = n4j.crystallize_skill(
+    routine, why = n4j.crystallize_routine(
         member_addresses = addrs,
         trigger          = body.trigger,
         procedure        = body.procedure,
         confidence       = body.confidence,
     )
-    if skill is None:
+    if routine is None:
         raise HTTPException(409, f"Crystallization failed; nothing was applied. {why}")
 
     for addr in addrs:
@@ -2088,21 +2088,21 @@ def crystallize_proposal(proposal_id: str, body: CrystallizeIn,
             log.warning("v2 index colour sync failed for %s: %s", addr, e)
     mmu.v2_index.save()
 
-    n4j.close_proposal_for_members(addrs, skill["skill_id"])
-    skill["indexed"] = _index_skill(skill["skill_id"], body.trigger, body.procedure)
-    skill["extends"] = _link_parent(skill["skill_id"], body.extends)
-    return {"status": "crystallized", "proposal_id": proposal_id, **skill}
+    n4j.close_proposal_for_members(addrs, routine["routine_id"])
+    routine["indexed"] = _index_routine(routine["routine_id"], body.trigger, body.procedure)
+    routine["extends"] = _link_parent(routine["routine_id"], body.extends)
+    return {"status": "crystallized", "proposal_id": proposal_id, **routine}
 
 
-@app.post("/skill_proposals/{proposal_id}/reject")
-def reject_skill_proposal_endpoint(proposal_id: str, note: str = ""):
+@app.post("/routine_proposals/{proposal_id}/reject")
+def reject_routine_proposal_endpoint(proposal_id: str, note: str = ""):
     """
     Decline a proposal so later sweeps stop re-offering it.
 
     Permanent by design: rejection is a judgement about the cluster, and a
     sweep that could quietly undo it would make the judgement pointless.
     """
-    ok, reason = n4j.reject_skill_proposal(proposal_id, note=note)
+    ok, reason = n4j.reject_routine_proposal(proposal_id, note=note)
     if not ok:
         raise HTTPException(404 if reason == "no such proposal" else 409, reason)
     return {"status": "rejected", "proposal_id": proposal_id}
@@ -2306,9 +2306,9 @@ def session_bundle(top_per_domain: int = 1):
     # Capped at three: this rides in front of every conversation, and a wall of
     # proposals would train the user to scroll past the whole block.
     try:
-        pending = n4j.get_skill_proposals(status="pending", limit=3)
+        pending = n4j.get_routine_proposals(status="pending", limit=3)
     except Exception as e:
-        log.warning("session_bundle: skill proposals unavailable: %s", e)
+        log.warning("session_bundle: routine proposals unavailable: %s", e)
         pending = []
 
     if pending:
@@ -2318,15 +2318,15 @@ def session_bundle(top_per_domain: int = 1):
             sem = p.get("semantic_coherence")
             sem_s = f", meaning {sem:.2f}" if isinstance(sem, (int, float)) else ""
             lines.append(
-                f"  [{p['skill_score']:.2f} score{sem_s}] {p['proposal_id']}"
+                f"  [{p['routine_score']:.2f} score{sem_s}] {p['proposal_id']}"
             )
             for prev in p.get("previews", []):
                 lines.append(f"    - {prev}")
         lines.append(
-            "  Crystallizing one of these compresses its members into a Skill and "
+            "  Crystallizing one of these compresses its members into a Routine and "
             "DEMOTES those memories to Blue. That is a change to how memory is "
             "structured, so it is the user's call and cannot be done from any tool you "
-            "have. Use review_skills for the full list. If one looks right to you, "
+            "have. Use review_routines for the full list. If one looks right to you, "
             "say which memories would be demoted and why the compression is worth "
             "it -- do not ask for approval as though it were a formality."
         )
@@ -2679,7 +2679,7 @@ def insights_endpoint():
     Phase 11 crystallization candidates, and top keywords.
 
     This endpoint is permanent infrastructure -- it becomes the engine for
-    Phase 11 skill proposal generation.
+    Phase 11 routine proposal generation.
     """
     try:
         data = n4j.get_insights()
@@ -2898,7 +2898,7 @@ def _fmt_pairs(pairs):
 def _fmt_candidates(cands):
     """
     Phase 13.1: candidates are clusters now, not single hub memories, because
-    all three call sites share find_skill_candidates(). A cluster is only
+    all three call sites share find_routine_candidates(). A cluster is only
     meaningful shown whole -- the members are the evidence of mutual density.
     """
     if not cands:
@@ -2907,7 +2907,7 @@ def _fmt_candidates(cands):
     for c in cands[:6]:
         mix = ", ".join(f"{v}x {k}" for k, v in sorted(c.get("src_mix", {}).items()))
         out.append(
-            f"  score {c['skill_score']:.2f} | {len(c['members'])} memories "
+            f"  score {c['routine_score']:.2f} | {len(c['members'])} memories "
             f"| coherence {c['grp_coherence']} | {mix or 'unknown source'}"
         )
         out.extend(f"    - {p}" for p in c.get("previews", []))

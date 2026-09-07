@@ -223,7 +223,7 @@ TOOLS = [
         700  General work
         701  Clients / accounts
         702  Work projects (distinct from personal projects)
-        703  Skills / capabilities
+        703  Routines / capabilities
         704  Industry / domain knowledge
 
         8xx — INTERESTS / HOBBIES (what the user does for enjoyment)
@@ -295,12 +295,12 @@ TOOLS = [
         }
     },
     {
-        "name": "review_skills",
+        "name": "review_routines",
         "description": (
-            "Read the pending skill-crystallization proposals: clusters of memories "
+            "Read the pending routine-crystallization proposals: clusters of memories "
             "the system has noticed are densely recalled together and semantically "
-            "related, which may be worth compressing into a single Skill. "
-            "Use when asked about skills, skill proposals, crystallization, what is "
+            "related, which may be worth compressing into a single Routine. "
+            "Use when asked about routines, routine proposals, crystallization, what is "
             "ready to crystallize, or what patterns are forming in memory. "
             "READ ONLY -- this cannot crystallize, reject, or change anything. "
             "Crystallizing demotes the source memories and requires the user's explicit "
@@ -378,12 +378,12 @@ TOOLS = [
 # server enforces this too, so removing the check here changes nothing.
 if ALLOW_CRYSTALLIZE:
     TOOLS.append({
-        "name": "crystallize_skill",
+        "name": "crystallize_routine",
         "description": (
-            "Confirm a pending skill proposal, turning it into a Skill. "
+            "Confirm a pending routine proposal, turning it into a Routine. "
             "THIS IS A WRITE AND IT RESTRUCTURES MEMORY: the source memories are "
-            "compressed into the new Skill and DEMOTED to Blue, the state the "
-            "recall gate treats as inactive. Read the proposal with review_skills "
+            "compressed into the new Routine and DEMOTED to Blue, the state the "
+            "recall gate treats as inactive. Read the proposal with review_routines "
             "first, say which memories will be demoted, and only proceed if the "
             "compression is genuinely worth losing their individual recall. "
             "Prefer leaving a proposal pending over crystallizing a doubtful one."
@@ -392,9 +392,9 @@ if ALLOW_CRYSTALLIZE:
             "type": "object",
             "properties": {
                 "proposal_id": {"type": "string",
-                                "description": "proposal_id from review_skills."},
+                                "description": "proposal_id from review_routines."},
                 "trigger":     {"type": "string",
-                                "description": "When this skill should fire. "
+                                "description": "When this routine should fire. "
                                                "A situation, not a topic."},
                 "procedure":   {"type": "string",
                                 "description": "What to actually do when it fires. "
@@ -402,10 +402,10 @@ if ALLOW_CRYSTALLIZE:
                                                "the source memories."},
                 "confidence":  {"type": "number", "default": 0.7},
                 "extends":     {"type": "string",
-                                "description": "Optional skill_id of a parent "
-                                               "skill this one specialises. Use "
+                                "description": "Optional routine_id of a parent "
+                                               "routine this one specialises. Use "
                                                "it to build a tree: several "
-                                               "narrow skills branching off one "
+                                               "narrow routines branching off one "
                                                "general one. Cycles and "
                                                "self-links are rejected."},
             },
@@ -413,63 +413,63 @@ if ALLOW_CRYSTALLIZE:
         },
     })
     TOOLS.append({
-        "name": "link_skill",
+        "name": "link_routine",
         "description": (
-            "Make one existing skill a branch of another, building the skill "
-            "tree. Use this to organise skills you have already created -- it "
+            "Make one existing routine a branch of another, building the routine "
+            "tree. Use this to organise routines you have already created -- it "
             "does NOT recreate anything, so ids stay stable and no memory "
             "changes colour. Prefer this over uncrystallizing and remaking a "
-            "skill just to change its parent. Self-links and cycles are "
+            "routine just to change its parent. Self-links and cycles are "
             "refused."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "skill_id":  {"type": "string",
-                              "description": "The child: the more specific skill. "
+                "routine_id":  {"type": "string",
+                              "description": "The child: the more specific routine. "
                                              "A unique prefix is accepted."},
                 "parent_id": {"type": "string",
-                              "description": "The parent: the more general skill "
+                              "description": "The parent: the more general routine "
                                              "it specialises."},
             },
-            "required": ["skill_id", "parent_id"],
+            "required": ["routine_id", "parent_id"],
         },
     })
     TOOLS.append({
-        "name": "unlink_skill",
+        "name": "unlink_routine",
         "description": (
-            "Detach a skill from its parent, making it a root again. The skill "
+            "Detach a routine from its parent, making it a root again. The routine "
             "and its memories are untouched -- use this to reparent rather "
             "than uncrystallizing and rebuilding."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "skill_id":  {"type": "string", "description": "The child to detach."},
+                "routine_id":  {"type": "string", "description": "The child to detach."},
                 "parent_id": {"type": "string",
                               "description": "Optional. Omit to detach from all parents."},
             },
-            "required": ["skill_id"],
+            "required": ["routine_id"],
         },
     })
     TOOLS.append({
-        "name": "uncrystallize_skill",
+        "name": "uncrystallize_routine",
         "description": (
-            "Reverse a crystallization. Deletes the Skill and restores its "
+            "Reverse a crystallization. Deletes the Routine and restores its "
             "source memories to the colours they had before, returning the "
-            "proposal to the review queue. Use this to undo a skill whose "
+            "proposal to the review queue. Use this to undo a routine whose "
             "trigger or procedure turned out wrong, or to free members that "
             "are blocking a better proposal. Refuses while another active "
-            "skill extends this one."
+            "routine extends this one."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "skill_id": {"type": "string",
-                             "description": "skill_id to reverse. An unambiguous "
+                "routine_id": {"type": "string",
+                             "description": "routine_id to reverse. An unambiguous "
                                             "prefix is accepted."},
             },
-            "required": ["skill_id"],
+            "required": ["routine_id"],
         },
     })
 
@@ -538,39 +538,39 @@ def mmu_rate(address, val_type, intensity=5, emotion_label=None):
 
 def _tool_inventory():
     """
-    What this process can actually do to skills.
+    What this process can actually do to routines.
 
     Stated explicitly because the alternative is inferring it from failures.
-    A model that does not know link_skill exists will reach for the only
+    A model that does not know link_routine exists will reach for the only
     branching route it does know -- uncrystallize and rebuild -- which changes
-    the skill id, re-enters the member-overlap refusals, and loops.
+    the routine id, re-enters the member-overlap refusals, and loops.
     """
     have = {t["name"] for t in TOOLS}
-    lines = ["Skill tools available in THIS session:"]
+    lines = ["Routine tools available in THIS session:"]
     for name, what in (
-        ("review_skills",       "read the queue and the existing tree"),
-        ("crystallize_skill",   "create a skill (optionally under a parent, via extends)"),
-        ("link_skill",          "branch an EXISTING skill under a parent, no rebuild"),
-        ("unlink_skill",        "detach a skill from its parent, no rebuild"),
-        ("uncrystallize_skill", "delete a skill and restore its memories"),
+        ("review_routines",       "read the queue and the existing tree"),
+        ("crystallize_routine",   "create a routine (optionally under a parent, via extends)"),
+        ("link_routine",          "branch an EXISTING routine under a parent, no rebuild"),
+        ("unlink_routine",        "detach a routine from its parent, no rebuild"),
+        ("uncrystallize_routine", "delete a routine and restore its memories"),
     ):
         lines.append(f"  {'YES' if name in have else 'NO '}  {name} -- {what}")
-    if "link_skill" not in have:
+    if "link_routine" not in have:
         lines.append(
-            "  Branching an existing skill is NOT possible in this session. Do "
+            "  Branching an existing routine is NOT possible in this session. Do "
             "not uncrystallize and rebuild to get around it: that changes the "
-            "skill id and re-enters the overlap refusals. Report it instead."
+            "routine id and re-enters the overlap refusals. Report it instead."
         )
     lines.append("")
     return "\n".join(lines) + "\n"
 
 
-def _existing_skills_block():
+def _existing_routines_block():
     """
-    The skills that already exist, with FULL ids.
+    The routines that already exist, with FULL ids.
 
-    Needed because crystallize_skill takes an `extends` parent id and nothing
-    listed skills, so the only way to branch was to be handed an id from
+    Needed because crystallize_routine takes an `extends` parent id and nothing
+    listed routines, so the only way to branch was to be handed an id from
     outside the conversation. A tree cannot be built by someone who cannot see
     it, and the ids shown in summaries are truncated, which matched nothing.
 
@@ -578,19 +578,19 @@ def _existing_skills_block():
     members already belong to one of these cannot be crystallized again.
     """
     try:
-        r = requests.get(f"{MMU_BASE}/skill_tree", headers=_SESSION_HEADERS, timeout=10)
+        r = requests.get(f"{MMU_BASE}/routine_tree", headers=_SESSION_HEADERS, timeout=10)
         tree = r.json().get("tree", [])
     except Exception:
         return ""
     if not tree:
         return ""
 
-    out = ["Existing skills. Branch a NEW one under a parent with `extends` on "
-           "crystallize_skill; branch an EXISTING one with link_skill (no "
+    out = ["Existing routines. Branch a NEW one under a parent with `extends` on "
+           "crystallize_routine; branch an EXISTING one with link_routine (no "
            "rebuild needed):"]
 
     def walk(node, depth):
-        out.append(f"  {'  ' * depth}{node['skill_id']}")
+        out.append(f"  {'  ' * depth}{node['routine_id']}")
         out.append(f"  {'  ' * depth}   {(node.get('trigger') or '')[:88]}")
         for kid in node.get("children", []):
             walk(kid, depth + 1)
@@ -601,7 +601,7 @@ def _existing_skills_block():
     return "\n".join(out) + "\n"
 
 
-def mmu_skill_proposals(limit=10):
+def mmu_routine_proposals(limit=10):
     """
     Read the crystallization review queue.
 
@@ -615,22 +615,22 @@ def mmu_skill_proposals(limit=10):
     corpus, so the honest reading of the output was "all the proposals are
     about one topic" -- which was false, and led to exactly that conclusion.
     """
-    existing = _staleness_warning() + _tool_inventory() + _existing_skills_block()
+    existing = _staleness_warning() + _tool_inventory() + _existing_routines_block()
     try:
-        r = requests.get(f"{MMU_BASE}/skill_proposals",
+        r = requests.get(f"{MMU_BASE}/routine_proposals",
                          params={"status": "pending", "limit": limit},
                          headers=_SESSION_HEADERS, timeout=10)
         data = r.json()
         props = data.get("proposals", [])
         if not props:
             return (existing +
-                    "No skill proposals are pending review. Clusters are queued "
+                    "No routine proposals are pending review. Clusters are queued "
                     "automatically when they become dense and coherent enough; "
                     "an empty queue means nothing currently clears the bar.")
 
         total = data.get("total", len(props))
         lines_prefix = existing
-        header = f"{len(props)} of {total} pending skill proposal(s)"
+        header = f"{len(props)} of {total} pending routine proposal(s)"
         if total > len(props):
             header += f" (highest-scoring first; ask for limit={total} to see all)"
         lines = [lines_prefix + header + ":", ""]
@@ -654,17 +654,17 @@ def mmu_skill_proposals(limit=10):
             sem_s = f"{sem:.2f}" if isinstance(sem, (int, float)) else "n/a"
             mix = ", ".join(f"{v}x {k}" for k, v in sorted((p.get("src_mix") or {}).items()))
             lines.append(
-                f"[{i}] score {p['skill_score']:.2f} "
+                f"[{i}] score {p['routine_score']:.2f} "
                 f"(co-recall {p.get('avg_weight')}, domain {p.get('grp_coherence')}, "
                 f"meaning {sem_s}) | {mix}"
             )
             lines.append(f"    proposal_id: {p['proposal_id']}")
             if p.get("blocked"):
-                who = ", ".join(b["skill_id"][:8] for b in p.get("blocked_by", []))
+                who = ", ".join(b["routine_id"][:8] for b in p.get("blocked_by", []))
                 lines.append(
                     f"    CANNOT CRYSTALLIZE: member(s) already belong to active "
-                    f"skill {who}. A memory cannot be compressed into two skills. "
-                    f"Uncrystallize that skill first, or leave this one."
+                    f"routine {who}. A memory cannot be compressed into two routines. "
+                    f"Uncrystallize that routine first, or leave this one."
                 )
             if p.get("members_missing"):
                 lines.append(f"    WARNING: {p['members_missing']} member(s) no longer exist")
@@ -675,7 +675,7 @@ def mmu_skill_proposals(limit=10):
 
         lines.append(
             "These are proposals only. Nothing has been written. Crystallizing one "
-            "compresses its members into a Skill and DEMOTES them to Blue, which "
+            "compresses its members into a Routine and DEMOTES them to Blue, which "
             "changes how memory is structured -- so it needs the user's explicit "
             "confirmation and cannot be done from this tool. You may read them, "
             "argue for or against one, and draft the trigger and procedure text. "
@@ -683,7 +683,7 @@ def mmu_skill_proposals(limit=10):
         )
         return "\n".join(lines)
     except Exception as e:
-        return f"[MMU skill proposals error: {e}]"
+        return f"[MMU routine proposals error: {e}]"
 
 
 def mmu_crystallize(proposal_id, trigger, procedure, confidence=0.7, extends=None):
@@ -697,7 +697,7 @@ def mmu_crystallize(proposal_id, trigger, procedure, confidence=0.7, extends=Non
     """
     try:
         r = requests.post(
-            f"{MMU_BASE}/skill_proposals/{proposal_id}/crystallize",
+            f"{MMU_BASE}/routine_proposals/{proposal_id}/crystallize",
             json={"member_addresses": [], "trigger": trigger,
                   "procedure": procedure, "confidence": confidence,
                   "extends": extends, "confirmed": True},
@@ -710,33 +710,33 @@ def mmu_crystallize(proposal_id, trigger, procedure, confidence=0.7, extends=Non
         ext = data.get("extends")
         branch = ""
         if ext and not str(ext).startswith("not linked"):
-            branch = f"Branched under parent skill {ext}.\n"
+            branch = f"Branched under parent routine {ext}.\n"
         elif ext:
             branch = f"WARNING: {ext}\n"
         return (
-            f"Crystallized skill {data['skill_id']} from {len(data['members'])} "
+            f"Crystallized routine {data['routine_id']} from {len(data['members'])} "
             f"memories, which are now Blue.\n"
             f"{branch}"
             f"Trigger: {data['trigger']}\n"
-            f"This can be undone: POST /skills/{data['skill_id']}/uncrystallize"
+            f"This can be undone: POST /routines/{data['routine_id']}/uncrystallize"
             f"?confirm=UNCRYSTALLIZE"
         )
     except Exception as e:
         return f"[MMU crystallize error: {e}]"
 
 
-def mmu_link_skill(skill_id, parent_id):
+def mmu_link_routine(routine_id, parent_id):
     """
-    Branch an existing skill under a parent, without recreating it.
+    Branch an existing routine under a parent, without recreating it.
 
     This is the operation whose absence caused the loop. Branching was only
-    possible via crystallize_skill's `extends`, i.e. only at creation, so an
-    already-created skill could be branched only by destroying and rebuilding
+    possible via crystallize_routine's `extends`, i.e. only at creation, so an
+    already-created routine could be branched only by destroying and rebuilding
     it -- which changes the id and re-enters the overlap checks.
     """
     try:
         r = requests.post(
-            f"{MMU_BASE}/skills/{skill_id}/link",
+            f"{MMU_BASE}/routines/{routine_id}/link",
             params={"parent_id": parent_id},
             headers={**_SESSION_HEADERS, "X-MMU-Source": "model"},
             timeout=30,
@@ -745,19 +745,19 @@ def mmu_link_skill(skill_id, parent_id):
         if r.status_code != 200:
             return f"[MMU link refused: {data.get('detail', r.status_code)}]"
         return (f"Linked: {data['child']} now extends {data['parent']}. "
-                f"Check the shape with review_skills.")
+                f"Check the shape with review_routines.")
     except Exception as e:
         return f"[MMU link error: {e}]"
 
 
-def mmu_unlink_skill(skill_id, parent_id=None):
-    """Detach a skill from its parent, making it a root again."""
+def mmu_unlink_routine(routine_id, parent_id=None):
+    """Detach a routine from its parent, making it a root again."""
     try:
         params = {}
         if parent_id:
             params["parent_id"] = parent_id
         r = requests.post(
-            f"{MMU_BASE}/skills/{skill_id}/unlink",
+            f"{MMU_BASE}/routines/{routine_id}/unlink",
             params=params,
             headers={**_SESSION_HEADERS, "X-MMU-Source": "model"},
             timeout=30,
@@ -765,26 +765,26 @@ def mmu_unlink_skill(skill_id, parent_id=None):
         data = r.json()
         if r.status_code != 200:
             return f"[MMU unlink refused: {data.get('detail', r.status_code)}]"
-        return (f"Unlinked {data['skill_id']}: {data['edges_removed']} parent "
-                f"link(s) removed. The skill itself is untouched.")
+        return (f"Unlinked {data['routine_id']}: {data['edges_removed']} parent "
+                f"link(s) removed. The routine itself is untouched.")
     except Exception as e:
         return f"[MMU unlink error: {e}]"
 
 
-def mmu_uncrystallize(skill_id):
+def mmu_uncrystallize(routine_id):
     """
-    Reverse a crystallization: delete the Skill and restore its members.
+    Reverse a crystallization: delete the Routine and restore its members.
 
     Gated by the same flag as crystallize. Creating without being able to
     reverse is the worse asymmetry of the two -- it lets a mistake become
     permanent for whoever holds the undo, and the natural next move after a
-    bad skill ("undo it and remake it properly") is then unavailable. This is
+    bad routine ("undo it and remake it properly") is then unavailable. This is
     also the strictly safer half: it restores memories rather than demoting
     them.
     """
     try:
         r = requests.post(
-            f"{MMU_BASE}/skills/{skill_id}/uncrystallize",
+            f"{MMU_BASE}/routines/{routine_id}/uncrystallize",
             params={"confirm": "UNCRYSTALLIZE"},
             headers={**_SESSION_HEADERS, "X-MMU-Source": "model"},
             timeout=30,
@@ -794,8 +794,8 @@ def mmu_uncrystallize(skill_id):
             return f"[MMU uncrystallize refused: {data.get('detail', r.status_code)}]"
         kept = data.get("still_demoted") or []
         note = (f" {len(kept)} member(s) stayed demoted because another active "
-                f"skill still owns them." if kept else "")
-        return (f"Uncrystallized {data['skill_id']}. "
+                f"routine still owns them." if kept else "")
+        return (f"Uncrystallized {data['routine_id']}. "
                 f"{len(data['restored'])} memory/memories restored to their "
                 f"previous colour. Any matching proposal returns to the "
                 f"review queue.{note}")
@@ -884,10 +884,10 @@ def handle(msg):
                 source_url=arguments.get("source_url"),
             )
 
-        elif name == "review_skills":
-            text = mmu_skill_proposals(limit=arguments.get("limit", 5))
+        elif name == "review_routines":
+            text = mmu_routine_proposals(limit=arguments.get("limit", 5))
 
-        elif name == "crystallize_skill":
+        elif name == "crystallize_routine":
             if not ALLOW_CRYSTALLIZE:
                 text = ("Crystallization is not enabled for tool use. It demotes "
                         "the source memories, so it is confirmed by a human "
@@ -901,26 +901,26 @@ def handle(msg):
                     extends     = arguments.get("extends"),
                 )
 
-        elif name == "link_skill":
+        elif name == "link_routine":
             if not ALLOW_CRYSTALLIZE:
-                text = "Editing the skill tree is not enabled for tool use."
+                text = "Editing the routine tree is not enabled for tool use."
             else:
-                text = mmu_link_skill(arguments.get("skill_id", ""),
+                text = mmu_link_routine(arguments.get("routine_id", ""),
                                       arguments.get("parent_id", ""))
 
-        elif name == "unlink_skill":
+        elif name == "unlink_routine":
             if not ALLOW_CRYSTALLIZE:
-                text = "Editing the skill tree is not enabled for tool use."
+                text = "Editing the routine tree is not enabled for tool use."
             else:
-                text = mmu_unlink_skill(arguments.get("skill_id", ""),
+                text = mmu_unlink_routine(arguments.get("routine_id", ""),
                                         arguments.get("parent_id"))
 
-        elif name == "uncrystallize_skill":
+        elif name == "uncrystallize_routine":
             if not ALLOW_CRYSTALLIZE:
                 text = ("Reversing a crystallization is not enabled for tool "
                         "use. Ask for it to be undone through mmu_review.py.")
             else:
-                text = mmu_uncrystallize(arguments.get("skill_id", ""))
+                text = mmu_uncrystallize(arguments.get("routine_id", ""))
 
         elif name == "rate_memory":
             text = mmu_rate(

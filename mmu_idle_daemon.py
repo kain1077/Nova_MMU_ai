@@ -397,17 +397,17 @@ class MMUClient:
             "inspired_by":     inspired_by or [],
         })
 
-    def sweep_skill_proposals(self, min_score=0.70, limit=10):
+    def sweep_routine_proposals(self, min_score=0.70, limit=10):
         """
         Phase 13.1: queue crystallization candidates for human review.
 
-        Writes SkillProposal nodes only -- no Memory is modified and no Skill
+        Writes RoutineProposal nodes only -- no Memory is modified and no Routine
         is created. This is the daemon's entire involvement in crystallization
         and the reason it is allowed to run unattended. Confirming a proposal
         is a human action through POST /crystallize, and deliberately remains
         absent from IDLE_TOOLS so the model cannot reach it.
         """
-        return self._post("/skill_proposals/sweep",
+        return self._post("/routine_proposals/sweep",
                           {"min_score": min_score, "limit": limit},
                           timeout=60)
 
@@ -518,7 +518,7 @@ def run_pass(depth, mmu, llm, dry_run=False):
         "saved_memories":   [],
         "artifacts":        [],
         "final_text":       "",
-        "skill_proposals":  None,
+        "routine_proposals":  None,
         "error":            None,
     }
 
@@ -607,7 +607,7 @@ def run_pass(depth, mmu, llm, dry_run=False):
     # ── Step 3: crystallization sweep ──
     #
     # Runs after the model is done, on the graph the pass just left behind.
-    # Read-mostly: it writes SkillProposal nodes and nothing else. Nova is not
+    # Read-mostly: it writes RoutineProposal nodes and nothing else. Nova is not
     # consulted and cannot veto -- this is bookkeeping about the shape of the
     # graph, not a thought she is having.
     #
@@ -615,17 +615,17 @@ def run_pass(depth, mmu, llm, dry_run=False):
     # produced good memories is not a failed pass because the sweep tripped.
     if not dry_run:
         try:
-            sweep = mmu.sweep_skill_proposals()
-            result["skill_proposals"] = sweep
+            sweep = mmu.sweep_routine_proposals()
+            result["routine_proposals"] = sweep
             if sweep.get("created"):
-                log.info("Skill proposals: %d new, %d refreshed, %d pending total "
-                         "-- review at GET /skill_proposals",
+                log.info("Routine proposals: %d new, %d refreshed, %d pending total "
+                         "-- review at GET /routine_proposals",
                          sweep.get("created", 0), sweep.get("refreshed", 0),
                          sweep.get("pending", 0))
             else:
-                log.info("Skill proposals: none new (%d pending)", sweep.get("pending", 0))
+                log.info("Routine proposals: none new (%d pending)", sweep.get("pending", 0))
         except Exception as e:
-            log.warning("Skill proposal sweep failed (pass otherwise fine): %s", e)
+            log.warning("Routine proposal sweep failed (pass otherwise fine): %s", e)
 
     result["elapsed_sec"] = round(time.time() - started, 1)
     log.info("IDLE PASS END | depth=%s | %ds | %d memories | %d artifacts",

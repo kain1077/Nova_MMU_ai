@@ -161,7 +161,7 @@ REQUIRED: grp_code from taxonomy (3-digit code):
 4xx PREFERENCES: 400 general, 401 entertainment, 402 music, 403 food, 404 aesthetic, 405 technology
 5xx EMOTIONAL:   500 general, 501 current state, 502 relational, 503 faith, 504 AI companionship
 6xx RESEARCH:    600 general, 601 physics/theory, 602 papers, 603 experiments, 604 related works
-7xx WORK:        700 general, 701 clients, 702 projects, 703 skills, 704 industry
+7xx WORK:        700 general, 701 clients, 702 projects, 703 routines, 704 industry
 8xx INTERESTS:   800 general, 801 gaming, 802 music, 803 film/TV, 804 outdoors, 805 creative
 9xx MISC:        900 general, 901 temporary, 902 unclassified
 

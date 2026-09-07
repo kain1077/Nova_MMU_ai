@@ -23,7 +23,7 @@ runs entirely on your own machine.
   searchable with page-level provenance. Reference material never ages.
 - **Proactive suggestions.** Recall can carry a small "you might also want" list drawn
   from connections across different domains.
-- **Skills.** Memories that cluster densely can be crystallized into a `Skill` node —
+- **Routines.** Memories that cluster densely can be crystallized into a `Routine` node —
   with human confirmation, never automatically.
 
 Everything runs locally. See [Privacy](#privacy).
@@ -222,19 +222,19 @@ text. Its judgment is a filter; a verbatim dump has none.
 
 ---
 
-## Skills
+## Routines
 
 Memories that are always recalled together are evidence of a pattern. MMU can compress
-such a cluster into a **Skill** — a `trigger` (when this applies) and a `procedure` (what
+such a cluster into a **Routine** — a `trigger` (when this applies) and a `procedure` (what
 to do), stored as one node and delivered instead of its source memories.
 
 The source memories are **never deleted**. They are demoted to Blue and become the
-skill's root system: still there, still findable directly, no longer competing in every
+routine's root system: still there, still findable directly, no longer competing in every
 recall. On a graph where one large corpus dominates, that is the point — the compression
 is worth less than the un-biasing.
 
 **Nothing crystallizes on its own.** The idle daemon looks for dense, coherent clusters
-and queues them as proposals; turning one into a Skill is a human decision, because it
+and queues them as proposals; turning one into a Routine is a human decision, because it
 restructures memory rather than adding to it.
 
 ```
@@ -251,26 +251,44 @@ Confirming shows exactly which memories will be demoted and requires you to type
 Everything is reversible:
 
 ```bash
-curl -X POST "http://127.0.0.1:8765/skills/<skill_id>/uncrystallize?confirm=UNCRYSTALLIZE"
+curl -X POST "http://127.0.0.1:8765/routines/<routine_id>/uncrystallize?confirm=UNCRYSTALLIZE"
 ```
 
-That deletes the Skill, restores each member to the colour it had before, and returns the
+That deletes the Routine, restores each member to the colour it had before, and returns the
 proposal to the queue.
 
-Skills form a tree. A narrow skill can extend a general one, so a common topic resolves
+Routines form a tree. A narrow routine can extend a general one, so a common topic resolves
 through one node instead of a dozen memories:
 
 ```bash
-curl -X POST "http://127.0.0.1:8765/skills/<child>/link?parent_id=<parent>"
+curl -X POST "http://127.0.0.1:8765/routines/<child>/link?parent_id=<parent>"
 ```
 
-Ids accept an unambiguous prefix. Cycles and self-links are refused, and a skill with an
+Ids accept an unambiguous prefix. Cycles and self-links are refused, and a routine with an
 active child cannot be deleted out from under it.
+
+### Upgrading from Skills
+
+This concept used to be called a **Skill**. It was renamed to avoid colliding with
+agent `SKILL.md` files, which are a different thing entirely -- authored instructions
+rather than memories the system compressed on its own.
+
+If you have an existing graph, rename it in place with the server stopped:
+
+```bash
+docker compose stop mmu-server
+python migrate_skill_to_routine.py --dry-run   # preview
+python migrate_skill_to_routine.py
+docker compose build mmu-server && docker compose up -d mmu-server
+```
+
+The `/skills/...` endpoints are now `/routines/...`, the MCP tools are renamed to
+match, and `MMU_SKILL_RECALL_MAX` is now `MMU_ROUTINE_RECALL_MAX`.
 
 ### Letting a model do it
 
 `MMU_ALLOW_MODEL_CRYSTALLIZE=true` gives your model tools to review, create, branch and
-reverse skills itself. **Off by default, and the default is the recommendation:** a model
+reverse routines itself. **Off by default, and the default is the recommendation:** a model
 that drafts a proposal can then approve its own draft, and the review stops being a
 review. It is enforced server-side, not merely by hiding the tool.
 
@@ -340,7 +358,7 @@ worth knowing early:
 | `MMU_SEMANTIC_FLOOR` | `0.0` | Drop weak keyword hits. `0.0` = off. |
 | `MMU_ANTICIPATE_MAX` | `3` | Proactive suggestions per recall. `0` = off. |
 | `MMU_BIND` | `127.0.0.1` | Interface the ports bind to. `0.0.0.0` exposes to your LAN. |
-| `MMU_ALLOW_MODEL_CRYSTALLIZE` | `false` | Let a model create and reverse skills itself. See [Skills](#skills). |
+| `MMU_ALLOW_MODEL_CRYSTALLIZE` | `false` | Let a model create and reverse routines itself. See [Routines](#routines). |
 | `MMU_API_KEY` | *(unset)* | Shared secret. Required on every endpoint but `/health` when set. |
 | `MMU_CORS_ORIGINS` | *(empty)* | Browser origins allowed. Empty disables CORS. |
 
@@ -506,7 +524,7 @@ Detail lives in `phase_packages/`, which documents how each piece came to be and
         |
   mmu_mcp_server.py        stdio MCP -> HTTP
         |
-  mmu_server.py            FastAPI: recall, remember, ingest, skills
+  mmu_server.py            FastAPI: recall, remember, ingest, routines
         |            \
   light_index_v2.py   neo4j_layer.py
   (fast keyword gate)  (graph, vectors, aging)
@@ -530,12 +548,12 @@ reader doesn't have to go find it.
   validated against a real instance that size and the from-scratch second-instance test
   described in [Running a second instance](#running-a-second-instance). Nobody has thrown
   10,000 memories or concurrent multi-user load at it, and it isn't built for that yet.
-- **Skill crystallization reaches real candidates now, but the confirm-and-write path is
+- **Routine crystallization reaches real candidates now, but the confirm-and-write path is
   still lightly exercised end to end.** Three bugs made it structurally unreachable until
   Phase 13.1/13.2 fixed them (documents were excluded from candidates, edge weights were
   normalized against the wrong population, and the model-crystallize flag wasn't reaching
   the process that read it). Candidates surface correctly now. Confirming one and watching
-  it demote member memories into a Skill has been validated at the mechanism level, not
+  it demote member memories into a Routine has been validated at the mechanism level, not
   worn in by repeated real use yet.
 - **CON numbers aren't permanent external identifiers.** `get_next_con()` uses
   `max(existing)+1`, which guarantees uniqueness at write time but will reuse a number if

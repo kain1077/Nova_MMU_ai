@@ -42,7 +42,7 @@ SIMILAR_THRESH = 0.72
 # instance at deploy time, not assumed from the model name.
 EMBEDDING_DIM   = int(os.environ.get("MMU_EMBEDDING_DIM", "768"))
 EMBEDDING_INDEX = "memory_embedding"
-SKILL_EMBEDDING_INDEX = "skill_embedding"
+ROUTINE_EMBEDDING_INDEX = "routine_embedding"
 
 SOURCE_LABELS = {
     0: "Conversation",
@@ -95,13 +95,13 @@ CONSTRAINTS = [
     "CREATE CONSTRAINT source_key   IF NOT EXISTS FOR (s:Source)  REQUIRE s.source_key IS UNIQUE",
     # Phase 7 -- CreativeOutput nodes produced during background cognition
     "CREATE CONSTRAINT creative_out  IF NOT EXISTS FOR (c:CreativeOutput) REQUIRE c.output_id IS UNIQUE",
-    # Phase 12 -- Skill nodes (procedural memory crystallization)
-    "CREATE CONSTRAINT skill_id      IF NOT EXISTS FOR (sk:Skill) REQUIRE sk.skill_id IS UNIQUE",
+    # Phase 12 -- Routine nodes (procedural memory crystallization)
+    "CREATE CONSTRAINT routine_id      IF NOT EXISTS FOR (sk:Routine) REQUIRE sk.routine_id IS UNIQUE",
     # Phase 13.1 -- queued crystallization proposals awaiting human review.
     # member_key is unique so a repeated sweep MERGEs onto the same proposal
     # instead of stacking duplicates of a cluster that is simply still dense.
-    "CREATE CONSTRAINT proposal_id   IF NOT EXISTS FOR (p:SkillProposal) REQUIRE p.proposal_id IS UNIQUE",
-    "CREATE CONSTRAINT proposal_key  IF NOT EXISTS FOR (p:SkillProposal) REQUIRE p.member_key IS UNIQUE",
+    "CREATE CONSTRAINT proposal_id   IF NOT EXISTS FOR (p:RoutineProposal) REQUIRE p.proposal_id IS UNIQUE",
+    "CREATE CONSTRAINT proposal_key  IF NOT EXISTS FOR (p:RoutineProposal) REQUIRE p.member_key IS UNIQUE",
 ]
 
 INDEXES = [
@@ -145,20 +145,20 @@ def bootstrap_schema():
                 log.info("Vector index %s ensured (dim=%d, cosine)",
                          EMBEDDING_INDEX, EMBEDDING_DIM)
 
-                # Phase 13.2: the same treatment for Skill. A separate index
-                # rather than a shared one -- skills and memories are ranked
+                # Phase 13.2: the same treatment for Routine. A separate index
+                # rather than a shared one -- routines and memories are ranked
                 # against each other only after both are retrieved, and mixing
                 # labels in one ANN index would make "top k memories" and "top
-                # k skills" compete for the same k.
+                # k routines" compete for the same k.
                 s.run(f"""
-                    CREATE VECTOR INDEX {SKILL_EMBEDDING_INDEX} IF NOT EXISTS
-                    FOR (sk:Skill) ON (sk.embedding)
+                    CREATE VECTOR INDEX {ROUTINE_EMBEDDING_INDEX} IF NOT EXISTS
+                    FOR (sk:Routine) ON (sk.embedding)
                     OPTIONS {{ indexConfig: {{
                         `vector.dimensions`: {int(EMBEDDING_DIM)},
                         `vector.similarity_function`: 'cosine'
                     }} }}
                 """)
-                log.info("Vector index %s ensured", SKILL_EMBEDDING_INDEX)
+                log.info("Vector index %s ensured", ROUTINE_EMBEDDING_INDEX)
             except Exception as e:
                 # Community edition below 5.11 has no vector index support.
                 # Semantic recall degrades to the keyword path; nothing breaks.
@@ -986,8 +986,8 @@ def delete_all_memories():
     """
     Remove every Memory node and everything attached to it.
 
-    Keeps Skill nodes: they are a separate abstraction and erasing memories
-    should not silently destroy crystallized skills. Callers wanting a truly
+    Keeps Routine nodes: they are a separate abstraction and erasing memories
+    should not silently destroy crystallized routines. Callers wanting a truly
     blank slate can drop the Docker volume.
 
     Returns the number of Memory nodes removed.
@@ -1217,26 +1217,26 @@ def fetch_payloads(addresses):
 #  PHASE 12 — PROCEDURAL MEMORY CRYSTALLIZATION
 # ═════════════════════════════════════════════
 #
-# Memories that cluster densely and cohere by domain compress into a Skill,
+# Memories that cluster densely and cohere by domain compress into a Routine,
 # mirroring declarative memory becoming procedural. Source memories are never
-# deleted -- they are demoted to Blue and become the skill's root system.
+# deleted -- they are demoted to Blue and become the routine's root system.
 #
 # THREE-STEP BY DESIGN, and the split is structural rather than conventional:
 #
-#   find_skill_candidates()  reads. Writes nothing. Safe to poll.
-#   queue_skill_proposals()  writes SkillProposal nodes only. Never touches a
+#   find_routine_candidates()  reads. Writes nothing. Safe to poll.
+#   queue_routine_proposals()  writes RoutineProposal nodes only. Never touches a
 #                            Memory node. Safe for the idle daemon.
-#   crystallize_skill()      writes, atomically, and only on explicit human
+#   crystallize_routine()      writes, atomically, and only on explicit human
 #                            confirmation.
 #
 # This is the one phase that restructures Nova's own memory rather than adding
 # capability beside it. Getting it wrong is not a bug, it is an identity-model
-# change nobody approved. crystallize_skill() is deliberately NOT reachable
+# change nobody approved. crystallize_routine() is deliberately NOT reachable
 # from mmu_idle_daemon.py's IDLE_TOOLS.
 #
 # ── Phase 13.1: two bugs that made crystallization unreachable ──
 #
-# Symptom: 999 memories, 724 co-recall edges, zero Skill nodes ever formed.
+# Symptom: 999 memories, 724 co-recall edges, zero Routine nodes ever formed.
 #
 # 1. DOCUMENTS WERE EXCLUDED. This function carried `src_type <> 2`, copied
 #    from get_anticipated_context() where it is correct -- a paragraph of a
@@ -1245,7 +1245,7 @@ def fetch_payloads(addresses):
 #    the trip. Crystallization is the opposite operation, and compressing a
 #    large reference corpus into one procedural node is exactly what a graph
 #    of 861 documents needs. The filter made 86% of memories permanently
-#    ineligible, so the densest region of the graph could never form a skill
+#    ineligible, so the densest region of the graph could never form a routine
 #    and stayed as hundreds of flat memories competing in every recall. That
 #    is a retrieval bias with a structural cause, not a tuning problem.
 #
@@ -1263,18 +1263,18 @@ def fetch_payloads(addresses):
 # young graph still cannot manufacture a candidate out of noise.
 
 # Reference point for weight normalization. Deliberately not max().
-SKILL_NORM_PERCENTILE = 0.90
+ROUTINE_NORM_PERCENTILE = 0.90
 
 # Absolute floor, applied under the normalized one. On a young or sparse graph
 # p90 can itself be 1-2, and 0.6 * that would admit noise. A pair that has not
 # been co-recalled at least this often is not evidence of anything, whatever
 # the rest of the distribution happens to look like.
-SKILL_MIN_ABS_WEIGHT = 3.0
+ROUTINE_MIN_ABS_WEIGHT = 3.0
 
 
-def skill_weight_floor(min_pairwise_norm=0.6):
+def routine_weight_floor(min_pairwise_norm=0.6):
     """
-    The co-recall weight a pair must clear to count toward a skill cluster.
+    The co-recall weight a pair must clear to count toward a routine cluster.
 
     Returns (floor, reference_weight, basis) where reference_weight is the
     percentile the floor came from and basis names which of the two rules
@@ -1283,25 +1283,25 @@ def skill_weight_floor(min_pairwise_norm=0.6):
     """
     driver = get_driver()
     if driver is None:
-        return SKILL_MIN_ABS_WEIGHT, 0.0, "absolute"
+        return ROUTINE_MIN_ABS_WEIGHT, 0.0, "absolute"
     try:
         with driver.session() as s:
             rec = s.run("""
                 MATCH ()-[r:CO_RECALLED]-()
                 RETURN percentileCont(r.weight, $p) AS ref
-            """, p=float(SKILL_NORM_PERCENTILE)).single()
+            """, p=float(ROUTINE_NORM_PERCENTILE)).single()
             ref = float((rec and rec["ref"]) or 0.0)
     except Exception as e:
-        log.warning(f"skill_weight_floor failed, using absolute floor: {e}")
-        return SKILL_MIN_ABS_WEIGHT, 0.0, "absolute"
+        log.warning(f"routine_weight_floor failed, using absolute floor: {e}")
+        return ROUTINE_MIN_ABS_WEIGHT, 0.0, "absolute"
 
     scaled = float(min_pairwise_norm) * ref
-    if scaled >= SKILL_MIN_ABS_WEIGHT:
+    if scaled >= ROUTINE_MIN_ABS_WEIGHT:
         return scaled, ref, "percentile"
-    return SKILL_MIN_ABS_WEIGHT, ref, "absolute"
+    return ROUTINE_MIN_ABS_WEIGHT, ref, "absolute"
 
 
-def find_skill_candidates(min_cluster=3, min_pairwise_norm=0.6, limit=10,
+def find_routine_candidates(min_cluster=3, min_pairwise_norm=0.6, limit=10,
                           max_per_domain=2, max_member_reuse=2):
     """
     Clusters where EVERY pair is densely co-recalled -- not merely anchored on
@@ -1311,7 +1311,7 @@ def find_skill_candidates(min_cluster=3, min_pairwise_norm=0.6, limit=10,
     different question ("which single memory has strong neighbours"), which is
     the right shape for a preview and the wrong shape for deciding to
     crystallize: a hub with many weak-to-each-other neighbours would qualify
-    while not being a coherent skill at all. Both previews now call this
+    while not being a coherent routine at all. Both previews now call this
     function, so the three code paths cannot drift apart again -- they had,
     and /insights was advertising candidates this function could never return.
 
@@ -1378,7 +1378,7 @@ def find_skill_candidates(min_cluster=3, min_pairwise_norm=0.6, limit=10,
     if driver is None:
         return []
     try:
-        floor, ref_w, _basis = skill_weight_floor(min_pairwise_norm)
+        floor, ref_w, _basis = routine_weight_floor(min_pairwise_norm)
         if ref_w <= 0:
             return []
 
@@ -1437,11 +1437,11 @@ def find_skill_candidates(min_cluster=3, min_pairwise_norm=0.6, limit=10,
                        CASE WHEN semantic IS NULL
                             THEN (avg_norm * 0.5) + (coherence * 0.5)
                             ELSE (avg_norm * 0.4) + (coherence * 0.3)
-                               + (semantic * 0.3) END                 AS skill_score,
+                               + (semantic * 0.3) END                 AS routine_score,
                        [a.payload, b.payload, c.payload]              AS payloads,
                        [a.src_type, b.src_type, c.src_type]           AS src_types,
                        [ga, gb, gc]                                   AS grps
-                ORDER BY skill_score DESC, avg_weight DESC
+                ORDER BY routine_score DESC, avg_weight DESC
                 LIMIT $lim
             """, floor=floor, ref=float(ref_w), lim=sample)
 
@@ -1477,7 +1477,7 @@ def find_skill_candidates(min_cluster=3, min_pairwise_norm=0.6, limit=10,
                     "grp_coherence":      round(float(r["coherence"] or 0.0), 3),
                     "semantic_coherence": (round(float(sem), 3) if sem is not None else None),
                     "scored_without_embeddings": sem is None,
-                    "skill_score":        round(float(r["skill_score"] or 0.0), 4),
+                    "routine_score":        round(float(r["routine_score"] or 0.0), 4),
                     "grps":               grps,
                     "domain":             dom,
                     "src_mix":            src_mix,
@@ -1506,20 +1506,20 @@ def find_skill_candidates(min_cluster=3, min_pairwise_norm=0.6, limit=10,
             out.extend(overflow[:limit - len(out)])
         return out
     except Exception as e:
-        log.warning(f"find_skill_candidates failed: {e}")
+        log.warning(f"find_routine_candidates failed: {e}")
         return []
 
 
-def crystallize_skill(member_addresses, trigger, procedure, confidence=0.0):
+def crystallize_routine(member_addresses, trigger, procedure, confidence=0.0):
     """
     The confirm step. ONE transaction, all-or-nothing.
 
-    Creates the Skill, wires PROCEDURALIZED_FROM from every member, and demotes
+    Creates the Routine, wires PROCEDURALIZED_FROM from every member, and demotes
     each member to Blue. Members are never deleted -- per the roadmap they are
-    the skill's root system, and a memory that has been compressed is still the
+    the routine's root system, and a memory that has been compressed is still the
     evidence the compression was drawn from.
 
-    Returns (skill_dict, None) on success, or (None, reason) on failure with
+    Returns (routine_dict, None) on success, or (None, reason) on failure with
     nothing half-applied.
 
     The reason is returned rather than logged and swallowed. This is the one
@@ -1536,12 +1536,12 @@ def crystallize_skill(member_addresses, trigger, procedure, confidence=0.0):
     if not member_addresses:
         return None, "no member addresses given"
 
-    skill_id = str(uuid.uuid4())
+    routine_id = str(uuid.uuid4())
     now = datetime.now().isoformat()
     try:
         with driver.session() as s:
             # execute_write gives a real transaction: a failure part-way rolls
-            # back rather than leaving memories demoted with no Skill to show
+            # back rather than leaving memories demoted with no Routine to show
             # for it.
             def _tx(tx):
                 live = [r["a"] for r in tx.run("""
@@ -1555,43 +1555,43 @@ def crystallize_skill(member_addresses, trigger, procedure, confidence=0.0):
                         f"addresses matched no memory: {', '.join(missing)}. "
                         "MMU addresses are rewritten in place when a memory is "
                         "recalled, so a stale address is the usual cause -- "
-                        "re-read GET /skill_proposals and use the addresses it "
+                        "re-read GET /routine_proposals and use the addresses it "
                         "returns now, or confirm by proposal_id instead."
                     )
 
-                # A memory already compressed into an active Skill cannot be
+                # A memory already compressed into an active Routine cannot be
                 # compressed into a second one. Colour is single-valued, so two
-                # skills claiming the same member disagree about what it should
+                # routines claiming the same member disagree about what it should
                 # be the moment either is undone -- which is exactly how this
                 # was found: a stale proposal was confirmed twice, and undoing
                 # the second restored a member the first still owned.
                 taken = [r["a"] for r in tx.run("""
-                    MATCH (m:Memory)-[:PROCEDURALIZED_FROM]->(sk:Skill)
+                    MATCH (m:Memory)-[:PROCEDURALIZED_FROM]->(sk:Routine)
                     WHERE m.address IN $addrs AND sk.status <> 'deprecated'
                     RETURN DISTINCT m.address AS a
                 """, addrs=list(member_addresses))]
                 if taken:
                     raise ValueError(
                         f"{len(taken)} member(s) already belong to an active "
-                        f"skill: {', '.join(taken)}. This will fail identically "
+                        f"routine: {', '.join(taken)}. This will fail identically "
                         "every time until that changes -- retrying is not a "
-                        "path forward. Either uncrystallize the skill that owns "
+                        "path forward. Either uncrystallize the routine that owns "
                         "them, or pick a different proposal; the review queue "
                         "marks which proposals are blocked and lists the "
                         "unblocked ones first."
                     )
 
                 tx.run("""
-                    CREATE (sk:Skill {
-                        skill_id: $sid, trigger: $trigger, procedure: $procedure,
+                    CREATE (sk:Routine {
+                        routine_id: $sid, trigger: $trigger, procedure: $procedure,
                         confidence: $conf, invocation_count: 0, last_invoked: null,
                         created_at: $now, status: 'active'
                     })
-                """, sid=skill_id, trigger=trigger, procedure=procedure,
+                """, sid=routine_id, trigger=trigger, procedure=procedure,
                      conf=float(confidence), now=now)
 
                 tx.run("""
-                    MATCH (sk:Skill {skill_id: $sid})
+                    MATCH (sk:Routine {routine_id: $sid})
                     MATCH (m:Memory) WHERE m.address IN $addrs
                     MERGE (m)-[:PROCEDURALIZED_FROM]->(sk)
                     // Remember what this was before demoting it. Members here
@@ -1600,48 +1600,48 @@ def crystallize_skill(member_addresses, trigger, procedure, confidence=0.0):
                     // would corrupt the aging state of the rest. coalesce
                     // keeps the ORIGINAL colour if this memory was somehow
                     // demoted once before.
-                    SET m.pre_skill_color = coalesce(m.pre_skill_color, m.color),
+                    SET m.pre_routine_color = coalesce(m.pre_routine_color, m.color),
                         m.color           = 'Blue'
-                """, sid=skill_id, addrs=list(member_addresses))
+                """, sid=routine_id, addrs=list(member_addresses))
 
                 # Clear any proposal marker for these members.
                 tx.run("""
                     MATCH (m:Memory) WHERE m.address IN $addrs
-                    REMOVE m.skill_candidate_id
+                    REMOVE m.routine_candidate_id
                 """, addrs=list(member_addresses))
                 return True
 
             s.execute_write(_tx)
 
-        log.info("Crystallized skill %s from %d memories", skill_id, len(member_addresses))
+        log.info("Crystallized routine %s from %d memories", routine_id, len(member_addresses))
         return {
-            "skill_id": skill_id, "trigger": trigger, "procedure": procedure,
+            "routine_id": routine_id, "trigger": trigger, "procedure": procedure,
             "confidence": float(confidence), "status": "active",
             "created_at": now, "members": list(member_addresses),
         }, None
     except Exception as e:
-        log.warning(f"crystallize_skill failed (nothing applied): {e}")
+        log.warning(f"crystallize_routine failed (nothing applied): {e}")
         return None, str(e)
 
 
-def uncrystallize_skill(skill_id):
+def uncrystallize_routine(routine_id):
     """
-    Reverse a crystallization: delete the Skill and restore its members.
+    Reverse a crystallization: delete the Routine and restore its members.
 
     Returns (info, None) on success or (None, reason) on failure, with nothing
     half-applied.
 
     This exists because crystallization is the one operation in the system that
     restructures memory rather than adding to it, and it was the one operation
-    with no way back. deprecate_skill() marks a Skill dead but leaves every
+    with no way back. deprecate_routine() marks a Routine dead but leaves every
     member sitting in Blue, which is the state the recall gate treats as
-    inactive -- so a skill judged wrong afterwards left its evidence buried.
+    inactive -- so a routine judged wrong afterwards left its evidence buried.
 
-    Refuses while another skill extends this one, for the same reason
-    deprecate_skill() does: a live child pointing at a deleted parent is a
+    Refuses while another routine extends this one, for the same reason
+    deprecate_routine() does: a live child pointing at a deleted parent is a
     broken tree, and silently orphaning it would be worse than refusing.
 
-    Members are restored to pre_skill_color. A member crystallized before that
+    Members are restored to pre_routine_color. A member crystallized before that
     property existed has no recorded colour and is restored to Green, reported
     in colors_guessed so the caller can say so rather than imply precision it
     does not have.
@@ -1652,35 +1652,35 @@ def uncrystallize_skill(skill_id):
     try:
         with driver.session() as s:
             rec = s.run("""
-                MATCH (sk:Skill {skill_id: $sid}) RETURN sk.trigger AS trigger
-            """, sid=skill_id).single()
+                MATCH (sk:Routine {routine_id: $sid}) RETURN sk.trigger AS trigger
+            """, sid=routine_id).single()
             if not rec:
-                return None, "no such skill"
+                return None, "no such routine"
 
             blockers = [r["cid"] for r in s.run("""
-                MATCH (child:Skill)-[:EXTENDS_SKILL]->(sk:Skill {skill_id: $sid})
+                MATCH (child:Routine)-[:EXTENDS_ROUTINE]->(sk:Routine {routine_id: $sid})
                 WHERE child.status <> 'deprecated'
-                RETURN child.skill_id AS cid
-            """, sid=skill_id)]
+                RETURN child.routine_id AS cid
+            """, sid=routine_id)]
             if blockers:
-                return None, (f"{len(blockers)} active child skill(s) still extend "
+                return None, (f"{len(blockers)} active child routine(s) still extend "
                               f"this one: {', '.join(blockers)}")
 
             def _tx(tx):
-                # Only members that this skill alone owns get restored. One
-                # still compressed into another active skill stays Blue and
+                # Only members that this routine alone owns get restored. One
+                # still compressed into another active routine stays Blue and
                 # keeps its recorded colour -- restoring it would contradict
-                # the skill that still claims it.
+                # the routine that still claims it.
                 rows = [dict(r) for r in tx.run("""
-                    MATCH (m:Memory)-[:PROCEDURALIZED_FROM]->(sk:Skill {skill_id: $sid})
-                    OPTIONAL MATCH (m)-[:PROCEDURALIZED_FROM]->(other:Skill)
-                    WHERE other.skill_id <> $sid AND other.status <> 'deprecated'
+                    MATCH (m:Memory)-[:PROCEDURALIZED_FROM]->(sk:Routine {routine_id: $sid})
+                    OPTIONAL MATCH (m)-[:PROCEDURALIZED_FROM]->(other:Routine)
+                    WHERE other.routine_id <> $sid AND other.status <> 'deprecated'
                     WITH m, count(other) AS others
                     RETURN m.address AS address,
-                           m.pre_skill_color AS pre,
-                           m.pre_skill_color IS NULL AS guessed,
+                           m.pre_routine_color AS pre,
+                           m.pre_routine_color IS NULL AS guessed,
                            others > 0 AS still_owned
-                """, sid=skill_id)]
+                """, sid=routine_id)]
 
                 keep = [r["address"] for r in rows if r["still_owned"]]
                 restore = [r["address"] for r in rows if not r["still_owned"]]
@@ -1688,96 +1688,96 @@ def uncrystallize_skill(skill_id):
                 if restore:
                     tx.run("""
                         MATCH (m:Memory) WHERE m.address IN $addrs
-                        SET m.color = coalesce(m.pre_skill_color, 'Green')
-                        REMOVE m.pre_skill_color
+                        SET m.color = coalesce(m.pre_routine_color, 'Green')
+                        REMOVE m.pre_routine_color
                     """, addrs=restore)
 
                 tx.run("""
-                    MATCH (m:Memory)-[r:PROCEDURALIZED_FROM]->(sk:Skill {skill_id: $sid})
+                    MATCH (m:Memory)-[r:PROCEDURALIZED_FROM]->(sk:Routine {routine_id: $sid})
                     DELETE r
-                """, sid=skill_id)
+                """, sid=routine_id)
 
                 rows = [dict(r, kept=(r["address"] in keep)) for r in rows]
 
                 # Reopen the proposal so the cluster returns to review rather
                 # than vanishing: undoing a crystallization is a statement that
-                # the skill was wrong, not that the pattern was imaginary.
+                # the routine was wrong, not that the pattern was imaginary.
                 tx.run("""
-                    MATCH (p:SkillProposal {skill_id: $sid})
+                    MATCH (p:RoutineProposal {routine_id: $sid})
                     SET p.status      = 'pending',
-                        p.skill_id    = null,
+                        p.routine_id    = null,
                         p.reviewed_at = null
-                """, sid=skill_id)
+                """, sid=routine_id)
 
-                tx.run("MATCH (sk:Skill {skill_id: $sid}) DETACH DELETE sk", sid=skill_id)
+                tx.run("MATCH (sk:Routine {routine_id: $sid}) DETACH DELETE sk", sid=routine_id)
                 return rows
 
             restored = s.execute_write(_tx)
 
-        log.info("Uncrystallized skill %s; restored %d memories", skill_id, len(restored))
+        log.info("Uncrystallized routine %s; restored %d memories", routine_id, len(restored))
         return {
-            "skill_id": skill_id,
+            "routine_id": routine_id,
             "trigger":  rec["trigger"],
             "restored": [{"address": r["address"], "color": r["pre"] or "Green"}
                          for r in restored if not r["kept"]],
-            # Left demoted on purpose: another active skill still owns these.
+            # Left demoted on purpose: another active routine still owns these.
             "still_demoted": [r["address"] for r in restored if r["kept"]],
             "colors_guessed": [r["address"] for r in restored
                                if r["guessed"] and not r["kept"]],
         }, None
     except Exception as e:
-        log.warning(f"uncrystallize_skill failed (nothing applied): {e}")
+        log.warning(f"uncrystallize_routine failed (nothing applied): {e}")
         return None, str(e)
 
 
 # ═════════════════════════════════════════════
-#  PHASE 13.2 — SKILL DELIVERY
+#  PHASE 13.2 — ROUTINE DELIVERY
 # ═════════════════════════════════════════════
 #
-# Crystallization was write-only. A Skill node carried trigger and procedure
+# Crystallization was write-only. A Routine node carried trigger and procedure
 # and nothing else: no keywords, no embedding, no edge into the Keyword graph.
 # Every retrieval path in this system reaches a memory through keywords or
-# through the vector index, so a Skill was unreachable by all of them -- and
+# through the vector index, so a Routine was unreachable by all of them -- and
 # invocation_count, written as 0 at creation, was never incremented because
 # nothing ever invoked anything.
 #
 # Measured before this existed: crystallizing three memories changed recall by
-# zero bytes. The 636-character skill was 11% of its 5,377 characters of source
+# zero bytes. The 636-character routine was 11% of its 5,377 characters of source
 # and was never delivered in place of them, so the compression was real on
 # paper and absent in practice.
 #
-# The model noticed before the code did. Asked about skills, it saved an
-# ordinary Memory titled "SKILL NODE: ..." with a trigger phrase and a
+# The model noticed before the code did. Asked about routines, it saved an
+# ordinary Memory titled "ROUTINE NODE: ..." with a trigger phrase and a
 # provenance footer -- reimplementing the mechanism at the only layer that was
 # actually retrievable.
 
 
-def write_skill_embedding(skill_id, vector):
-    """Attach an embedding to a Skill, in Neo4j's native vector encoding."""
+def write_routine_embedding(routine_id, vector):
+    """Attach an embedding to a Routine, in Neo4j's native vector encoding."""
     driver = get_driver()
     if driver is None or not vector:
         return False
     try:
         with driver.session() as s:
             rec = s.run("""
-                MATCH (sk:Skill {skill_id: $sid})
+                MATCH (sk:Routine {routine_id: $sid})
                 CALL db.create.setNodeVectorProperty(sk, 'embedding', $vector)
                 RETURN count(sk) AS n
-            """, sid=skill_id, vector=[float(x) for x in vector]).single()
+            """, sid=routine_id, vector=[float(x) for x in vector]).single()
             return bool(rec and rec["n"])
     except Exception as e:
-        log.warning(f"write_skill_embedding failed: {e}")
+        log.warning(f"write_routine_embedding failed: {e}")
         return False
 
 
-def link_skill_keywords(skill_id, terms):
+def link_routine_keywords(routine_id, terms):
     """
-    Link a Skill into the same Keyword graph memories use.
+    Link a Routine into the same Keyword graph memories use.
 
     Deliberately the existing HAS_KEYWORD edge and the existing Keyword nodes
-    rather than a parallel vocabulary: a skill about dimensional relativity and
+    rather than a parallel vocabulary: a routine about dimensional relativity and
     a memory about dimensional relativity should match the same term, or the
-    keyword gate would need to learn about skills as a special case.
+    keyword gate would need to learn about routines as a special case.
     """
     driver = get_driver()
     if driver is None or not terms:
@@ -1793,29 +1793,29 @@ def link_skill_keywords(skill_id, terms):
                     MERGE (k:Keyword {term: $term})
                     ON CREATE SET k.freq = 0, k.stem = $term
                     WITH k
-                    MATCH (sk:Skill {skill_id: $sid})
+                    MATCH (sk:Routine {routine_id: $sid})
                     MERGE (sk)-[:HAS_KEYWORD]->(k)
-                """, term=term, sid=skill_id)
+                """, term=term, sid=routine_id)
                 n += 1
         return n
     except Exception as e:
-        log.warning(f"link_skill_keywords failed: {e}")
+        log.warning(f"link_routine_keywords failed: {e}")
         return 0
 
 
-def match_skills(query_vector=None, terms=None, limit=3, min_semantic=0.75):
+def match_routines(query_vector=None, terms=None, limit=3, min_semantic=0.75):
     """
-    Find active skills relevant to a query, by embedding and by keyword.
+    Find active routines relevant to a query, by embedding and by keyword.
 
-    Returns [{skill_id, trigger, procedure, confidence, members, score, via}]
-    where via is "semantic" or "keyword", so a caller can report WHY a skill
+    Returns [{routine_id, trigger, procedure, confidence, members, score, via}]
+    where via is "semantic" or "keyword", so a caller can report WHY a routine
     surfaced -- the same transparency rule that puts `via` on every memory row.
 
-    Deprecated skills are never matched. A skill with no embedding falls back
+    Deprecated routines are never matched. A routine with no embedding falls back
     to the keyword path rather than being invisible, which is what keeps a
-    skill crystallized before this phase from silently disappearing.
+    routine crystallized before this phase from silently disappearing.
 
-    min_semantic is deliberately high. A skill substitutes for its source
+    min_semantic is deliberately high. A routine substitutes for its source
     memories in the delivered context, so a loose match does not merely add
     noise, it withholds the memories the caller would otherwise have seen.
     """
@@ -1834,25 +1834,25 @@ def match_skills(query_vector=None, terms=None, limit=3, min_semantic=0.75):
                         CALL db.index.vector.queryNodes($index, $k, $vector)
                         YIELD node, score
                         WHERE node.status = 'active' AND score >= $floor
-                        RETURN node.skill_id AS sid, score AS score
-                    """, index=SKILL_EMBEDDING_INDEX, k=max(int(limit) * 3, 10),
+                        RETURN node.routine_id AS sid, score AS score
+                    """, index=ROUTINE_EMBEDDING_INDEX, k=max(int(limit) * 3, 10),
                          vector=[float(x) for x in query_vector],
                          floor=float(min_semantic)):
                         found[r["sid"]] = (float(r["score"]), "semantic")
                 except Exception as e:
-                    # No vector index (older Neo4j), or no embedded skills yet.
-                    log.debug("skill vector match unavailable: %s", e)
+                    # No vector index (older Neo4j), or no embedded routines yet.
+                    log.debug("routine vector match unavailable: %s", e)
 
             if terms:
                 for r in s.run("""
-                    MATCH (sk:Skill)-[:HAS_KEYWORD]->(k:Keyword)
+                    MATCH (sk:Routine)-[:HAS_KEYWORD]->(k:Keyword)
                     WHERE sk.status = 'active' AND k.term IN $terms
                     WITH sk, count(DISTINCT k) AS hits
-                    RETURN sk.skill_id AS sid, hits
+                    RETURN sk.routine_id AS sid, hits
                     ORDER BY hits DESC LIMIT $lim
                 """, terms=terms, lim=max(int(limit) * 3, 10)):
                     sid, hits = r["sid"], r["hits"]
-                    # Fraction of the query's terms this skill carries. Kept on
+                    # Fraction of the query's terms this routine carries. Kept on
                     # the same 0-1 scale as the cosine score so one threshold
                     # and one ordering apply to both paths.
                     score = hits / float(len(terms))
@@ -1863,9 +1863,9 @@ def match_skills(query_vector=None, terms=None, limit=3, min_semantic=0.75):
                 return []
 
             rows = s.run("""
-                MATCH (sk:Skill) WHERE sk.skill_id IN $sids
+                MATCH (sk:Routine) WHERE sk.routine_id IN $sids
                 OPTIONAL MATCH (m:Memory)-[:PROCEDURALIZED_FROM]->(sk)
-                RETURN sk.skill_id   AS skill_id,
+                RETURN sk.routine_id   AS routine_id,
                        sk.trigger    AS trigger,
                        sk.procedure  AS procedure,
                        sk.confidence AS confidence,
@@ -1874,7 +1874,7 @@ def match_skills(query_vector=None, terms=None, limit=3, min_semantic=0.75):
 
             out = []
             for r in rows:
-                score, via = found[r["skill_id"]]
+                score, via = found[r["routine_id"]]
                 d = dict(r)
                 d["score"] = round(score, 4)
                 d["via"]   = via
@@ -1882,35 +1882,35 @@ def match_skills(query_vector=None, terms=None, limit=3, min_semantic=0.75):
             out.sort(key=lambda d: -d["score"])
             return out[:int(limit)]
     except Exception as e:
-        log.warning(f"match_skills failed: {e}")
+        log.warning(f"match_routines failed: {e}")
         return []
 
 
-def record_skill_invocation(skill_ids):
+def record_routine_invocation(routine_ids):
     """
     Count a delivery. invocation_count existed from Phase 12 and was never
-    incremented, which meant there was no way to tell a skill that earns its
+    incremented, which meant there was no way to tell a routine that earns its
     place from one that has never once been used.
     """
     driver = get_driver()
-    if driver is None or not skill_ids:
+    if driver is None or not routine_ids:
         return False
     try:
         with driver.session() as s:
             s.run("""
-                MATCH (sk:Skill) WHERE sk.skill_id IN $sids
+                MATCH (sk:Routine) WHERE sk.routine_id IN $sids
                 SET sk.invocation_count = coalesce(sk.invocation_count, 0) + 1,
                     sk.last_invoked     = $now
-            """, sids=list(skill_ids), now=datetime.now().isoformat())
+            """, sids=list(routine_ids), now=datetime.now().isoformat())
         return True
     except Exception as e:
-        log.warning(f"record_skill_invocation failed: {e}")
+        log.warning(f"record_routine_invocation failed: {e}")
         return False
 
 
-def get_skills_needing_index():
+def get_routines_needing_index():
     """
-    Active skills with no embedding or no keywords -- everything crystallized
+    Active routines with no embedding or no keywords -- everything crystallized
     before delivery existed, plus anything whose embedding write failed.
     """
     driver = get_driver()
@@ -1919,62 +1919,62 @@ def get_skills_needing_index():
     try:
         with driver.session() as s:
             return [dict(r) for r in s.run("""
-                MATCH (sk:Skill)
+                MATCH (sk:Routine)
                 WHERE sk.status = 'active'
                   AND (sk.embedding IS NULL
                        OR NOT (sk)-[:HAS_KEYWORD]->(:Keyword))
-                RETURN sk.skill_id  AS skill_id,
+                RETURN sk.routine_id  AS routine_id,
                        sk.trigger   AS trigger,
                        sk.procedure AS procedure
             """)]
     except Exception as e:
-        log.warning(f"get_skills_needing_index failed: {e}")
+        log.warning(f"get_routines_needing_index failed: {e}")
         return []
 
 
-def resolve_skill_id(value):
+def resolve_routine_id(value):
     """
-    Accept a full skill_id or an unambiguous prefix. Returns (skill_id, error).
+    Accept a full routine_id or an unambiguous prefix. Returns (routine_id, error).
 
-    Skill ids are UUIDs and get displayed truncated almost everywhere -- tree
+    Routine ids are UUIDs and get displayed truncated almost everywhere -- tree
     views, summaries, logs. Requiring the full 36 characters means the id
     someone actually has in front of them is the one form that does not work,
     which is how a branch ends up as a second root.
 
     An ambiguous prefix is an error, never a guess: silently picking one of two
-    matching skills would attach a branch to the wrong parent.
+    matching routines would attach a branch to the wrong parent.
     """
     value = (value or "").strip()
     if not value:
-        return None, "no skill id given"
+        return None, "no routine id given"
     driver = get_driver()
     if driver is None:
         return None, "no database connection"
     try:
         with driver.session() as s:
             hits = [r["sid"] for r in s.run("""
-                MATCH (sk:Skill)
-                WHERE sk.skill_id = $v OR sk.skill_id STARTS WITH $v
-                RETURN sk.skill_id AS sid
-                ORDER BY CASE WHEN sk.skill_id = $v THEN 0 ELSE 1 END
+                MATCH (sk:Routine)
+                WHERE sk.routine_id = $v OR sk.routine_id STARTS WITH $v
+                RETURN sk.routine_id AS sid
+                ORDER BY CASE WHEN sk.routine_id = $v THEN 0 ELSE 1 END
                 LIMIT 5
             """, v=value)]
         if not hits:
-            return None, f"no skill with id {value}"
+            return None, f"no routine with id {value}"
         if hits[0] == value or len(hits) == 1:
             return hits[0], None
-        return None, (f"{len(hits)} skills start with {value}: "
+        return None, (f"{len(hits)} routines start with {value}: "
                       f"{', '.join(h[:12] for h in hits)}. Use more characters.")
     except Exception as e:
-        log.warning(f"resolve_skill_id failed: {e}")
+        log.warning(f"resolve_routine_id failed: {e}")
         return None, str(e)
 
 
-def link_skills(child_id, parent_id):
+def link_routines(child_id, parent_id):
     """
-    Phase 13: child EXTENDS_SKILL parent.
+    Phase 13: child EXTENDS_ROUTINE parent.
 
-    Refuses to create a cycle. A skill tree with a cycle is not a tree, and the
+    Refuses to create a cycle. A routine tree with a cycle is not a tree, and the
     deprecation guard below walks children -- a cycle would make that walk
     non-terminating.
     """
@@ -1982,40 +1982,40 @@ def link_skills(child_id, parent_id):
     if driver is None:
         return False
     if child_id == parent_id:
-        raise ValueError("a skill cannot extend itself")
+        raise ValueError("a routine cannot extend itself")
     try:
         with driver.session() as s:
             # Would the new edge close a loop? True if parent already reaches
-            # child by following EXTENDS_SKILL upward.
+            # child by following EXTENDS_ROUTINE upward.
             cyc = s.run("""
-                MATCH (p:Skill {skill_id: $pid}), (c:Skill {skill_id: $cid})
-                RETURN EXISTS((p)-[:EXTENDS_SKILL*1..]->(c)) AS cycles
+                MATCH (p:Routine {routine_id: $pid}), (c:Routine {routine_id: $cid})
+                RETURN EXISTS((p)-[:EXTENDS_ROUTINE*1..]->(c)) AS cycles
             """, pid=parent_id, cid=child_id).single()
             if cyc and cyc["cycles"]:
-                raise ValueError("that link would create a cycle in the skill tree")
+                raise ValueError("that link would create a cycle in the routine tree")
 
             rec = s.run("""
-                MATCH (c:Skill {skill_id: $cid}), (p:Skill {skill_id: $pid})
-                MERGE (c)-[:EXTENDS_SKILL]->(p)
+                MATCH (c:Routine {routine_id: $cid}), (p:Routine {routine_id: $pid})
+                MERGE (c)-[:EXTENDS_ROUTINE]->(p)
                 RETURN count(*) AS n
             """, cid=child_id, pid=parent_id).single()
             return bool(rec and rec["n"])
     except ValueError:
         raise
     except Exception as e:
-        log.warning(f"link_skills failed: {e}")
+        log.warning(f"link_routines failed: {e}")
         return False
 
 
-def unlink_skill(child_id, parent_id=None):
+def unlink_routine(child_id, parent_id=None):
     """
-    Detach a skill from its parent, making it a root again.
+    Detach a routine from its parent, making it a root again.
 
     Reparenting previously meant uncrystallizing and rebuilding, which changes
-    the skill_id, re-enters the overlap checks, and destroys work to change one
+    the routine_id, re-enters the overlap checks, and destroys work to change one
     edge. Detaching is the cheap operation and should be reachable as one.
 
-    parent_id=None removes every EXTENDS_SKILL edge from this skill.
+    parent_id=None removes every EXTENDS_ROUTINE edge from this routine.
     Returns (removed_count, error).
     """
     driver = get_driver()
@@ -2023,29 +2023,29 @@ def unlink_skill(child_id, parent_id=None):
         return 0, "no database connection"
     try:
         with driver.session() as s:
-            if not s.run("MATCH (sk:Skill {skill_id:$cid}) RETURN count(sk) AS n",
+            if not s.run("MATCH (sk:Routine {routine_id:$cid}) RETURN count(sk) AS n",
                          cid=child_id).single()["n"]:
-                return 0, "no such skill"
+                return 0, "no such routine"
             if parent_id:
                 rec = s.run("""
-                    MATCH (c:Skill {skill_id:$cid})-[r:EXTENDS_SKILL]->(p:Skill {skill_id:$pid})
+                    MATCH (c:Routine {routine_id:$cid})-[r:EXTENDS_ROUTINE]->(p:Routine {routine_id:$pid})
                     DELETE r RETURN count(r) AS n
                 """, cid=child_id, pid=parent_id).single()
             else:
                 rec = s.run("""
-                    MATCH (c:Skill {skill_id:$cid})-[r:EXTENDS_SKILL]->(:Skill)
+                    MATCH (c:Routine {routine_id:$cid})-[r:EXTENDS_ROUTINE]->(:Routine)
                     DELETE r RETURN count(r) AS n
                 """, cid=child_id).single()
         return int(rec["n"]) if rec else 0, None
     except Exception as e:
-        log.warning(f"unlink_skill failed: {e}")
+        log.warning(f"unlink_routine failed: {e}")
         return 0, str(e)
 
 
-def get_skill_tree(root_skill_id=None):
+def get_routine_tree(root_routine_id=None):
     """
-    Walk EXTENDS_SKILL. Returns the tree under root_skill_id, or the whole
-    forest (every skill with no parent) when no root is given.
+    Walk EXTENDS_ROUTINE. Returns the tree under root_routine_id, or the whole
+    forest (every routine with no parent) when no root is given.
     """
     driver = get_driver()
     if driver is None:
@@ -2053,18 +2053,18 @@ def get_skill_tree(root_skill_id=None):
     try:
         with driver.session() as s:
             rows = s.run("""
-                MATCH (sk:Skill)
-                OPTIONAL MATCH (sk)-[:EXTENDS_SKILL]->(p:Skill)
-                RETURN sk.skill_id AS skill_id, sk.trigger AS trigger,
+                MATCH (sk:Routine)
+                OPTIONAL MATCH (sk)-[:EXTENDS_ROUTINE]->(p:Routine)
+                RETURN sk.routine_id AS routine_id, sk.trigger AS trigger,
                        sk.status AS status, sk.confidence AS confidence,
-                       collect(DISTINCT p.skill_id) AS parents
+                       collect(DISTINCT p.routine_id) AS parents
             """)
             nodes = {}
             for r in rows:
                 d = dict(r)
                 d["parents"]  = [p for p in (d["parents"] or []) if p]
                 d["children"] = []
-                nodes[d["skill_id"]] = d
+                nodes[d["routine_id"]] = d
 
             for sid, d in nodes.items():
                 for p in d["parents"]:
@@ -2072,36 +2072,36 @@ def get_skill_tree(root_skill_id=None):
                         nodes[p]["children"].append(sid)
 
             def build(sid, seen):
-                if sid in seen:          # defensive; link_skills blocks cycles
-                    return {"skill_id": sid, "cycle": True}
+                if sid in seen:          # defensive; link_routines blocks cycles
+                    return {"routine_id": sid, "cycle": True}
                 seen = seen | {sid}
                 n = nodes[sid]
                 return {
-                    "skill_id":   sid,
+                    "routine_id":   sid,
                     "trigger":    n["trigger"],
                     "status":     n["status"],
                     "confidence": n["confidence"],
                     "children":   [build(c, seen) for c in n["children"]],
                 }
 
-            if root_skill_id:
-                if root_skill_id not in nodes:
+            if root_routine_id:
+                if root_routine_id not in nodes:
                     return []
-                return [build(root_skill_id, set())]
+                return [build(root_routine_id, set())]
             roots = [sid for sid, d in nodes.items() if not d["parents"]]
             return [build(r, set()) for r in roots]
     except Exception as e:
-        log.warning(f"get_skill_tree failed: {e}")
+        log.warning(f"get_routine_tree failed: {e}")
         return []
 
 
-def deprecate_skill(skill_id):
+def deprecate_routine(routine_id):
     """
-    Phase 13: set a Skill to deprecated, but ONLY if no active child extends it.
+    Phase 13: set a Routine to deprecated, but ONLY if no active child extends it.
 
     The roadmap states a parent cannot be deprecated while a child is active.
     Enforced here as a real check rather than a comment: a silent success would
-    leave a live skill extending a dead parent, and the tree would be wrong in a
+    leave a live routine extending a dead parent, and the tree would be wrong in a
     way nothing later would notice.
 
     Returns (True, None) or (False, reason).
@@ -2111,36 +2111,36 @@ def deprecate_skill(skill_id):
         return False, "Neo4j unavailable"
     try:
         with driver.session() as s:
-            exists = s.run("MATCH (sk:Skill {skill_id:$sid}) RETURN sk.status AS st",
-                           sid=skill_id).single()
+            exists = s.run("MATCH (sk:Routine {routine_id:$sid}) RETURN sk.status AS st",
+                           sid=routine_id).single()
             if not exists:
-                return False, "no such skill"
+                return False, "no such routine"
 
             blockers = [r["cid"] for r in s.run("""
-                MATCH (child:Skill)-[:EXTENDS_SKILL]->(sk:Skill {skill_id: $sid})
+                MATCH (child:Routine)-[:EXTENDS_ROUTINE]->(sk:Routine {routine_id: $sid})
                 WHERE child.status = 'active'
-                RETURN child.skill_id AS cid
-            """, sid=skill_id)]
+                RETURN child.routine_id AS cid
+            """, sid=routine_id)]
             if blockers:
                 return False, (
-                    f"{len(blockers)} active child skill(s) still extend this one: "
+                    f"{len(blockers)} active child routine(s) still extend this one: "
                     f"{', '.join(blockers)}. Deprecate or reparent them first."
                 )
 
-            s.run("MATCH (sk:Skill {skill_id:$sid}) SET sk.status = 'deprecated'",
-                  sid=skill_id)
+            s.run("MATCH (sk:Routine {routine_id:$sid}) SET sk.status = 'deprecated'",
+                  sid=routine_id)
             return True, None
     except Exception as e:
-        log.warning(f"deprecate_skill failed: {e}")
+        log.warning(f"deprecate_routine failed: {e}")
         return False, str(e)
 
 
-def propose_meta_skill(min_shared=2):
+def propose_meta_routine(min_shared=2):
     """
-    Phase 13: skill pairs sharing >= min_shared source memories are candidates
+    Phase 13: routine pairs sharing >= min_shared source memories are candidates
     for a common parent.
 
-    Proposes only. Creating the meta-skill is a human decision, same discipline
+    Proposes only. Creating the meta-routine is a human decision, same discipline
     as crystallization itself -- this is the step where the tree starts encoding
     claims about how Nova's abilities relate, which is not a call to make
     automatically.
@@ -2151,61 +2151,61 @@ def propose_meta_skill(min_shared=2):
     try:
         with driver.session() as s:
             rows = s.run("""
-                MATCH (m:Memory)-[:PROCEDURALIZED_FROM]->(a:Skill)
-                MATCH (m)-[:PROCEDURALIZED_FROM]->(b:Skill)
-                WHERE a.skill_id < b.skill_id
+                MATCH (m:Memory)-[:PROCEDURALIZED_FROM]->(a:Routine)
+                MATCH (m)-[:PROCEDURALIZED_FROM]->(b:Routine)
+                WHERE a.routine_id < b.routine_id
                 WITH a, b, count(DISTINCT m) AS shared
                 WHERE shared >= $ms
-                RETURN a.skill_id AS skill_a, a.trigger AS trigger_a,
-                       b.skill_id AS skill_b, b.trigger AS trigger_b,
+                RETURN a.routine_id AS routine_a, a.trigger AS trigger_a,
+                       b.routine_id AS routine_b, b.trigger AS trigger_b,
                        shared
                 ORDER BY shared DESC
             """, ms=int(min_shared))
             return [dict(r) for r in rows]
     except Exception as e:
-        log.warning(f"propose_meta_skill failed: {e}")
+        log.warning(f"propose_meta_routine failed: {e}")
         return []
 
 
-def get_skills(status=None):
-    """List Skill nodes with their source-memory counts."""
+def get_routines(status=None):
+    """List Routine nodes with their source-memory counts."""
     driver = get_driver()
     if driver is None:
         return []
     try:
         with driver.session() as s:
             rows = s.run("""
-                MATCH (sk:Skill)
+                MATCH (sk:Routine)
                 WHERE $status IS NULL OR sk.status = $status
                 OPTIONAL MATCH (m:Memory)-[:PROCEDURALIZED_FROM]->(sk)
-                OPTIONAL MATCH (sk)-[:EXTENDS_SKILL]->(parent:Skill)
-                RETURN sk.skill_id AS skill_id, sk.trigger AS trigger,
+                OPTIONAL MATCH (sk)-[:EXTENDS_ROUTINE]->(parent:Routine)
+                RETURN sk.routine_id AS routine_id, sk.trigger AS trigger,
                        sk.procedure AS procedure, sk.confidence AS confidence,
                        sk.status AS status, sk.created_at AS created_at,
                        sk.invocation_count AS invocation_count,
                        count(DISTINCT m) AS source_memories,
-                       collect(DISTINCT parent.skill_id) AS extends
+                       collect(DISTINCT parent.routine_id) AS extends
                 ORDER BY sk.created_at DESC
             """, status=status)
             return [dict(r) for r in rows]
     except Exception as e:
-        log.warning(f"get_skills failed: {e}")
+        log.warning(f"get_routines failed: {e}")
         return []
 
 
 # ═════════════════════════════════════════════
-#  PHASE 13.1 — SKILL PROPOSAL QUEUE
+#  PHASE 13.1 — ROUTINE PROPOSAL QUEUE
 # ═════════════════════════════════════════════
 #
-# The human gate on crystallize_skill() is correct and stays. What it lacked
+# The human gate on crystallize_routine() is correct and stays. What it lacked
 # was a doorbell: nothing ever surfaced a candidate for review, so in practice
-# the gate was never approached and no skill was ever formed. find_skill_
+# the gate was never approached and no routine was ever formed. find_routine_
 # candidates() is read-only and safe to poll, but a poll nobody runs proposes
 # nothing.
 #
-# A SkillProposal is a durable, deduplicated note that a cluster looked ready.
+# A RoutineProposal is a durable, deduplicated note that a cluster looked ready.
 # The daemon may create and refresh them. It may not act on them. Turning one
-# into a Skill still requires POST /crystallize with confirmed=true, which is
+# into a Routine still requires POST /crystallize with confirmed=true, which is
 # still a human decision -- the queue changes who does the noticing, not who
 # does the deciding.
 
@@ -2243,14 +2243,14 @@ def _created_for_addresses(session, member_addresses):
 MAX_PENDING_PROPOSALS = 25
 
 
-def queue_skill_proposals(candidates=None, min_score=0.70, limit=10,
+def queue_routine_proposals(candidates=None, min_score=0.70, limit=10,
                           max_pending=MAX_PENDING_PROPOSALS):
     """
-    Write pending SkillProposal nodes for candidates that clear min_score.
+    Write pending RoutineProposal nodes for candidates that clear min_score.
 
-    Touches no Memory node and creates no Skill. The default min_score matches
+    Touches no Memory node and creates no Routine. The default min_score matches
     the threshold the roadmap always documented for proposing; it finally
-    means something now that skill_score is clamped to 0-1.
+    means something now that routine_score is clamped to 0-1.
 
     A proposal already marked rejected is NOT resurrected. If a reviewer has
     said no to a cluster, the sweep re-offering it every 20 minutes would be
@@ -2269,16 +2269,16 @@ def queue_skill_proposals(candidates=None, min_score=0.70, limit=10,
                 "deferred": 0, "pending": 0}
 
     if candidates is None:
-        candidates = find_skill_candidates(limit=limit)
+        candidates = find_routine_candidates(limit=limit)
 
-    ranked = [c for c in candidates if float(c.get("skill_score", 0)) >= float(min_score)]
+    ranked = [c for c in candidates if float(c.get("routine_score", 0)) >= float(min_score)]
     created = refreshed = skipped = deferred = 0
     now = datetime.now().isoformat()
 
     try:
         with driver.session() as s:
             pending_now = s.run("""
-                MATCH (p:SkillProposal {status: 'pending'}) RETURN count(p) AS n
+                MATCH (p:RoutineProposal {status: 'pending'}) RETURN count(p) AS n
             """).single()["n"]
 
             for c in ranked:
@@ -2286,14 +2286,14 @@ def queue_skill_proposals(candidates=None, min_score=0.70, limit=10,
                 # should let the next one through rather than wait a pass.
                 if pending_now >= int(max_pending):
                     known = s.run("""
-                        MATCH (p:SkillProposal {member_key: $key}) RETURN count(p) AS n
+                        MATCH (p:RoutineProposal {member_key: $key}) RETURN count(p) AS n
                     """, key=_member_key(c["member_created"])).single()["n"]
                     if not known:
                         deferred += 1
                         continue
                 key = _member_key(c["member_created"])
                 rec = s.run("""
-                    MERGE (p:SkillProposal {member_key: $key})
+                    MERGE (p:RoutineProposal {member_key: $key})
                     ON CREATE SET p.proposal_id   = $pid,
                                   p.members       = $members,
                                   p.member_created = $created,
@@ -2302,8 +2302,8 @@ def queue_skill_proposals(candidates=None, min_score=0.70, limit=10,
                                   p.updated_at    = $now,
                                   p.reviewed_at   = null,
                                   p.review_note   = '',
-                                  p.skill_id      = null,
-                                  p.skill_score   = $score,
+                                  p.routine_id      = null,
+                                  p.routine_score   = $score,
                                   p.avg_weight    = $avgw,
                                   p.grp_coherence = $coh,
                                   p.semantic_coherence = $sem,
@@ -2319,8 +2319,8 @@ def queue_skill_proposals(candidates=None, min_score=0.70, limit=10,
                                                         THEN $members ELSE p.members END,
                                   p.updated_at    = CASE WHEN p.status = 'pending'
                                                         THEN $now ELSE p.updated_at END,
-                                  p.skill_score   = CASE WHEN p.status = 'pending'
-                                                        THEN $score ELSE p.skill_score END,
+                                  p.routine_score   = CASE WHEN p.status = 'pending'
+                                                        THEN $score ELSE p.routine_score END,
                                   p.avg_weight    = CASE WHEN p.status = 'pending'
                                                         THEN $avgw ELSE p.avg_weight END,
                                   p.grp_coherence = CASE WHEN p.status = 'pending'
@@ -2335,7 +2335,7 @@ def queue_skill_proposals(candidates=None, min_score=0.70, limit=10,
                 """,
                     key=key, pid=str(uuid.uuid4()), members=list(c["members"]),
                     created=list(c["member_created"]),
-                    now=now, score=float(c.get("skill_score", 0.0)),
+                    now=now, score=float(c.get("routine_score", 0.0)),
                     avgw=float(c.get("avg_weight", 0.0)),
                     coh=float(c.get("grp_coherence", 0.0)),
                     sem=(float(c["semantic_coherence"])
@@ -2356,11 +2356,11 @@ def queue_skill_proposals(candidates=None, min_score=0.70, limit=10,
                     skipped += 1
 
             pending = s.run("""
-                MATCH (p:SkillProposal {status: 'pending'}) RETURN count(p) AS n
+                MATCH (p:RoutineProposal {status: 'pending'}) RETURN count(p) AS n
             """).single()["n"]
 
         if created:
-            log.info("Queued %d new skill proposal(s); %d refreshed, %d already rejected",
+            log.info("Queued %d new routine proposal(s); %d refreshed, %d already rejected",
                      created, refreshed, skipped)
         if deferred:
             log.info("Deferred %d proposal(s): %d already pending review (ceiling %d)",
@@ -2369,12 +2369,12 @@ def queue_skill_proposals(candidates=None, min_score=0.70, limit=10,
                 "skipped_rejected": skipped, "deferred": deferred,
                 "pending": pending}
     except Exception as e:
-        log.warning(f"queue_skill_proposals failed: {e}")
+        log.warning(f"queue_routine_proposals failed: {e}")
         return {"created": 0, "refreshed": 0, "skipped_rejected": 0,
                 "deferred": 0, "pending": 0}
 
 
-def get_skill_proposals(status="pending", limit=50):
+def get_routine_proposals(status="pending", limit=50):
     """
     List queued proposals, highest score first. status=None returns all.
 
@@ -2400,7 +2400,7 @@ def get_skill_proposals(status="pending", limit=50):
         with driver.session() as s:
             where = "WHERE p.status = $status" if status else ""
             rows = s.run(f"""
-                MATCH (p:SkillProposal)
+                MATCH (p:RoutineProposal)
                 {where}
                 OPTIONAL MATCH (m:Memory) WHERE m.created_at IN p.member_created
                 WITH p, collect({{created_at: m.created_at,
@@ -2408,11 +2408,11 @@ def get_skill_proposals(status="pending", limit=50):
                                  payload:    m.payload,
                                  color:      m.color,
                                  grp: toInteger(split(m.address, '.')[2])}}) AS live
-                // A member already compressed into an active Skill cannot be
+                // A member already compressed into an active Routine cannot be
                 // compressed into a second one, so this proposal can never be
-                // confirmed while that skill exists. Saying so here is the
+                // confirmed while that routine exists. Saying so here is the
                 // difference between a queue and a list of things to try.
-                OPTIONAL MATCH (bm:Memory)-[:PROCEDURALIZED_FROM]->(bsk:Skill)
+                OPTIONAL MATCH (bm:Memory)-[:PROCEDURALIZED_FROM]->(bsk:Routine)
                 WHERE bm.created_at IN p.member_created
                   AND bsk.status <> 'deprecated'
                 // Filter the nulls OUT here, not in Python. An OPTIONAL
@@ -2420,16 +2420,16 @@ def get_skill_proposals(status="pending", limit=50):
                 // size(blockers) was 1 for every proposal and the ordering
                 // below silently did nothing.
                 WITH p, live,
-                     [b IN collect(DISTINCT {{skill_id: bsk.skill_id,
+                     [b IN collect(DISTINCT {{routine_id: bsk.routine_id,
                                              trigger:  bsk.trigger}})
-                      WHERE b.skill_id IS NOT NULL] AS blockers
+                      WHERE b.routine_id IS NOT NULL] AS blockers
                 RETURN blockers         AS blockers,
                        p.proposal_id    AS proposal_id,
                        p.member_key     AS member_key,
                        p.member_created AS member_created,
                        live             AS live_members,
                        p.status         AS status,
-                       p.skill_score    AS skill_score,
+                       p.routine_score    AS routine_score,
                        p.avg_weight     AS avg_weight,
                        p.grp_coherence  AS grp_coherence,
                        p.semantic_coherence AS semantic_coherence,
@@ -2438,13 +2438,13 @@ def get_skill_proposals(status="pending", limit=50):
                        p.updated_at     AS updated_at,
                        p.reviewed_at    AS reviewed_at,
                        p.review_note    AS review_note,
-                       p.skill_id       AS skill_id
+                       p.routine_id       AS routine_id
                 // Actionable proposals first. Score still orders within each
                 // group, but a review queue that leads with items nothing can
                 // confirm wastes the reviewer's attention on the ones ranked
                 // highest -- which is exactly what happened: the top three by
                 // score were all blocked.
-                ORDER BY size(blockers) ASC, p.skill_score DESC, p.created_at ASC
+                ORDER BY size(blockers) ASC, p.routine_score DESC, p.created_at ASC
                 LIMIT $lim
             """, status=status, lim=int(limit))
 
@@ -2465,7 +2465,7 @@ def get_skill_proposals(status="pending", limit=50):
                 d["members_missing"] = len(stamps) - len(live)
 
                 blockers = [b for b in (d.pop("blockers", None) or [])
-                            if b.get("skill_id")]
+                            if b.get("routine_id")]
                 d["blocked_by"] = blockers
                 d["blocked"]    = bool(blockers)
 
@@ -2476,11 +2476,11 @@ def get_skill_proposals(status="pending", limit=50):
                 out.append(d)
             return out
     except Exception as e:
-        log.warning(f"get_skill_proposals failed: {e}")
+        log.warning(f"get_routine_proposals failed: {e}")
         return []
 
 
-def count_skill_proposals(status="pending"):
+def count_routine_proposals(status="pending"):
     """How many proposals exist, independent of any page limit."""
     driver = get_driver()
     if driver is None:
@@ -2488,15 +2488,15 @@ def count_skill_proposals(status="pending"):
     try:
         with driver.session() as s:
             where = "WHERE p.status = $status" if status else ""
-            rec = s.run(f"MATCH (p:SkillProposal) {where} RETURN count(p) AS n",
+            rec = s.run(f"MATCH (p:RoutineProposal) {where} RETURN count(p) AS n",
                         status=status).single()
             return int(rec["n"]) if rec else 0
     except Exception as e:
-        log.warning(f"count_skill_proposals failed: {e}")
+        log.warning(f"count_routine_proposals failed: {e}")
         return 0
 
 
-def reject_skill_proposal(proposal_id, note=""):
+def reject_routine_proposal(proposal_id, note=""):
     """
     Mark a proposal rejected so later sweeps stop re-offering it.
 
@@ -2509,16 +2509,16 @@ def reject_skill_proposal(proposal_id, note=""):
     try:
         with driver.session() as s:
             rec = s.run("""
-                MATCH (p:SkillProposal {proposal_id: $pid})
+                MATCH (p:RoutineProposal {proposal_id: $pid})
                 RETURN p.status AS status
             """, pid=proposal_id).single()
             if not rec:
                 return False, "no such proposal"
             if rec["status"] == "crystallized":
-                return False, "that proposal already became a skill"
+                return False, "that proposal already became a routine"
 
             s.run("""
-                MATCH (p:SkillProposal {proposal_id: $pid})
+                MATCH (p:RoutineProposal {proposal_id: $pid})
                 SET p.status      = 'rejected',
                     p.reviewed_at = $now,
                     p.review_note = $note,
@@ -2527,7 +2527,7 @@ def reject_skill_proposal(proposal_id, note=""):
                  note=(note or ""))
         return True, "rejected"
     except Exception as e:
-        log.warning(f"reject_skill_proposal failed: {e}")
+        log.warning(f"reject_routine_proposal failed: {e}")
         return False, str(e)
 
 
@@ -2546,7 +2546,7 @@ def get_proposal_members(proposal_id):
     try:
         with driver.session() as s:
             rec = s.run("""
-                MATCH (p:SkillProposal {proposal_id: $pid})
+                MATCH (p:RoutineProposal {proposal_id: $pid})
                 RETURN p.member_created AS stamps, p.status AS status
             """, pid=proposal_id).single()
             if not rec:
@@ -2568,11 +2568,11 @@ def get_proposal_members(proposal_id):
         return [], str(e)
 
 
-def close_proposal_for_members(member_addresses, skill_id):
+def close_proposal_for_members(member_addresses, routine_id):
     """
     Close the loop after a human crystallizes: if the confirmed member set
     matches a queued proposal, mark it crystallized so the sweep stops
-    proposing a cluster that already became a skill.
+    proposing a cluster that already became a routine.
 
     Best-effort. Crystallization has already committed by the time this runs,
     and a bookkeeping failure must not be reported as a failed crystallization.
@@ -2587,17 +2587,17 @@ def close_proposal_for_members(member_addresses, skill_id):
             if not created:
                 return False
             res = s.run("""
-                MATCH (p:SkillProposal {member_key: $key})
+                MATCH (p:RoutineProposal {member_key: $key})
                 SET p.status      = 'crystallized',
-                    p.skill_id    = $sid,
+                    p.routine_id    = $sid,
                     p.reviewed_at = $now,
                     p.updated_at  = $now
                 RETURN p.proposal_id AS pid
-            """, key=_member_key(created), sid=skill_id,
+            """, key=_member_key(created), sid=routine_id,
                  now=datetime.now().isoformat()).single()
         return bool(res)
     except Exception as e:
-        log.warning(f"close_proposal_for_members failed (skill was created): {e}")
+        log.warning(f"close_proposal_for_members failed (routine was created): {e}")
         return False
 
 
@@ -3157,7 +3157,7 @@ def get_insights() -> dict:
     Phase 5: Returns comprehensive memory graph insights.
 
     Used by the /insights REST endpoint and, in Phase 11, as the engine
-    for crystallization candidate detection and skill proposal generation.
+    for crystallization candidate detection and routine proposal generation.
 
     Queries run in a single session; all are read-only and index-friendly.
     """
@@ -3284,17 +3284,17 @@ def get_insights() -> dict:
         #
         # Phase 13.1: this used to run its own query -- hub-shaped ("which
         # memory has strong neighbours"), with no source or colour filter and
-        # its own scoring formula. find_skill_candidates() asks the question
+        # its own scoring formula. find_routine_candidates() asks the question
         # that actually decides crystallization (mutual density across every
         # pair) and applies the real filters, and the two disagreed
         # systematically: /insights advertised a physics candidate at 0.7957,
-        # above the documented propose-at-0.70 bar, that /skill_candidates was
+        # above the documented propose-at-0.70 bar, that /routine_candidates was
         # structurally incapable of ever returning. Reporting a candidate the
         # confirm path cannot accept is worse than reporting none.
         #
         # One call, one answer. The endpoint is a preview of a real decision,
         # so it previews the real decision.
-        crystal_candidates = find_skill_candidates(limit=10)
+        crystal_candidates = find_routine_candidates(limit=10)
 
         # 9. Top keywords by frequency
         top_keywords = []
@@ -4025,12 +4025,12 @@ def get_idle_context(depth: str = "light") -> dict:
                 }
 
                 # Crystallization preview. Phase 13.1: same single source
-                # of truth as /insights and /skill_candidates. This path was
+                # of truth as /insights and /routine_candidates. This path was
                 # the loosest of the three -- no weight floor at all, so any
                 # memory with two neighbours scored -- which meant Nova was
                 # being shown "candidates" during idle cognition that no
                 # confirm path would accept.
-                ctx["crystallization_candidates"] = find_skill_candidates(limit=10)
+                ctx["crystallization_candidates"] = find_routine_candidates(limit=10)
 
             # ── Deep only: prior artifacts, open threads, gaps ───────
             if depth == "deep":

@@ -231,13 +231,13 @@ def test_proposals_are_not_keyed_on_addresses():
     addresses that no longer MATCH anything. created_at is written once.
     """
     import neo4j_layer as n4j
-    src = inspect.getsource(n4j.queue_skill_proposals)
+    src = inspect.getsource(n4j.queue_routine_proposals)
     assert '_member_key(c["member_created"])' in src
     assert '_member_key(c["members"])' not in src,         "addresses are mutable and cannot key a proposal"
-    assert "member_created" in inspect.getsource(n4j.find_skill_candidates)
+    assert "member_created" in inspect.getsource(n4j.find_routine_candidates)
 
 
-def test_skill_floor_never_normalizes_against_the_max():
+def test_routine_floor_never_normalizes_against_the_max():
     """
     Phase 13.1 regression guard. Normalizing against max() made the bar track
     the single hottest edge in the graph, so every recall of the hottest pair
@@ -245,9 +245,9 @@ def test_skill_floor_never_normalizes_against_the_max():
     crystallize the more it was used. The reference must be a percentile.
     """
     import neo4j_layer as n4j
-    assert 0.0 < n4j.SKILL_NORM_PERCENTILE < 1.0
-    assert n4j.SKILL_MIN_ABS_WEIGHT > 0, "an absolute floor must exist under it"
-    src = inspect.getsource(n4j.skill_weight_floor)
+    assert 0.0 < n4j.ROUTINE_NORM_PERCENTILE < 1.0
+    assert n4j.ROUTINE_MIN_ABS_WEIGHT > 0, "an absolute floor must exist under it"
+    src = inspect.getsource(n4j.routine_weight_floor)
     assert "percentileCont" in src
     assert "max(r.weight)" not in src
 
@@ -256,12 +256,12 @@ def test_documents_are_eligible_for_crystallization():
     """
     Phase 13.1 regression guard. `src_type <> 2` was copied here from
     get_idle_context(), where excluding documents is correct. It made 86% of a
-    real graph permanently unable to form a skill, so the densest region of
+    real graph permanently unable to form a routine, so the densest region of
     memory stayed as hundreds of flat entries competing in every recall.
     Crystallization is compression; a reference corpus is its best case.
     """
     import neo4j_layer as n4j
-    src = inspect.getsource(n4j.find_skill_candidates)
+    src = inspect.getsource(n4j.find_routine_candidates)
     assert "src_type <> 2" not in src, \
         "documents must remain eligible for crystallization"
     # get_anticipated_context is the path where the exclusion IS correct -- a
@@ -273,12 +273,12 @@ def test_documents_are_eligible_for_crystallization():
 def test_previews_share_one_candidate_implementation():
     """
     The three paths had drifted into three different queries with three
-    scoring formulas, and /insights advertised candidates /skill_candidates
+    scoring formulas, and /insights advertised candidates /routine_candidates
     could never return. They must call the one function.
     """
     import neo4j_layer as n4j
     for fn in (n4j.get_insights, n4j.get_idle_context):
-        assert "find_skill_candidates(" in inspect.getsource(fn), \
+        assert "find_routine_candidates(" in inspect.getsource(fn), \
             f"{fn.__name__} must not compute its own candidates"
 
 
@@ -296,8 +296,8 @@ def test_health():
 def test_endpoints_survive_any_graph_size():
     """Including an empty one -- no 500s, sane empty structures."""
     for path in ("/health", "/embedding_status", "/insights", "/session_bundle",
-                 "/graph", "/memories", "/skill_candidates", "/skills",
-                 "/skill_tree", "/unrated_memories", "/activity"):
+                 "/graph", "/memories", "/routine_candidates", "/routines",
+                 "/routine_tree", "/unrated_memories", "/activity"):
         st, _ = _call("GET", path)
         assert st == 200, f"{path} returned {st}"
 
@@ -371,44 +371,44 @@ def test_deleted_memory_leaves_no_phantom():
 
 
 @live
-def test_skill_candidates_is_read_only():
+def test_routine_candidates_is_read_only():
     _, before = _call("GET", "/health")
-    _call("GET", "/skill_candidates")
+    _call("GET", "/routine_candidates")
     _, after = _call("GET", "/health")
     assert after["total_memories"] == before["total_memories"]
 
 
 @live
-def test_skill_proposal_sweep_creates_no_skills():
+def test_routine_proposal_sweep_creates_no_routines():
     """
     The sweep is what makes the daemon safe to run unattended: it may queue a
-    proposal, never act on one. If it can create a Skill or demote a memory,
+    proposal, never act on one. If it can create a Routine or demote a memory,
     the human gate on /crystallize has been routed around.
     """
     _, before_h = _call("GET", "/health")
-    _, before_s = _call("GET", "/skills")
+    _, before_s = _call("GET", "/routines")
 
-    st, d = _call("POST", "/skill_proposals/sweep")
+    st, d = _call("POST", "/routine_proposals/sweep")
     assert st == 200 and d["status"] == "swept"
 
     _, after_h = _call("GET", "/health")
-    _, after_s = _call("GET", "/skills")
+    _, after_s = _call("GET", "/routines")
     assert after_h["total_memories"] == before_h["total_memories"]
     assert after_s["count"] == before_s["count"], \
         "a sweep must never crystallize anything"
 
 
 @live
-def test_skill_proposal_sweep_is_idempotent():
+def test_routine_proposal_sweep_is_idempotent():
     """
     The daemon sweeps after every idle pass. A cluster that is still dense
     must refresh its proposal, not queue a second copy of the same finding.
     """
-    _call("POST", "/skill_proposals/sweep")
-    _, first = _call("GET", "/skill_proposals")
-    st, d = _call("POST", "/skill_proposals/sweep")
+    _call("POST", "/routine_proposals/sweep")
+    _, first = _call("GET", "/routine_proposals")
+    st, d = _call("POST", "/routine_proposals/sweep")
     assert st == 200 and d["created"] == 0, "a repeat sweep must create nothing"
-    _, second = _call("GET", "/skill_proposals")
+    _, second = _call("GET", "/routine_proposals")
     assert second["count"] == first["count"]
 
 
@@ -419,8 +419,8 @@ def test_proposals_reach_the_model_somehow():
     the session bundle did not mention it, so the only thing that could see a
     proposal was curl. A review queue nothing can read is the same as no queue.
     """
-    _call("POST", "/skill_proposals/sweep")
-    _, q = _call("GET", "/skill_proposals")
+    _call("POST", "/routine_proposals/sweep")
+    _, q = _call("GET", "/routine_proposals")
     if not q["count"]:
         pytest.skip("nothing pending to surface")
     _, bundle = _call("GET", "/session_bundle")
@@ -435,7 +435,7 @@ def test_semantic_coherence_is_measured_not_assumed():
     a user's self-description -- all filed under 5xx and about nothing in
     common. Meaning has to be measured against the embeddings.
     """
-    _, d = _call("GET", "/skill_candidates?limit=5")
+    _, d = _call("GET", "/routine_candidates?limit=5")
     if not d["count"]:
         pytest.skip("no candidates on this graph")
     for c in d["candidates"]:
@@ -454,7 +454,7 @@ def test_no_memory_crowds_the_queue():
     filled 40% of a real queue, which a reviewer reads as the same finding
     four times. Breadth is the point of a review list.
     """
-    _, d = _call("GET", "/skill_candidates?limit=10")
+    _, d = _call("GET", "/routine_candidates?limit=10")
     if d["count"] < 4:
         pytest.skip("too few candidates to crowd anything")
     seen = {}
@@ -466,14 +466,14 @@ def test_no_memory_crowds_the_queue():
 
 
 @live
-def test_skill_proposals_rejects_bad_status():
-    st, _ = _call("GET", "/skill_proposals?status=bogus")
+def test_routine_proposals_rejects_bad_status():
+    st, _ = _call("GET", "/routine_proposals?status=bogus")
     assert st == 400
 
 
 @live
 def test_reject_unknown_proposal_is_404():
-    st, _ = _call("POST", "/skill_proposals/no-such-proposal-id/reject")
+    st, _ = _call("POST", "/routine_proposals/no-such-proposal-id/reject")
     assert st == 404
 
 
@@ -484,7 +484,7 @@ def test_candidates_report_the_floor_they_applied():
     if the caller can see the bar that was applied and what set it. Reporting
     a bare count is how a structural exclusion stayed invisible for a phase.
     """
-    st, d = _call("GET", "/skill_candidates")
+    st, d = _call("GET", "/routine_candidates")
     assert st == 200
     t = d["thresholds"]
     for k in ("weight_floor", "reference_weight", "reference", "floor_set_by"):
@@ -493,23 +493,23 @@ def test_candidates_report_the_floor_they_applied():
 
 
 @live
-def test_insights_and_skill_candidates_agree():
+def test_insights_and_routine_candidates_agree():
     """
     They disagreed systematically: /insights showed a top candidate above the
-    documented propose-at-0.70 bar that /skill_candidates was structurally
+    documented propose-at-0.70 bar that /routine_candidates was structurally
     incapable of returning. A preview of a decision must preview the decision.
     """
     _, ins = _call("GET", "/insights")
-    _, cands = _call("GET", "/skill_candidates?limit=10")
+    _, cands = _call("GET", "/routine_candidates?limit=10")
     a = [c["members"] for c in ins["crystallization_candidates"]]
     b = [c["members"] for c in cands["candidates"]]
-    assert a == b, "/insights and /skill_candidates must report the same clusters"
+    assert a == b, "/insights and /routine_candidates must report the same clusters"
 
 
 @live
-def test_a_crystallized_skill_is_actually_retrievable():
+def test_a_crystallized_routine_is_actually_retrievable():
     """
-    Phase 13.2. Crystallization was write-only: a Skill had no keywords and no
+    Phase 13.2. Crystallization was write-only: a Routine had no keywords and no
     embedding, and every retrieval path reaches memories through one or the
     other, so nothing could ever return one. Crystallizing three memories
     changed recall by zero bytes.
@@ -531,25 +531,25 @@ def test_a_crystallized_skill_is_actually_retrievable():
             "procedure": "Seat the widget first, then torque it to spec.",
             "confirmed": True})
         assert st == 200, sk
-        sid = sk["skill_id"]
+        sid = sk["routine_id"]
 
         st, d = _call("POST", "/recall",
                       {"prompt": "quibbleprobe widget torque", "top_k": 5})
         assert st == 200
-        ids = [s["skill_id"] for s in d.get("skills", [])]
-        assert sid in ids, "a crystallized skill must be retrievable by recall"
+        ids = [s["routine_id"] for s in d.get("routines", [])]
+        assert sid in ids, "a crystallized routine must be retrievable by recall"
 
         # And it must SUBSTITUTE for its members, not arrive alongside them.
-        # A skill delivered next to everything it compressed has added text
+        # A routine delivered next to everything it compressed has added text
         # rather than saved it.
-        hit = next(s for s in d["skills"] if s["skill_id"] == sid)
-        assert hit["replaced_members"], "the skill must displace its own members"
+        hit = next(s for s in d["routines"] if s["routine_id"] == sid)
+        assert hit["replaced_members"], "the routine must displace its own members"
         for addr in hit["replaced_members"]:
             assert addr not in d["context_block"],                 "a replaced member must not also appear in the context block"
-        assert "SKILL" in d["context_block"]
+        assert "ROUTINE" in d["context_block"]
     finally:
         if sid:
-            _call("POST", f"/skills/{sid}/uncrystallize?confirm=UNCRYSTALLIZE")
+            _call("POST", f"/routines/{sid}/uncrystallize?confirm=UNCRYSTALLIZE")
         for addr in addrs:
             _call("DELETE", f"/memories/{urllib.parse.quote(addr, safe='')}")
 
@@ -557,9 +557,9 @@ def test_a_crystallized_skill_is_actually_retrievable():
 @live
 def test_crystallize_can_create_a_branch():
     """
-    Phase 13.2. link_skills() and POST /skills/{id}/link existed from Phase 13,
+    Phase 13.2. link_routines() and POST /routines/{id}/link existed from Phase 13,
     but nothing a model could reach exposed them, so "crystallize these as
-    branches off that skill" was not an instruction the system could carry out.
+    branches off that routine" was not an instruction the system could carry out.
     A tree built by remembering to call /link afterwards does not get built.
     """
     made = []
@@ -580,29 +580,29 @@ def test_crystallize_can_create_a_branch():
                 "procedure": f"Handle {tag}.",
                 "confirmed": True,
                 "extends": made[0] if made else None})
-            made.append(sk["skill_id"])
+            made.append(sk["routine_id"])
 
         # The child names its parent, and the tree reflects it.
-        _, skills = _call("GET", "/skills")
-        child = next(s for s in skills["skills"] if s["skill_id"] == made[1])
-        assert made[0] in (child.get("extends") or []),             "a skill created with extends= must actually be linked"
+        _, routines = _call("GET", "/routines")
+        child = next(s for s in routines["routines"] if s["routine_id"] == made[1])
+        assert made[0] in (child.get("extends") or []),             "a routine created with extends= must actually be linked"
 
-        _, tree = _call("GET", f"/skill_tree?root={made[0]}")
+        _, tree = _call("GET", f"/routine_tree?root={made[0]}")
         kids = tree["tree"][0]["children"]
-        assert [k["skill_id"] for k in kids] == [made[1]]
+        assert [k["routine_id"] for k in kids] == [made[1]]
     finally:
         for sid in reversed(made):
-            _call("POST", f"/skills/{sid}/uncrystallize?confirm=UNCRYSTALLIZE")
+            _call("POST", f"/routines/{sid}/uncrystallize?confirm=UNCRYSTALLIZE")
         for addr in addrs:
             _call("DELETE", f"/memories/{urllib.parse.quote(addr, safe='')}")
 
 
 @live
-def test_an_existing_skill_can_be_branched_without_rebuilding():
+def test_an_existing_routine_can_be_branched_without_rebuilding():
     """
-    Branching used to be possible only at creation, through crystallize_skill's
-    `extends`. An already-created skill could therefore be branched only by
-    uncrystallizing and rebuilding it -- which mints a new skill_id and
+    Branching used to be possible only at creation, through crystallize_routine's
+    `extends`. An already-created routine could therefore be branched only by
+    uncrystallizing and rebuilding it -- which mints a new routine_id and
     re-enters the overlap checks. Observed consequence: 21 identical POSTs to
     one blocked proposal, and a tree that stayed flat.
     """
@@ -620,34 +620,34 @@ def test_an_existing_skill_can_be_branched_without_rebuilding():
             _, sk = _call("POST", "/crystallize", {
                 "member_addresses": pair, "trigger": f"asked about {tag}",
                 "procedure": f"Handle {tag}.", "confirmed": True})
-            made.append(sk["skill_id"])
+            made.append(sk["routine_id"])
         parent, child = made
 
         # Link by prefix, without recreating anything.
-        st, d = _call("POST", f"/skills/{child[:8]}/link?parent_id={parent[:8]}")
+        st, d = _call("POST", f"/routines/{child[:8]}/link?parent_id={parent[:8]}")
         assert st == 200 and d["parent"] == parent
 
         # Idempotent: linking twice is not an error and makes one edge.
-        st, _ = _call("POST", f"/skills/{child[:8]}/link?parent_id={parent[:8]}")
+        st, _ = _call("POST", f"/routines/{child[:8]}/link?parent_id={parent[:8]}")
         assert st == 200
-        _, tree = _call("GET", f"/skill_tree?root={parent}")
+        _, tree = _call("GET", f"/routine_tree?root={parent}")
         assert len(tree["tree"][0]["children"]) == 1
 
         # The ids are unchanged -- that is the point of not rebuilding.
-        _, skills = _call("GET", "/skills")
-        ids = [s["skill_id"] for s in skills["skills"]]
+        _, routines = _call("GET", "/routines")
+        ids = [s["routine_id"] for s in routines["routines"]]
         assert parent in ids and child in ids
 
         # Detach without destroying.
-        st, d = _call("POST", f"/skills/{child}/unlink")
+        st, d = _call("POST", f"/routines/{child}/unlink")
         assert st == 200 and d["edges_removed"] == 1
-        _, skills = _call("GET", "/skills")
-        assert child in [s["skill_id"] for s in skills["skills"]],             "unlink must not delete the skill"
+        _, routines = _call("GET", "/routines")
+        assert child in [s["routine_id"] for s in routines["routines"]],             "unlink must not delete the routine"
     finally:
         for sid in reversed(made):
-            _call("POST", f"/skills/{sid}/unlink")
+            _call("POST", f"/routines/{sid}/unlink")
         for sid in reversed(made):
-            _call("POST", f"/skills/{sid}/uncrystallize?confirm=UNCRYSTALLIZE")
+            _call("POST", f"/routines/{sid}/uncrystallize?confirm=UNCRYSTALLIZE")
         for addr in addrs:
             _call("DELETE", f"/memories/{urllib.parse.quote(addr, safe='')}")
 
@@ -661,7 +661,7 @@ def test_blocked_proposals_are_marked_and_ranked_last():
     plain "pending". A review queue that leads with work nothing can confirm
     spends the reviewer's attention on exactly the wrong items.
     """
-    st, d = _call("GET", "/skill_proposals?limit=50")
+    st, d = _call("GET", "/routine_proposals?limit=50")
     assert st == 200
     props = d["proposals"]
     if not props:
@@ -679,31 +679,31 @@ def test_blocked_proposals_are_marked_and_ranked_last():
     # And a blocked one really is refused, rather than merely labelled.
     blocked = next((p for p in props if p["blocked"]), None)
     if blocked:
-        st, _ = _call("POST", f"/skill_proposals/{blocked['proposal_id']}/crystallize",
+        st, _ = _call("POST", f"/routine_proposals/{blocked['proposal_id']}/crystallize",
                       {"member_addresses": [], "trigger": "t", "procedure": "p",
                        "confirmed": True})
         assert st == 409
 
 
 @live
-def test_skill_ids_accept_an_unambiguous_prefix():
+def test_routine_ids_accept_an_unambiguous_prefix():
     """
-    Skill ids are UUIDs and are displayed truncated nearly everywhere -- tree
+    Routine ids are UUIDs and are displayed truncated nearly everywhere -- tree
     views, summaries, logs. Requiring all 36 characters made the one form
     anybody actually has in front of them the one form that did not work, so a
     branch became a second root.
     """
-    _, skills = _call("GET", "/skills")
-    if len(skills["skills"]) < 1:
-        pytest.skip("no skills to resolve")
-    full = skills["skills"][0]["skill_id"]
+    _, routines = _call("GET", "/routines")
+    if len(routines["routines"]) < 1:
+        pytest.skip("no routines to resolve")
+    full = routines["routines"][0]["routine_id"]
 
     # A prefix that matches nothing is an error, not a guess.
-    st, d = _call("POST", f"/skills/{full}/link?parent_id=zzzzzznope")
-    assert st == 404 and "no skill with id" in d["detail"]
+    st, d = _call("POST", f"/routines/{full}/link?parent_id=zzzzzznope")
+    assert st == 404 and "no routine with id" in d["detail"]
 
     # A self-link via prefix is still a self-link.
-    st, d = _call("POST", f"/skills/{full[:8]}/link?parent_id={full[:8]}")
+    st, d = _call("POST", f"/routines/{full[:8]}/link?parent_id={full[:8]}")
     assert st == 400, "prefix resolution must not defeat the self-link check"
 
 
@@ -715,19 +715,19 @@ def test_proposals_report_the_queue_not_the_page():
     corpus owned that page -- and the honest reading of the output was that
     every proposal was about one topic, which was false.
     """
-    st, d = _call("GET", "/skill_proposals?limit=1")
+    st, d = _call("GET", "/routine_proposals?limit=1")
     assert st == 200
     assert "total" in d, "the queue size must be reported alongside the page"
     assert d["total"] >= d["count"]
 
 
 @live
-def test_skill_reindex_is_safe_to_rerun():
+def test_routine_reindex_is_safe_to_rerun():
     """Anything crystallized before Phase 13.2 has no embedding and no
     keywords; the backfill must be idempotent, not just present."""
-    st, first = _call("POST", "/skills/reindex")
+    st, first = _call("POST", "/routines/reindex")
     assert st == 200
-    st, second = _call("POST", "/skills/reindex")
+    st, second = _call("POST", "/routines/reindex")
     assert st == 200 and second["count"] == 0,         "a second reindex must find nothing left to do"
 
 
@@ -735,7 +735,7 @@ def test_skill_reindex_is_safe_to_rerun():
 def test_crystallization_is_reversible():
     """
     Crystallization is the one operation that restructures memory, and it had
-    no undo: deprecate_skill() left every member stranded in Blue. Members
+    no undo: deprecate_routine() left every member stranded in Blue. Members
     carry mixed colours, so an undo that assumed one would corrupt the rest.
     """
     _, a = _call("POST", "/remember", {
@@ -750,14 +750,14 @@ def test_crystallization_is_reversible():
         assert st == 200, sk
 
         st, un = _call("POST",
-                       f"/skills/{sk['skill_id']}/uncrystallize?confirm=UNCRYSTALLIZE")
+                       f"/routines/{sk['routine_id']}/uncrystallize?confirm=UNCRYSTALLIZE")
         assert st == 200, un
         assert len(un["restored"]) == 2
         for m in un["restored"]:
             assert m["color"] != "Blue", "a restored memory must not stay demoted"
 
-        _, skills = _call("GET", "/skills")
-        assert sk["skill_id"] not in [s["skill_id"] for s in skills["skills"]]
+        _, routines = _call("GET", "/routines")
+        assert sk["routine_id"] not in [s["routine_id"] for s in routines["routines"]]
     finally:
         for addr in addrs:
             _call("DELETE", f"/memories/{urllib.parse.quote(addr, safe='')}")
@@ -765,7 +765,7 @@ def test_crystallization_is_reversible():
 
 @live
 def test_uncrystallize_requires_the_phrase():
-    st, _ = _call("POST", "/skills/whatever/uncrystallize")
+    st, _ = _call("POST", "/routines/whatever/uncrystallize")
     assert st == 400
 
 
@@ -777,7 +777,7 @@ def test_model_crystallization_is_gated():
     client-side promise, and the write is not something to leave to a client
     keeping one.
     """
-    _, q = _call("GET", "/skill_proposals")
+    _, q = _call("GET", "/routine_proposals")
     if not q["count"]:
         pytest.skip("nothing pending")
     pid = q["proposals"][0]["proposal_id"]
@@ -789,7 +789,7 @@ def test_model_crystallization_is_gated():
     # status was "one of" several. With the flag enabled that is a real write,
     # and it crystallized a live proposal with the trigger "t" -- demoting
     # three real memories. A test against a gate must not be able to open it.
-    st, d = _call("POST", f"/skill_proposals/{pid}/crystallize",
+    st, d = _call("POST", f"/routine_proposals/{pid}/crystallize",
                   {"member_addresses": [], "trigger": "t", "procedure": "p",
                    "confirmed": False},
                   headers={"X-MMU-Source": "model"})
@@ -799,22 +799,22 @@ def test_model_crystallization_is_gated():
 
 
 @live
-def test_a_memory_cannot_belong_to_two_active_skills():
+def test_a_memory_cannot_belong_to_two_active_routines():
     """
-    Colour is single-valued, so two skills claiming one member disagree about
+    Colour is single-valued, so two routines claiming one member disagree about
     what it should be the moment either is undone. Found the hard way: a stale
     proposal was confirmed while one of its members was already crystallized,
-    and undoing it restored a memory the first skill still owned.
+    and undoing it restored a memory the first routine still owned.
     """
-    _, sk = _call("GET", "/skills")
-    active = [s for s in sk["skills"] if s.get("status") == "active"]
+    _, sk = _call("GET", "/routines")
+    active = [s for s in sk["routines"] if s.get("status") == "active"]
     if not active:
-        pytest.skip("no active skill to collide with")
+        pytest.skip("no active routine to collide with")
 
-    # Any proposal whose members overlap an active skill must be refused.
-    _, props = _call("GET", "/skill_proposals")
+    # Any proposal whose members overlap an active routine must be refused.
+    _, props = _call("GET", "/routine_proposals")
     for p in props["proposals"]:
-        st, d = _call("POST", f"/skill_proposals/{p['proposal_id']}/crystallize",
+        st, d = _call("POST", f"/routine_proposals/{p['proposal_id']}/crystallize",
                       {"member_addresses": [], "trigger": "", "procedure": "",
                        "confirmed": True})
         # Empty trigger/procedure is rejected first; that is fine. What must
@@ -825,12 +825,12 @@ def test_a_memory_cannot_belong_to_two_active_skills():
 @live
 def test_crystallize_by_proposal_id_refuses_without_confirmation():
     """The proposal-id path is ergonomics, not a second door around the gate."""
-    _call("POST", "/skill_proposals/sweep")
-    _, q = _call("GET", "/skill_proposals")
+    _call("POST", "/routine_proposals/sweep")
+    _, q = _call("GET", "/routine_proposals")
     if not q["count"]:
         pytest.skip("nothing pending")
     pid = q["proposals"][0]["proposal_id"]
-    st, d = _call("POST", f"/skill_proposals/{pid}/crystallize", {
+    st, d = _call("POST", f"/routine_proposals/{pid}/crystallize", {
         "member_addresses": [], "trigger": "t", "procedure": "p"})
     assert st == 400 and "confirmed" in d["detail"]
 

@@ -72,7 +72,7 @@ services:
       # Phase 13.1: allow a model to confirm a crystallization itself.
       # Off by default -- crystallizing demotes its source memories to Blue,
       # and a model that drafts a proposal should not also approve it.
-      # Reverse anything with POST /skills/{id}/uncrystallize.
+      # Reverse anything with POST /routines/{id}/uncrystallize.
       - MMU_ALLOW_MODEL_CRYSTALLIZE=${MMU_ALLOW_MODEL_CRYSTALLIZE:-false}
     extra_hosts:
       - "host.docker.internal:host-gateway"

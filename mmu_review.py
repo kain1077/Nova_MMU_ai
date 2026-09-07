@@ -2,7 +2,7 @@
 """
 mmu_review.py -- the human side of crystallization.
 
-Phase 12 made confirming a skill a human decision and Phase 13.1 gave that
+Phase 12 made confirming a routine a human decision and Phase 13.1 gave that
 decision a queue. This is the terminal for it. Nothing here is reachable by a
 model: it is a local script you run, and every write asks first.
 
@@ -14,7 +14,7 @@ model: it is a local script you run, and every write asks first.
     python mmu_review.py --sweep         look for new candidates now
 
 Confirming is deliberately a conversation, not a flag. Crystallizing compresses
-memories into a Skill and DEMOTES them to Blue, which changes how memory is
+memories into a Routine and DEMOTES them to Blue, which changes how memory is
 structured rather than adding to it -- so the script shows exactly what will be
 demoted and makes you type the word before it writes anything.
 
@@ -80,7 +80,7 @@ def wrap(text, indent="      "):
 
 def fetch(status="pending"):
     q = f"?status={status}&limit=50" if status else "?status=&limit=50"
-    st, d = call("GET", f"/skill_proposals{q}")
+    st, d = call("GET", f"/routine_proposals{q}")
     if st != 200:
         print(f"Error {st}: {d.get('detail')}")
         sys.exit(1)
@@ -90,7 +90,7 @@ def fetch(status="pending"):
 def show(p, index, full=False):
     sem = p.get("semantic_coherence")
     sem_s = f"{sem:.2f}" if isinstance(sem, (int, float)) else "n/a"
-    head = (f"{BOLD}[{index}]{RESET} score {p['skill_score']:.2f}  "
+    head = (f"{BOLD}[{index}]{RESET} score {p['routine_score']:.2f}  "
             f"{DIM}(co-recall {p.get('avg_weight')} | domain {p.get('grp_coherence')} | "
             f"meaning {sem_s}){RESET}")
     if p.get("status") != "pending":
@@ -146,12 +146,12 @@ def cmd_crystallize(n):
         sys.exit(1)
 
     print(f"{BOLD}This will:{RESET}")
-    print(f"  - create one Skill from these {len(p['members'])} memories")
+    print(f"  - create one Routine from these {len(p['members'])} memories")
     print(f"  - DEMOTE all {len(p['members'])} of them to Blue")
-    print(f"  {DIM}Blue memories stay as the skill's root system and are never "
+    print(f"  {DIM}Blue memories stay as the routine's root system and are never "
           f"deleted, but the recall gate treats them as inactive.{RESET}")
     print()
-    print("Two things only you can write. The trigger is when this skill should "
+    print("Two things only you can write. The trigger is when this routine should "
           "fire; the procedure is what to actually do.")
     print()
 
@@ -176,7 +176,7 @@ def cmd_crystallize(n):
         print("\nAborted. Nothing written.")
         return
 
-    st, d = call("POST", f"/skill_proposals/{p['proposal_id']}/crystallize", {
+    st, d = call("POST", f"/routine_proposals/{p['proposal_id']}/crystallize", {
         "member_addresses": [],          # resolved server-side; see the endpoint
         "trigger": trigger,
         "procedure": procedure,
@@ -186,9 +186,9 @@ def cmd_crystallize(n):
     if st != 200:
         print(f"\nFailed ({st}): {d.get('detail')}")
         sys.exit(1)
-    print(f"\n{BOLD}Crystallized.{RESET}  skill_id {d['skill_id']}")
+    print(f"\n{BOLD}Crystallized.{RESET}  routine_id {d['routine_id']}")
     print(f"{DIM}{len(d['members'])} memories demoted to Blue. "
-          f"See them with: curl {BASE}/skills{RESET}")
+          f"See them with: curl {BASE}/routines{RESET}")
 
 
 def cmd_reject(n, note):
@@ -205,7 +205,7 @@ def cmd_reject(n, note):
         return
 
     q = f"?note={urllib.request.quote(note)}" if note else ""
-    st, d = call("POST", f"/skill_proposals/{p['proposal_id']}/reject{q}")
+    st, d = call("POST", f"/routine_proposals/{p['proposal_id']}/reject{q}")
     if st != 200:
         print(f"Failed ({st}): {d.get('detail')}")
         sys.exit(1)
@@ -213,7 +213,7 @@ def cmd_reject(n, note):
 
 
 def cmd_sweep():
-    st, d = call("POST", "/skill_proposals/sweep")
+    st, d = call("POST", "/routine_proposals/sweep")
     if st != 200:
         print(f"Failed ({st}): {d.get('detail')}")
         sys.exit(1)
@@ -225,7 +225,7 @@ def cmd_sweep():
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Review and confirm MMU skill crystallization proposals.")
+        description="Review and confirm MMU routine crystallization proposals.")
     ap.add_argument("n", nargs="?", type=int, help="proposal number from the listing")
     ap.add_argument("--crystallize", action="store_true", help="confirm proposal n")
     ap.add_argument("--reject", action="store_true", help="decline proposal n")
