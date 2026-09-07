@@ -4,7 +4,7 @@ Neo4j Backfill Script
 One-time migration of all existing SQLite memories into Neo4j.
 Safe to re-run — uses MERGE so nothing gets duplicated.
 
-Run from C:\\mmu\\ after docker compose up:
+Run from the repo root after docker compose up:
     python neo4j_backfill.py
 
 What it does:
@@ -21,15 +21,19 @@ import sqlite3
 import os
 import sys
 import time
+from pathlib import Path
 from difflib import SequenceMatcher
 
 # ── Config ────────────────────────────────────────────
-# Adjust these paths if yours differ
+# Paths default relative to this file, so they resolve on any platform.
+# Override with MMU_DB_PATH if your copy lives elsewhere.
 
-DB_PATH    = os.environ.get("MMU_DB_PATH",  r"C:\mmu\data\memory_system.db")
+DB_PATH    = os.environ.get("MMU_DB_PATH",
+                            str(Path(__file__).resolve().parent / "data" / "memory_system.db"))
 NEO4J_URI  = os.environ.get("NEO4J_URI",   "bolt://127.0.0.1:7687")
 NEO4J_USER = os.environ.get("NEO4J_USER",  "neo4j")
-NEO4J_PASS = os.environ.get("NEO4J_PASS",  "mmupassword")
+# Required, never defaulted -- see migrate_add_valence.py for why.
+NEO4J_PASS = os.environ.get("NEO4J_PASS")
 
 SIMILAR_THRESH = 0.72
 SOURCE_LABELS  = {0: "Conversation", 1: "AI-Self", 2: "Document", 3: "Web"}

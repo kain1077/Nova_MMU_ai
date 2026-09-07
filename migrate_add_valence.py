@@ -34,15 +34,19 @@ import re
 import sys
 import json
 import argparse
+from pathlib import Path
 
 NEO4J_URI  = os.environ.get("NEO4J_URI",  "bolt://127.0.0.1:7687")
 NEO4J_USER = os.environ.get("NEO4J_USER", "neo4j")
-NEO4J_PASS = os.environ.get("NEO4J_PASS", "mmupassword")
+# Required, never defaulted. A script that falls back to a known password
+# silently tries that password against whatever is listening.
+NEO4J_PASS = os.environ.get("NEO4J_PASS")
 
-# V2 index file -- mounted from Docker volume on the host
+# V2 index file -- mounted from the Docker volume onto the host. The default
+# is relative to this file, so it resolves the same on any platform.
 V2_INDEX_PATH = os.environ.get(
     "MMU_V2_INDEX_PATH",
-    r"C:\mmu\data\memory_index_v2.json"
+    str(Path(__file__).resolve().parent / "data" / "memory_index_v2.json"),
 )
 
 OLD_ADDR_RE = re.compile(

@@ -1,0 +1,47 @@
+name: Bug report
+description: Something behaved differently than the docs say it should
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing: check [Known Limitations](https://github.com/kain1077/Nova_MMU_ai#known-limitations).
+        Several things are documented as unproven — a report against those is still
+        welcome, it just isn't a surprise.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what you got instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: selfcheck
+    attributes:
+      label: Self-check output
+      description: |
+        `docker compose logs mmu-server | grep -A10 "MMU self-check"`.
+        The dimension lines catch a large share of install problems on their own.
+      render: shell
+
+  - type: input
+    id: os
+    attributes:
+      label: OS and Docker
+      placeholder: "e.g. Ubuntu 24.04, Docker Engine 27.1 / macOS 15, Docker Desktop 4.34"
+    validations:
+      required: true
+
+  - type: input
+    id: embedding
+    attributes:
+      label: Embedding endpoint and model
+      placeholder: "e.g. LM Studio, nomic-embed-text-v1.5, dim 768"
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      render: shell

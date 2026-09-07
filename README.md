@@ -43,14 +43,21 @@ Everything runs locally. See [Privacy](#privacy).
 MMU is **not** required to run an LLM itself. It stores and retrieves; your client
 supplies the model.
 
+**Platforms.** The server runs in Docker, so it behaves the same on Windows, macOS and
+Linux; `host.docker.internal` is wired up explicitly in `docker-compose.yml` so it
+resolves on plain Docker Engine too, not just Docker Desktop. The host-side scripts are
+Python and platform-agnostic. Development and day-to-day use so far has been on Windows,
+so that's the path with the most hours on it -- macOS and Linux should be clean, but if
+you hit something, please open an issue, since a report is the only way it gets found.
+
 ---
 
 ## Install
 
 ```bash
-git clone <your-repo-url> mmu
+git clone https://github.com/kain1077/Nova_MMU_ai.git mmu
 cd mmu
-cp .env.example .env
+cp .env.example .env        # Windows: copy .env.example .env
 ```
 
 Open `.env` and set at minimum:
@@ -124,6 +131,11 @@ MMU speaks [MCP](https://modelcontextprotocol.io). Point your client at
 That gives the model four tools: `get_session_context` (call first, loads the
 bundle), `recall_memory`, `save_memory`, and `rate_memory`.
 
+Use `python3` instead of `python` if that's what your system calls it — on most macOS and
+Linux installs, bare `python` either isn't on `PATH` or points at Python 2. Both `command`
+and the path in `args` are passed straight to your MCP client, so an absolute path to the
+interpreter (a virtualenv's, say) works and is the more reliable choice.
+
 ### Giving the model web search
 
 MMU does not browse, and shouldn't — it's a memory system. Run a search MCP server
@@ -133,6 +145,10 @@ keeping. `mcp_config_example.json` in this repo shows both wired together using
 key), which needs [uv](https://docs.astral.sh/uv/):
 
 ```bash
+# macOS / Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Windows
 winget install --id=astral-sh.uv -e
 ```
 
@@ -493,7 +509,32 @@ worth betting your graph on:
 MMU_TEST_BASE=http://127.0.0.1:8766 pytest tests/ -v
 ```
 
+In PowerShell, set it on its own line first — the inline `VAR=value command` prefix is
+shell syntax that PowerShell doesn't have:
+
+```powershell
+$env:MMU_TEST_BASE = "http://127.0.0.1:8766"; pytest tests/ -v
+```
+
 [Running a second instance](#running-a-second-instance) covers standing one up.
+
+### Measuring recall latency
+
+`mmu_recall_speed_test.py` times `/recall` against a live server, reporting the server's
+own `read_ms` alongside full round-trip time. Standard library only:
+
+```bash
+python mmu_recall_speed_test.py --prompts "my dog" "the thing I decided last week"
+```
+
+Replace the default prompts with ones that actually hit your graph — a latency probe for
+something you never stored is measuring a miss. Keep the set fixed after that, so runs
+stay comparable to each other.
+
+It refuses by default to fire more `/recall` calls than `MMU_ARCHIVE_THRESH`, because
+recall ages every memory it *doesn't* return, and a big burst can archive conversational
+memories as a side effect. That is not hypothetical — it happened twice during earlier
+validation runs, which is why the guard is there.
 
 ---
 
@@ -517,6 +558,89 @@ Detail lives in `phase_packages/`, which documents how each piece came to be and
 `mmu_idle_daemon.py` is optional and runs on the host, giving the model time to think
 between conversations. It is the only component that talks to a chat model; the server
 itself calls only `/v1/embeddings`.
+
+### Why Neo4j and not SQLite
+
+A fair question, and the honest answer is that at 1,000 memories SQLite would be fine.
+The ~2 GB of container is real cost for a graph that small, and if MMU were only a store
+of memories with embeddings on them, that cost would not be justified.
+
+What it buys is the part that isn't storage. MMU's behaviour is mostly *edges*:
+`CO_RECALLED` weights that build up between memories retrieved together, `SIMILAR_TO`
+between fuzzy-matched keywords, the density-of-cluster calculation that nominates a group
+of memories for crystallization into a Skill, and the parent/child structure of the
+skill tree itself. Those are traversals over a graph that changes shape as you use it.
+In SQLite they'd be recursive CTEs over a join table, hand-maintained — writable, but the
+schema would end up being a graph database with extra steps, and the crystallization
+sweep is the piece that would suffer most.
+
+The comparison also isn't quite SQLite-vs-Neo4j: it's SQLite-plus-a-vector-index versus
+Neo4j, which carries the vector index natively. Adding sqlite-vec or FAISS puts a second
+moving part back in.
+
+Where this could change: if the edge work turned out to matter less than expected, or if
+someone wanted MMU embedded rather than containerized, a SQLite backend behind the same
+`neo4j_layer.py` interface is a reasonable thing to want, and the interface is narrow
+enough to make it tractable. Nobody has built it. If that's the version you need, the
+issue tracker is the place to say so.
+
+### Benchmarks
+
+There are none yet, and that's the most legitimate gap in this project. Comparable systems
+publish LoCoMo and LongMemEval numbers; MMU publishes recall latency against one person's
+graph, which tells you it's fast and tells you nothing about whether it *remembers well*.
+`mmu_recall_speed_test.py` measures speed, not quality.
+
+A LongMemEval run is the planned next substantial piece of work. Until it exists, treat
+every retrieval-quality claim here as the author's own observation on the author's own
+data — which is exactly the kind of claim a benchmark is for replacing.
+
+---
+
+## Known Limitations
+
+Honest, roughly in order of how much it matters. None of this is secret -- it's the same
+list carried in `phase_packages/phase_final_deploy_report.md` (§9), collected here so a
+reader doesn't have to go find it.
+
+- **Scale is proven to ~1,000 memories, one user, one machine.** Everything above has been
+  validated against a real instance that size and the from-scratch second-instance test
+  described in [Running a second instance](#running-a-second-instance). Nobody has thrown
+  10,000 memories or concurrent multi-user load at it, and it isn't built for that yet.
+- **Skill crystallization reaches real candidates now, but the confirm-and-write path is
+  still lightly exercised end to end.** Three bugs made it structurally unreachable until
+  Phase 13.1/13.2 fixed them (documents were excluded from candidates, edge weights were
+  normalized against the wrong population, and the model-crystallize flag wasn't reaching
+  the process that read it). Candidates surface correctly now. Confirming one and watching
+  it demote member memories into a Skill has been validated at the mechanism level, not
+  worn in by repeated real use yet.
+- **CON numbers no longer get reused, but only going forward.** They used to come from
+  `max(existing)+1`, which handed the same number back out if the highest-numbered memory
+  was deleted. They now come from a monotonic `:Counter` node that is never recomputed
+  from the population. An existing graph seeds that counter from its current maximum on
+  first run, so nothing gets renumbered — but any CON collision that already happened
+  before you upgraded stays as it is, since MMU has no way to know it occurred.
+- **A Session node isn't a conversation.** `/recall` mints a fresh session UUID per call,
+  not per conversation, so `/session_resume` reflects one call's memories, not a whole
+  chat's.
+- **Emotion/valence rating is mostly unused.** The schema is live and `/rate` works, but
+  most memories are never rated, so anything that leans on valence -- negative-memory
+  weighting, mood-aware retrieval -- is currently running on sparse data.
+- **Temporal pattern detection needs real elapsed time to say anything.** It's implemented
+  and was validated against a graph with months of real usage behind it. A fresh install
+  won't have anything interesting to report here for a while, and that's expected, not
+  broken.
+- **Single-user by design, no tenancy.** State is in-process with no concept of separate
+  users sharing one instance. That's a deliberate scope choice (see
+  [Privacy](#privacy) / [Security](#security)), not a missing feature.
+- **`mmupassword` is still in this repo's git history**, not rewritten out of it -- see the
+  note under [Changing your database password](#changing-your-database-password). Fork
+  with your own password if that history matters to you.
+- **No retrieval-quality benchmark.** See [Benchmarks](#benchmarks). Latency is measured;
+  recall quality is not.
+- **One author, no external review yet.** Every line here has been read by exactly one
+  person. That's the honest state of a project this age, and it's the thing that changes
+  fastest if you open an issue or a PR -- see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 

@@ -1,0 +1,34 @@
+name: Platform report (macOS / Linux)
+description: Tell us whether MMU ran cleanly on your OS — success reports welcome
+labels: ["platform"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        MMU is developed on Windows. macOS and Linux should work, but "should" is doing
+        real work in that sentence. A report either way is useful.
+
+  - type: dropdown
+    id: outcome
+    attributes:
+      label: Outcome
+      options:
+        - Worked with no changes
+        - Worked after some fiddling
+        - Did not work
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS and Docker
+      placeholder: "e.g. Fedora 40, Docker Engine 27.1 (not Desktop)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: friction
+    attributes:
+      label: Anything you had to change or work around
+      description: Paths, `python` vs `python3`, host.docker.internal, permissions, anything.

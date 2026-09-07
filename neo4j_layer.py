@@ -102,6 +102,9 @@ CONSTRAINTS = [
     # instead of stacking duplicates of a cluster that is simply still dense.
     "CREATE CONSTRAINT proposal_id   IF NOT EXISTS FOR (p:SkillProposal) REQUIRE p.proposal_id IS UNIQUE",
     "CREATE CONSTRAINT proposal_key  IF NOT EXISTS FOR (p:SkillProposal) REQUIRE p.member_key IS UNIQUE",
+    # Monotonic counters (currently just 'con'). One node per counter name;
+    # the constraint is what stops a race from creating two of the same one.
+    "CREATE CONSTRAINT counter_name  IF NOT EXISTS FOR (c:Counter) REQUIRE c.name IS UNIQUE",
 ]
 
 INDEXES = [
@@ -957,11 +960,23 @@ def graph_neighbors(address, limit=5):
 
 def get_next_con():
     """
-    The next free CON (address identity) number.
+    The next CON (address identity) number, from a counter that only ever
+    goes up.
 
-    max(existing) + 1, not count() + 1. The count is wrong the moment anything
-    is deleted: delete 5 of 100 and count()+1 hands back 96, which is already
-    taken, violating the memory_addr UNIQUE constraint or silently colliding.
+    This used to be max(existing) + 1, which is unique at write time but not
+    stable over time: delete the highest-numbered memory and the next write
+    hands that same number back out. Anything outside MMU that had recorded the
+    old CON -- a note, an export, an external index -- then silently points at a
+    different memory. So the number lives in a :Counter node instead and is
+    never recomputed from the population.
+
+    (count() + 1 is worse still and was the original bug here: delete 5 of 100
+    and it returns 96, which is already taken, so it collides against the
+    memory_addr UNIQUE constraint.)
+
+    An existing graph seeds the counter from max(existing) the first time
+    through, so upgrading doesn't renumber anything or collide with what's
+    already there.
 
     Returns 1 on an empty graph or if Neo4j is unavailable -- the caller is
     creating a memory either way, and a low CON is recoverable while a crash is
@@ -972,14 +987,47 @@ def get_next_con():
         return 1
     try:
         with driver.session() as s:
+            # Common path: the counter exists, so just claim the next value.
+            # The increment happens inside a write transaction, which holds a
+            # lock on the node, so concurrent callers serialize rather than
+            # both reading the same value.
+            rec = s.run("""
+                MATCH (c:Counter {name: 'con'})
+                SET c.value = c.value + 1
+                RETURN c.value AS con
+            """).single()
+            if rec and rec["con"] is not None:
+                return int(rec["con"])
+
+            # First run on this graph (new install or an upgrade from the old
+            # max()+1 scheme). Seed above the highest CON already in use.
             rec = s.run("""
                 MATCH (m:Memory)
                 RETURN max(toInteger(split(m.address, '.')[0])) AS max_con
             """).single()
-            return int((rec["max_con"] or 0)) + 1 if rec else 1
+            seed = int(rec["max_con"] or 0) if rec else 0
+
+            rec = s.run("""
+                MERGE (c:Counter {name: 'con'})
+                  ON CREATE SET c.value = $seed
+                SET c.value = c.value + 1
+                RETURN c.value AS con
+            """, seed=seed).single()
+            log.info(f"CON counter initialized at {seed}; first issued CON is {seed + 1}")
+            return int(rec["con"]) if rec else 1
     except Exception as e:
-        log.warning(f"get_next_con failed, falling back to count: {e}")
-        return get_memory_count() + 1
+        # Last resort. This can collide, but the caller is mid-write and a
+        # reused number beats losing the memory.
+        log.warning(f"get_next_con failed, falling back to max()+1: {e}")
+        try:
+            with driver.session() as s:
+                rec = s.run("""
+                    MATCH (m:Memory)
+                    RETURN max(toInteger(split(m.address, '.')[0])) AS max_con
+                """).single()
+                return int((rec["max_con"] or 0)) + 1 if rec else 1
+        except Exception:
+            return get_memory_count() + 1
 
 
 def delete_all_memories():

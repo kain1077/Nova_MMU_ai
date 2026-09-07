@@ -14,9 +14,14 @@ import sqlite3
 import json
 import os
 from collections import defaultdict
+from pathlib import Path
 
-DB_PATH    = os.environ.get("MMU_DB_PATH", "C:/mmu/data/memory_system.db")
-INDEX_PATH = os.environ.get("MMU_INDEX_PATH", "C:/mmu/data/memory_index.json")
+# Defaults are relative to the repo root, so this works the same on Windows,
+# macOS and Linux. The live data normally lives in a Docker volume -- point
+# MMU_DB_PATH / MMU_INDEX_PATH at wherever you copied it out to.
+REPO_ROOT  = Path(__file__).resolve().parent.parent
+DB_PATH    = os.environ.get("MMU_DB_PATH",    str(REPO_ROOT / "data" / "memory_system.db"))
+INDEX_PATH = os.environ.get("MMU_INDEX_PATH", str(REPO_ROOT / "data" / "memory_index.json"))
 MMU_BASE   = "http://127.0.0.1:8765"
 
 # ── Pull live data from the REST server ──────────────
