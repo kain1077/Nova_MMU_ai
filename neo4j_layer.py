@@ -591,45 +591,105 @@ def write_color_update(old_address, new_address, new_color):
     When aging changes an address (USE counter increments),
     update the Memory node's address and color in Neo4j.
     For Blue transitions: also marks the node as archived.
+
+    Returns THE ADDRESS THE NODE CARRIES AFTERWARDS, or None if nothing was
+    written at all. The caller must key its own index update off that return
+    value rather than off `new_address`.
+
+    This used to return nothing, and _age_memories() renamed the v2 index
+    unconditionally afterwards -- so any rewrite Neo4j declined still moved the
+    card. The address is not a free identifier: USE is encoded into it, so two
+    memories sharing a CON (duplicates from the old count()+1 numbering) can
+    CONVERGE on one address as their USE counters meet. m.address is UNIQUE, so
+    the second one's rename is rejected here while the index went ahead --
+    which is exactly how a memory ends up in the graph, counted by every query,
+    and absent from the read path.
+
+    The collision is now detected rather than raised: OPTIONAL MATCH looks for
+    an occupant and the address is only moved when there is none. The colour
+    change still lands either way, because the colour is not part of the
+    contested identity. A memory that loses the race simply keeps its old
+    address -- its USE counter fails to advance this pass, which costs nothing
+    and is visible in the log.
     """
     s = neo4j_session()
     if s is None:
-        return
+        return None
     try:
         with s:
             if old_address == new_address:
                 # Just color change
-                s.run("""
+                rec = s.run("""
                     MATCH (m:Memory {address: $addr})
                     SET m.color = $color
-                """, addr=old_address, color=new_color)
+                    RETURN m.address AS address
+                """, addr=old_address, color=new_color).single()
             else:
-                # Address changed — update and preserve edges via EVOLVES_FROM
-                s.run("""
+                # Address changed — move it only if the target is free.
+                # FOREACH over a one-or-zero element list is the conditional
+                # write: no occupant, one SET; occupant, none.
+                rec = s.run("""
                     MATCH (old:Memory {address: $old_addr})
-                    SET old.address = $new_addr,
-                        old.color   = $new_color
-                """, old_addr=old_address, new_addr=new_address, new_color=new_color)
+                    OPTIONAL MATCH (clash:Memory {address: $new_addr})
+                    SET old.color = $new_color
+                    FOREACH (_ IN CASE WHEN clash IS NULL THEN [1] ELSE [] END |
+                        SET old.address = $new_addr)
+                    RETURN old.address AS address
+                """, old_addr=old_address, new_addr=new_address,
+                     new_color=new_color).single()
+            if rec is None:
+                # No node at old_address. Nothing was written; the caller must
+                # not touch its index either.
+                log.warning("Neo4j color update found no node at %s", old_address)
+                return None
+            landed = rec["address"]
+            if landed != new_address:
+                log.warning(
+                    "Address %s could not move to %s -- that address is already "
+                    "taken. Colour applied, USE counter held back.",
+                    old_address, new_address
+                )
+            return landed
     except Exception as e:
         log.warning(f"Neo4j color update failed: {e}")
+        return None
 
 
 def write_addr_rename(old_address, new_address):
     """
     Phase 6.5: Rename a Memory node's address without changing color or any
     other property. Used when a valence update changes only the ~VAL segment.
+
+    Returns the address the node carries afterwards, or None if nothing was
+    written. Same contract, and same reason, as write_color_update(): the v2
+    index must only follow a move the graph actually made. ~VAL is a smaller
+    target than USE -- rating two memories the same way is not enough to
+    collide, they would also have to share a CON -- but the seam is identical
+    and there is no reason for it to behave differently.
     """
     s = neo4j_session()
     if s is None:
-        return
+        return None
     try:
         with s:
-            s.run("""
+            rec = s.run("""
                 MATCH (m:Memory {address: $old})
-                SET m.address = $new
-            """, old=old_address, new=new_address)
+                OPTIONAL MATCH (clash:Memory {address: $new})
+                FOREACH (_ IN CASE WHEN clash IS NULL THEN [1] ELSE [] END |
+                    SET m.address = $new)
+                RETURN m.address AS address
+            """, old=old_address, new=new_address).single()
+            if rec is None:
+                log.warning("Neo4j addr rename found no node at %s", old_address)
+                return None
+            landed = rec["address"]
+            if landed != new_address:
+                log.warning("Address %s could not move to %s -- already taken.",
+                            old_address, new_address)
+            return landed
     except Exception as e:
         log.warning(f"Neo4j addr rename failed: {e}")
+        return None
 
 
 def write_valence(address, val_type, val_intensity, emotion_label=None):
@@ -1100,10 +1160,15 @@ def get_index_source_rows():
     be repaired incrementally. A full rebuild also discards the shortcut cache
     and resets the generation counter, which is a heavy price for reinstating
     one card.
+
+    Returns None when the graph could not be read, and [] when it was read and
+    is empty. Both used to be [], so /index_repair called an empty graph a
+    503 -- which is exactly what a fresh second instance is, and therefore what
+    every drift test run against one saw before it had written anything.
     """
     driver = get_driver()
     if driver is None:
-        return []
+        return None
     try:
         with driver.session() as s:
             return [dict(r) for r in s.run("""
@@ -1117,7 +1182,7 @@ def get_index_source_rows():
             """)]
     except Exception as e:
         log.warning(f"get_index_source_rows failed: {e}")
-        return []
+        return None
 
 
 def get_memory_count():

@@ -428,9 +428,44 @@ class LightIndexV2:
         Aging renames addresses. Both tiers must follow or the index
         silently rots — this is the same class of bug as the
         CO_RECALLED / _age_memories mismatch.
+
+        Returns True when the card moved, False when the rename was refused.
+        A refusal leaves BOTH tiers exactly as they were: the caller's memory
+        keeps its old address and stays reachable.
+
+        Two refusals, and neither used to exist:
+
+        1. The target is already occupied. This is not hypothetical -- USE is
+           encoded into the address, so a memory whose USE counter is climbing
+           and one sharing its CON (duplicates survive from the old count()+1
+           numbering) can converge on the same string. The line this replaced
+           was `cache[new] = cache.pop(old)`, which resolves that collision by
+           destroying the occupant's card: two memories in, one card out. The
+           evicted memory is still in Neo4j and still counted by every graph
+           query, and is invisible to recall, because this index IS the read
+           path. That is the drift `/index_repair` kept reporting as one
+           MISSING address with no matching PHANTOM -- a removal with no add,
+           which ordinary drift cannot produce.
+
+        2. There is no card at old_addr. The keyword rewrite below used to run
+           regardless, which pointed live gate() terms at an address holding no
+           card -- findable, unrankable, unhydratable.
         """
-        if old_addr in self.shortcut_cache:
-            self.shortcut_cache[new_addr] = self.shortcut_cache.pop(old_addr)
+        if old_addr == new_addr:
+            return True
+        if old_addr not in self.shortcut_cache:
+            log.warning("rename refused: no card at %s (target %s left alone)",
+                        old_addr, new_addr)
+            return False
+        if new_addr in self.shortcut_cache:
+            log.warning(
+                "rename refused: %s is already occupied, so moving %s there "
+                "would drop a memory out of the read path. Both keep their "
+                "current addresses.", new_addr, old_addr
+            )
+            return False
+
+        self.shortcut_cache[new_addr] = self.shortcut_cache.pop(old_addr)
         for idx_dict in (self.keyword_index, self.word_parts_index):
             for token, addrs in idx_dict.items():
                 if old_addr in addrs:
@@ -445,6 +480,7 @@ class LightIndexV2:
                 if n[0] == old_addr:
                     n[0] = new_addr
         self.save()   # address renames must survive restart or index rots
+        return True
 
     # ─────────────────────────────────────────
     #  BACKFILL FROM NEO4J

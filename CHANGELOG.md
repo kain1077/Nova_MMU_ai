@@ -8,6 +8,49 @@ between minor versions, and will say so here when they do.
 
 ### Fixed
 
+- **Aging no longer drops a memory out of the read path when it rewrites an address.**
+  `use` is encoded into the address by `_gen_addr`, so incrementing it changes the
+  address, and the v2 index is keyed by address. Two memories that share a `con` —
+  duplicates left over from the old `count() + 1` numbering — converge on one address
+  as their `use` counters climb, because `use` clamps at `MMU_ARCHIVE_THRESH`. When
+  they collided, `LightIndexV2.rename()` resolved it with
+  `cache[new] = cache.pop(old)`, destroying the occupant's card, while Neo4j rejected
+  the identical rename against the `UNIQUE` constraint on `m.address` and
+  `write_color_update()` swallowed the exception. Two memories in, one card out — and
+  the evicted one stayed in the graph, counted by `/health` and by every Cypher query,
+  and invisible to recall, because the index *is* the read path.
+
+  Three changes, at the two seams that were wrong:
+
+  - `LightIndexV2.rename()` returns a bool and refuses two cases it used to perform:
+    a target that is already occupied, and a source address that has no card. The
+    second one used to move the gate's keyword pointers anyway, leaving live terms
+    aimed at an address holding no card.
+  - `write_color_update()` and `write_addr_rename()` return **the address the node
+    actually carries afterwards**, and detect the collision with an `OPTIONAL MATCH`
+    instead of leaving it to the constraint. The colour change still lands; only the
+    address is held back.
+  - `_age_memories()` and `rate_memory()` check the index before asking the graph to
+    move anything, and then follow *what landed* rather than what they asked for. A
+    held address costs one `use` increment — a decay counter, not a timestamp — and
+    says so in the log, once per contested pair rather than once per `/recall`.
+
+  Found by `POST /index_repair` on a 1,009-memory graph reporting
+  `missing_count: 1, phantom_count: 0`. That asymmetry is the signature: a removal
+  with no matching add is not ordinary drift. It is very likely the same mechanism
+  behind the node `index_repair`'s own docstring describes as having sat in that state
+  since August. Existing drift is not repaired by this change — run
+  `POST /index_repair?apply=true` once to reinstate anything already lost. Regression
+  tests cover the collision, the cardless-source case, the uncontested rename, and an
+  end-to-end `use` increment that asserts `index_total == neo4j_total` afterwards.
+
+- **`POST /index_repair` no longer calls an empty graph a 503.**
+  `get_index_source_rows()` returned `[]` both when Neo4j could not be read and when
+  it was read and held nothing, and `index_repair` treated the falsy result as a
+  failure. An empty graph is exactly what a fresh second instance is, so the drift
+  tests failed on the setup the README tells people to use. The two cases are now
+  distinct: `None` for unreadable, `[]` for empty.
+
 - **The live tests no longer default to the production port.** `MMU_TEST_BASE`
   defaulted to `http://127.0.0.1:8765`, so a bare `pytest tests/` on a machine running
   MMU normally silently exercised the user's own graph — writing memories and aging
@@ -15,16 +58,6 @@ between minor versions, and will say so here when they do.
   live tests at 8765 is refused before any request unless `MMU_TEST_ALLOW_PRODUCTION=1`
   is set. Found by walking into it: four memories went Green → Yellow before anyone
   noticed.
-
-### Known issue found while doing that
-
-- **Aging can rewrite a memory's address without the v2 index following.** `use` is
-  encoded into the address by `_gen_addr`, so incrementing it changes the address; the
-  index drops the old card and does not always add the new one. The memory stays in
-  Neo4j, counted by every graph query, and is invisible to recall. `POST
-  /index_repair?apply=true` reinstates it. This is very likely the mechanism behind the
-  node `index_repair`'s own docstring describes as having "sat in that state since
-  August". Not yet fixed at the source.
 
 ### Added
 

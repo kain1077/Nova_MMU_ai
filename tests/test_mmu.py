@@ -254,6 +254,122 @@ def test_use_is_clamped():
     assert use == 20, "clamped, or it overflows the 3-digit address field"
 
 
+# ═════════════════════════════════════════════════════════════
+#  PURE -- v2 index address rewrites
+# ═════════════════════════════════════════════════════════════
+#
+# The address is not a stable identifier: _gen_addr() encodes USE into it, so
+# aging rewrites it. The index is keyed by address and IS the read path, so
+# every rewrite is a two-store operation that can go wrong in the middle.
+# These are the tests for that seam.
+
+
+def _index(tmp_path):
+    from light_index_v2 import LightIndexV2
+    return LightIndexV2(path=str(tmp_path / "idx.json"))
+
+
+def _addr(con, use, pri=5, grp=101, st=1):
+    return _gen(con, pri, grp, use, 0, st, 0, 0)
+
+
+def test_two_memories_sharing_a_con_converge_on_one_address():
+    """
+    Why the collision below is inevitable rather than unlucky.
+
+    USE clamps at ARCHIVE_THRESH, so every un-recalled memory eventually parks
+    on the same USE value. Two memories that share a CON differ in nothing else
+    the address records -- and duplicate CONs exist: they are the residue of the
+    old count()+1 numbering, fixed at the source in get_next_con() but not
+    repairable after the fact.
+    """
+    a_use, b_use = 3, 17
+    for _ in range(50):
+        a_use = min(a_use + 1, 20)
+        b_use = min(b_use + 1, 20)
+    assert _addr(33, a_use) == _addr(33, b_use), \
+        "clamping makes duplicate-CON addresses converge, so rename must expect it"
+
+
+def test_rename_never_evicts_the_memory_already_there(tmp_path):
+    """
+    The root cause of v2 index drift, reduced to three lines.
+
+    rename() used to be `cache[new] = cache.pop(old)`. When `new` was occupied
+    that silently destroyed the occupant's card: two memories in, one card out.
+    Neo4j kept both nodes -- m.address is UNIQUE, so it rejected the same rename
+    and the exception was swallowed -- so the evicted memory stayed in the
+    graph, counted by /health and by every Cypher query, and invisible to
+    recall, because the index IS the read path.
+
+    That is the exact shape /index_repair reported on the live graph: one
+    MISSING address, PHANTOM empty. A removal with no matching add is not
+    ordinary drift; ordinary drift moves a card, it does not delete one.
+    """
+    ix = _index(tmp_path)
+    climbing = _addr(33, 19)     # the memory whose USE counter is advancing
+    parked   = _addr(33, 20)     # a duplicate-CON memory already sitting there
+    ix.add(climbing, ["alpha"])
+    ix.add(parked,   ["beta"])
+
+    moved = ix.rename(climbing, parked)
+
+    assert moved is False, "a rename onto an occupied address must be refused"
+    assert len(ix.shortcut_cache) == 2, "no memory may be dropped from the index"
+    assert climbing in ix.shortcut_cache, "the mover keeps its old address"
+    assert ix.shortcut_cache[parked]["keywords"] == ["beta"], \
+        "the occupant's card must be untouched, not overwritten"
+    assert climbing in ix.keyword_index["alpha"], \
+        "a refused rename must not move the gate's pointers either"
+
+
+def test_rename_refuses_when_the_source_card_is_gone(tmp_path):
+    """
+    The other half of the same line. The keyword rewrite used to run whether or
+    not a card was found, so renaming an unindexed address pointed live gate()
+    terms at an address holding no card -- findable, unrankable and
+    unhydratable, which reaches a caller as a recall quietly returning fewer
+    results than it claimed.
+    """
+    ix = _index(tmp_path)
+    present = _addr(41, 0)
+    ix.add(present, ["gamma"])
+    ghost = _addr(99, 0)
+
+    assert ix.rename(ghost, _addr(99, 1)) is False
+    assert list(ix.shortcut_cache) == [present]
+    for term, addrs in ix.keyword_index.items():
+        for a in addrs:
+            assert a in ix.shortcut_cache, \
+                f"{a} is reachable through the gate on '{term}' but has no card"
+
+
+def test_an_uncontested_rename_still_moves_everything(tmp_path):
+    """The guard must not cost the ordinary case: card, gate pointers and any
+    neighbour references all follow, or the index rots the other way."""
+    ix = _index(tmp_path)
+    old, new = _addr(41, 0), _addr(41, 1)
+    other = _addr(42, 0)
+    ix.add(old, ["gamma"])
+    ix.add(other, ["delta"])
+    ix.shortcut_cache[other]["neighbors"] = [[old, 0.9, "similar"]]
+
+    assert ix.rename(old, new) is True
+    assert new in ix.shortcut_cache and old not in ix.shortcut_cache
+    assert ix.shortcut_cache[new]["keywords"] == ["gamma"]
+    assert new in ix.keyword_index["gamma"] and old not in ix.keyword_index["gamma"]
+    assert ix.shortcut_cache[other]["neighbors"][0][0] == new, \
+        "neighbour references must follow, or expansion points at nothing"
+
+
+def test_rename_to_the_same_address_is_a_no_op(tmp_path):
+    ix = _index(tmp_path)
+    a = _addr(41, 0)
+    ix.add(a, ["gamma"])
+    assert ix.rename(a, a) is True
+    assert ix.shortcut_cache[a]["keywords"] == ["gamma"]
+
+
 def test_member_key_is_order_independent():
     """
     Proposal dedup hangs off this. If the key depended on member order, the
@@ -388,6 +504,110 @@ def test_index_and_graph_agree():
     assert st == 200
     assert d["missing_count"] == 0, f"invisible to recall: {d['missing']}"
     assert d["phantom_count"] == 0, f"indexed but gone: {d['phantom']}"
+
+
+@live
+def test_aging_a_use_increment_keeps_index_and_graph_in_step():
+    """
+    The regression for the drift itself, end to end.
+
+    Aging encodes USE into the address, so a memory NOT returned by a recall
+    gets a new address during that very recall. Both stores have to follow it
+    together. When they did not, the memory stayed in Neo4j -- counted by
+    /health and by every graph query -- and vanished from the read path.
+
+    Probe A exists only to be recalled; probe B exists only to be aged by that
+    recall without being returned. B is located afterwards through /memories
+    rather than by recalling it, because recalling B resets its USE counter to
+    zero and would erase the thing under test.
+
+    Everything this test writes carries RUN_TAG in its payload, and cleanup
+    finds it by that rather than by the addresses it was given -- aging has been
+    rewriting those the whole time, which is the entire point. Deleting stale
+    addresses is how a test leaves its own litter behind.
+    """
+    # RUN_TAG only ever appears in PAYLOADS, for cleanup. The keywords are
+    # deliberately unrelated words: the gate matches on 4-char stems, so
+    # keywords sharing a prefix would put every filler in the same gate hit as
+    # the probes, and top_k would decide by luck which of them came back.
+    RUN_TAG = "agingdriftprobe"
+    marker_a = "zephyralpha"       # stem "zeph"
+    marker_b = "quokkabravo"       # stem "quok"
+    filler_kw = "ballastfiller"    # stem "ball"
+
+    def _cleanup():
+        st, listing = _call("GET", "/memories")
+        if st != 200:
+            return
+        for m in listing["memories"]:
+            if RUN_TAG in (m.get("payload") or ""):
+                _call("DELETE",
+                      f"/memories/{urllib.parse.quote(m['address'], safe='')}")
+
+    try:
+        # Aging is floored at MMU_AGING_MIN_MEMORIES so a nearly empty graph
+        # does not archive itself. Clear the floor rather than skipping past it:
+        # a test that only runs on a graph that happens to be big enough is a
+        # test that does not run.
+        st, health = _call("GET", "/health")
+        assert st == 200
+        filler = 0
+        while health["total_memories"] + filler < 30:
+            st, _f = _call("POST", "/remember", {
+                "keywords": [f"{filler_kw}{filler}"],
+                "payload": f"{RUN_TAG} filler {filler}, here only to clear the "
+                           f"aging floor.",
+                "src_type": 1})
+            assert st == 200
+            filler += 1
+
+        st, _a = _call("POST", "/remember", {
+            "keywords": [marker_a], "payload": f"{RUN_TAG} probe A: {marker_a}.",
+            "src_type": 1})
+        assert st == 200
+        st, b = _call("POST", "/remember", {
+            "keywords": [marker_b], "payload": f"{RUN_TAG} probe B: {marker_b}.",
+            "src_type": 1})
+        assert st == 200
+        b_start = b["address"]
+
+        # Recalling A ages B: B is not in the result set, so its USE climbs.
+        for _ in range(3):
+            st, _d = _call("POST", "/recall", {"prompt": marker_a, "top_k": 3})
+            assert st == 200
+
+        st, listing = _call("GET", "/memories")
+        assert st == 200
+        found = [m for m in listing["memories"]
+                 if marker_b in (m.get("payload") or "")]
+        assert len(found) == 1, f"probe B is not in the graph exactly once: {found}"
+        b_now = found[0]["address"]
+
+        m = ADDR_RE.search(b_now)
+        assert m is not None, f"unparseable address after aging: {b_now}"
+        if int(m.group(4)) == 0:
+            pytest.skip("USE never advanced, so there was no address rewrite to "
+                        "test. Check MMU_AGING_MIN_MEMORIES on this instance.")
+        assert b_now != b_start, "a USE increment must rewrite the address"
+
+        # The whole point: the rewrite moved the card, it did not drop it.
+        st, d = _call("POST", "/index_repair")
+        assert st == 200
+        assert d["index_total"] == d["neo4j_total"], (
+            f"index and graph disagree after aging: "
+            f"missing={d['missing']} phantom={d['phantom']}")
+        assert d["missing_count"] == 0, f"invisible to recall: {d['missing']}"
+        assert d["phantom_count"] == 0, f"indexed but gone: {d['phantom']}"
+
+        # And the aged memory is still reachable through the read path at its
+        # new address. Agreeing totals alone would not prove that.
+        st, d = _call("POST", "/recall", {"prompt": marker_b, "top_k": 5})
+        assert st == 200
+        assert any(marker_b in (mem.get("payload") or "")
+                   for mem in d["memories"]), \
+            "an aged memory must still be recallable at its rewritten address"
+    finally:
+        _cleanup()
 
 
 @live

@@ -631,12 +631,40 @@ def _embedding_text(keywords, payload):
 class MMUCore:
     def __init__(self):
         self.v2_index = LightIndexV2(path=V2_INDEX_PATH)
+        # Address pairs whose aging rename has been refused because the target
+        # was already taken. Purely for log deduplication -- see _age_memories.
+        self._addr_collisions = set()
         card_count = len(self.v2_index.shortcut_cache)
         print(f"MMUCore ready | {card_count} memories in v2 index | Phase 3 (Neo4j + v2 only)")
 
     # ── Address helpers ───────────────────────
 
     def _gen_addr(self, con, pri, grp, use, arc, st=0, sc=0, sl=0, val=0):
+        """
+        The address. Note that USE and ~VAL are MUTABLE state living inside
+        what is otherwise an identifier, so aging and /rate both rewrite it.
+
+        That is a real design cost and it was weighed. Taking USE out would end
+        one whole class of bug -- addresses would stop changing, and the two
+        stores could not fall out of step over a rename that never happened.
+        It was not done, for two reasons:
+
+          - The address is not private. Models paste it back into /rate and
+            /flag_recall, Phase 10 uses it as a cluster seed, and it is in
+            exports and in whatever notes a user kept. Rewriting the schema
+            renumbers all of that at once, and CON reuse (fixed in
+            get_next_con()) is the standing reminder that an identifier handed
+            out and then reassigned cannot be repaired afterwards.
+          - It would fix one field, not the class. PRI, GRP, ARC, ~VAL and the
+            provenance fields are all in here too, and /rate already rewrites
+            ~VAL through the same path. A rename that refuses to overwrite an
+            occupant protects every one of them; deleting a field protects one.
+
+        So the seams are guarded instead -- see _age_memories() and
+        LightIndexV2.rename(). If this is ever revisited, _parse_addr(), the
+        aging state machine's read of p["use"], and every stored address are
+        what the change has to carry.
+        """
         # Phase 6.5: ~VAL segment (TTS: TT=type 00/01/02, S=intensity 0-9)
         return f"{con:03d}.{pri:03d}.{grp:03d}.{use:03d},{arc:03d}~{val:03d}|{st}.{sc:03d}.{sl:03d}"
 
@@ -1104,13 +1132,74 @@ class MMUCore:
                 p.get("val", 0)   # Phase 6.5: preserve valence across aging
             )
 
+            # An address rewrite is not a free rename. USE is encoded into
+            # the address, so a memory whose counter is climbing can arrive at
+            # a string another memory already holds -- guaranteed for any two
+            # memories sharing a CON, since USE clamps at ARCHIVE_THRESH and
+            # both converge there. Duplicate CONs exist: they are the residue
+            # of the old count()+1 numbering, fixed in get_next_con() but not
+            # retroactively repairable.
+            #
+            # This is what that used to do. Neo4j rejected the second rename
+            # against the UNIQUE constraint on m.address and swallowed the
+            # exception; the index went ahead anyway and resolved the collision
+            # with cache[new] = cache.pop(old), destroying the occupant's card.
+            # Two memories in, one card out -- and the evicted one is still in
+            # the graph, still counted by /health and every Cypher query, and
+            # invisible to recall, because the index IS the read path. It shows
+            # up in /index_repair as one MISSING with no matching PHANTOM: a
+            # removal with no add, which ordinary drift cannot produce.
+            #
+            # So: check the index first, since it is in memory and free to ask,
+            # and hold the address rather than move it into an occupied slot.
+            # Nothing is lost by holding. USE is a decay counter, not a
+            # timestamp; failing to advance it once delays this memory's next
+            # colour transition by a single recall.
+            if new_addr != addr and new_addr in self.v2_index.shortcut_cache:
+                # Warn once per contested pair, not once per recall: a held
+                # address stays held until the occupant ages off it, so an
+                # undeduped warning here would repeat on every /recall for the
+                # life of the collision and bury everything else in the log.
+                if (addr, new_addr) not in self._addr_collisions:
+                    self._addr_collisions.add((addr, new_addr))
+                    log.warning(
+                        "aging: %s cannot advance USE to %s -- that address is "
+                        "already held by another memory (duplicate CON). Colour "
+                        "still applied; address held.", addr, new_addr
+                    )
+                new_addr = addr
+
             if new_addr != addr or new_color != color:
-                n4j.write_color_update(addr, new_addr, new_color)
-                if new_addr != addr:
-                    self.v2_index.rename(addr, new_addr)
-                self.v2_index.set_color(new_addr, new_color)
+                # Neo4j is the record, so it moves first and the index follows
+                # WHAT LANDED -- never what was asked for. write_color_update
+                # returns the address the node actually carries afterwards, or
+                # None if it wrote nothing at all. Following the request rather
+                # than the result is the other half of this bug: an index that
+                # renames past a graph write that never happened drifts just as
+                # badly, only in the opposite direction.
+                landed = n4j.write_color_update(addr, new_addr, new_color)
+                if landed is None:
+                    # Graph unreachable or the node is gone. Leave the index
+                    # untouched: the two stores stay in step, and the next
+                    # recall retries this memory from where it is.
+                    continue
+                if landed != addr and not self.v2_index.rename(addr, landed):
+                    # The graph moved it and the index would not -- only
+                    # reachable if the two had already drifted apart. Say so
+                    # loudly; /index_repair reconciles it using the keyword
+                    # list, which this loop does not have. Carry on with the
+                    # address the GRAPH now holds: it is the record, and
+                    # handing callers the old one makes /rate and Phase 10's
+                    # cluster seeds miss silently, which is the defect the
+                    # address map exists to prevent.
+                    log.error(
+                        "aging: graph moved %s to %s but the index refused. "
+                        "Run POST /index_repair?apply=true.", addr, landed
+                    )
+                else:
+                    self.v2_index.set_color(landed, new_color)
                 if addr in addr_map:
-                    addr_map[addr] = new_addr
+                    addr_map[addr] = landed
 
         self.v2_index.save()
         # Phase 10: expose the rename mapping. Callers hold addresses captured
@@ -1172,10 +1261,34 @@ class MMUCore:
             val
         )
 
+        # Same seam as aging, same rule: the graph moves first and the index
+        # follows what landed. Rating rewrites the ~VAL segment, so it can
+        # collide for the same reason -- two memories sharing a CON, rated the
+        # same way -- and a rename that clobbers the occupant loses a memory
+        # out of the read path. Refusing costs the rating its address change,
+        # not the rating itself: valence is written as node properties below
+        # regardless, and those are what /rate is actually for.
         if new_addr != address:
-            n4j.write_addr_rename(address, new_addr)
-            self.v2_index.rename(address, new_addr)
-            self.v2_index.save()
+            if new_addr in self.v2_index.shortcut_cache:
+                log.warning("rate: %s cannot take address %s -- already held. "
+                            "Valence still recorded on the node.",
+                            address, new_addr)
+                new_addr = address
+            else:
+                # new_addr is only what we asked for. The node's address after
+                # the call is the only one write_valence() below can MATCH on,
+                # and the only one worth returning to the caller.
+                landed = n4j.write_addr_rename(address, new_addr)
+                new_addr = landed if landed else address
+                if new_addr != address:
+                    if self.v2_index.rename(address, new_addr):
+                        self.v2_index.save()
+                    else:
+                        log.error(
+                            "rate: graph moved %s to %s but the index refused. "
+                            "Run POST /index_repair?apply=true.",
+                            address, new_addr
+                        )
 
         # Phase 6.6: sanitize emotion_label (max 50 chars, strip whitespace)
         el = (emotion_label or "").strip()[:50] or None
@@ -1954,7 +2067,7 @@ def index_repair(apply: bool = False):
     heavy price for reinstating one card.
     """
     rows = n4j.get_index_source_rows()
-    if not rows:
+    if rows is None:
         raise HTTPException(503, "Could not read memories from Neo4j.")
 
     graph = {r["address"]: r for r in rows if r["address"]}
