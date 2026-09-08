@@ -1,0 +1,131 @@
+# This file belongs at .github/workflows/release.yml.
+#
+# It is parked here because the token used to push this branch lacks GitHub's
+# `workflow` scope, which is required to create or modify anything under
+# .github/workflows/. To activate it:
+#
+#     gh auth refresh -s workflow
+#     git mv packaging/release.yml .github/workflows/release.yml
+#     git commit -m "Activate the release workflow" && git push
+#
+# Or paste it into the GitHub web editor at .github/workflows/release.yml, which
+# needs no extra scope.
+
+name: Build release binaries
+
+# PyInstaller cannot cross-compile -- a Windows .exe has to be produced on
+# Windows and a macOS binary on macOS -- so the matrix is not an optimisation,
+# it is the only way to get all four artifacts.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      draft_release:
+        description: "Create a draft release from the built binaries"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt
+      # The live tests skip themselves when no server is listening, so this runs
+      # the pure tier only -- which is the tier that should gate a release.
+      - run: pytest tests/ -v
+
+  build:
+    name: ${{ matrix.label }}
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: windows-x64
+          - os: ubuntu-22.04     # oldest supported glibc; newer hosts still run it
+            label: linux-x64
+          - os: macos-13         # Intel
+            label: macos-x64
+          - os: macos-14         # Apple silicon
+            label: macos-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build dependencies
+        run: pip install -r packaging/requirements-build.txt
+
+      - name: Build binaries
+        run: python packaging/build.py
+
+      - name: Smoke-test the installer
+        shell: bash
+        env:
+          MMU_NO_PAUSE: "1"
+        run: |
+          set -e
+          binary=$(ls dist/mmu-setup-* | head -1)
+          "$binary" --version
+          # doctor exits non-zero when it finds problems, and on a runner with no
+          # Docker it certainly will. We only care that it ran and reported.
+          "$binary" doctor || true
+
+      - name: Smoke-test the MCP bridge
+        shell: bash
+        run: |
+          set -e
+          binary=$(ls dist/mmu-mcp-* | head -1)
+          # The bridge must answer tools/list without a server running; it is the
+          # handshake a chat client performs before any memory call.
+          request='{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+          echo "$request" | "$binary" > out.json 2>/dev/null || true
+          grep -q "recall_memory" out.json
+          echo "bridge advertises its tools"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mmu-${{ matrix.label }}
+          path: dist/mmu-*
+          if-no-files-found: error
+
+  release:
+    name: Draft release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.draft_release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: artifacts
+        # Unsigned binaries downloaded over the internet deserve a way to be
+        # verified. This is not a substitute for code signing; it is what we can
+        # offer without a certificate.
+        run: sha256sum mmu-* | tee SHA256SUMS.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: artifacts/*
+          generate_release_notes: true

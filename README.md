@@ -38,7 +38,8 @@ Everything runs locally. See [Privacy](#privacy).
   llama.cpp's server and vLLM also work.
 - ~2 GB free disk for the Neo4j container and your graph.
 - **Python 3.10+** -- only if you connect a model over MCP or run the maintenance
-  scripts. The server itself needs nothing but Docker.
+  scripts. The server itself needs nothing but Docker, and the packaged
+  `mmu-mcp` binary covers the MCP side without Python at all.
 
 MMU is **not** required to run an LLM itself. It stores and retrieves; your client
 supplies the model.
@@ -53,6 +54,53 @@ you hit something, please open an issue, since a report is the only way it gets 
 ---
 
 ## Install
+
+Two routes. The installer does the same work the manual steps do, and prints
+what it did at each stage; neither is more "real" than the other.
+
+### Option A — the installer
+
+Download the binary for your platform from the
+[latest release](https://github.com/kain1077/Nova_MMU_ai/releases/latest) and run
+it:
+
+```bash
+# macOS / Linux
+chmod +x ./mmu-setup-*
+./mmu-setup-*
+
+# Windows: double-click mmu-setup-windows-x64.exe
+```
+
+It checks Docker, generates `.env` with a random Neo4j password, finds your
+embeddings endpoint and **measures its dimension for you**, starts the
+containers, waits for the self-check to pass, and merges MMU into your chat
+client's MCP config without disturbing any other server you have configured.
+
+There is a second binary, `mmu-mcp`. Put it next to `mmu-setup` before running
+setup and the installer will wire your client to it — which means the MCP bridge
+no longer needs Python on your machine at all.
+
+The binaries are not code-signed, so Windows SmartScreen and macOS Gatekeeper
+will both object on first run. [`packaging/README.md`](packaging/README.md#signing)
+explains how to get past that, and why there is no certificate.
+
+Afterwards:
+
+```bash
+mmu-setup status     # is it up, and how many memories
+mmu-setup doctor     # check every prerequisite at once
+mmu-setup logs       # what the containers are saying
+mmu-setup stop       # stop; memories stay on the volumes
+```
+
+`doctor` is the one worth knowing. It checks Docker, the project files, `.env`,
+the embedding endpoint's *actual* dimension against the configured one, the
+server, and whether your chat clients are registered — and reports all of them,
+rather than stopping at the first failure. Paste its output into a bug report and
+most of the obvious questions are already answered.
+
+### Option B — from source
 
 ```bash
 git clone https://github.com/kain1077/Nova_MMU_ai.git mmu
@@ -107,8 +155,12 @@ If those last two numbers disagree, stop and fix it — see
 
 ## Connect a model
 
-The MCP bridge runs on your machine rather than inside the container, so install
-its dependencies first:
+The MCP bridge runs on your machine rather than inside the container.
+
+If you are using the packaged `mmu-mcp` binary, it has no dependencies and
+`mmu-setup connect` has already registered it — skip to
+[Giving the model web search](#giving-the-model-web-search). Otherwise install
+the bridge's dependencies:
 
 ```bash
 pip install -r requirements-host.txt

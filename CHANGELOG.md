@@ -4,6 +4,55 @@ Notable changes, newest first. Versions follow [semantic versioning](https://sem
 with the caveat that MMU is pre-1.0 — the HTTP API and the graph schema can still change
 between minor versions, and will say so here when they do.
 
+## [Unreleased]
+
+### Added
+
+- **Packaged installers.** Two single-file binaries per platform, built in
+  `packaging/`: `mmu-setup` (installer, launcher, doctor) and `mmu-mcp` (the MCP bridge,
+  frozen). Neither needs Python installed. Built for Windows, Linux, Intel Mac and Apple
+  silicon by the release workflow in `packaging/release.yml`; PyInstaller cannot
+  cross-compile, so that is four runners rather than one.
+
+  Docker is still a genuine prerequisite — Neo4j is a JVM database and does not fold into
+  an executable — so `mmu-setup` packages *everything around* MMU rather than MMU itself.
+  What it removes is the error-prone part of the install:
+
+  - **The embedding dimension is measured, not asked for.** The README's install asks you
+    to `curl` your endpoint and count the numbers in the response. That number is baked
+    into the Neo4j vector index at creation time, and getting it wrong produces a graph
+    that accepts saves and silently never embeds them. `mmu-setup` probes LM Studio,
+    Ollama, llama.cpp and vLLM, embeds a test string, counts the vector, and rewrites
+    `127.0.0.1` to `host.docker.internal` so the container can actually reach it.
+  - **The startup self-check is parsed, not printed.** A dimension mismatch fails the
+    install instead of sitting in a log waiting to be grepped.
+  - **MCP client config is merged, never replaced**, with a timestamped backup. The
+    README warns that most clients replace their config and tells you to paste every
+    server by hand; this adds one key and leaves the rest alone.
+  - `.env` is generated *inside* `.env.example`, so all 121 lines of explanation survive.
+    The generated Neo4j password is alphanumeric on purpose: docker compose expands
+    `${...}` using values from `.env`, so a `$` in the password reaches the container
+    mangled and presents as a wrong password against a correct-looking file.
+
+  `mmu-setup doctor` checks Docker, project files, `.env`, the endpoint's actual
+  dimension against the configured one, the server and every registered client — and
+  reports all of them rather than stopping at the first failure.
+
+### Fixed
+
+- **The MCP bridge works when frozen.** `mmu_mcp_server.py` located `.env` relative to
+  `__file__`, which under PyInstaller points into a temporary extraction directory that
+  is recreated at every launch — so a frozen bridge silently saw none of `.env`, exactly
+  the failure the loader was written to fix. It now looks beside its own executable and
+  then in the platform install directory. The staleness check had the same root cause and
+  now watches the executable, which restores the detection rather than merely silencing
+  it.
+
+- **Uninstalling one MMU no longer unregisters another.** MCP client config is global
+  while an install is not, so tearing down a second checkout removed the entry pointing at
+  the first. Removal is now gated on the entry actually launching the project being
+  removed; anything else is reported and left alone. Found by doing it.
+
 ## [0.1.2] — 2026-09-07
 
 Second pass on outside review. Four issues filed by @kumilange; two of them turned out to

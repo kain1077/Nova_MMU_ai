@@ -1,0 +1,10 @@
+# Build-time only. Needed to produce the binaries, never to run them.
+#
+#   pip install -r packaging/requirements-build.txt
+#   python packaging/build.py
+
+pyinstaller==6.22.2
+
+# Frozen into mmu-mcp alongside the bridge. Kept in step with
+# requirements-host.txt -- if the bridge's dependency there moves, this moves.
+requests==2.34.2
