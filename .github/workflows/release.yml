@@ -56,7 +56,13 @@ jobs:
             label: windows-x64
           - os: ubuntu-22.04     # oldest supported glibc; newer hosts still run it
             label: linux-x64
-          - os: macos-13         # Intel
+          # macos-13 was the obvious Intel label and was retired in December
+          # 2025; naming it does not fail, it queues forever waiting for a
+          # runner that no longer exists. macos-15-intel is the replacement, and
+          # is the last x86_64 macOS image GitHub will offer -- it goes away in
+          # August 2027, after which Intel Macs can only be served by building
+          # elsewhere, or by letting Rosetta 2 run this binary on Apple silicon.
+          - os: macos-15-intel   # Intel
             label: macos-x64
           - os: macos-14         # Apple silicon
             label: macos-arm64
