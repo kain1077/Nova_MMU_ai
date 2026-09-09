@@ -1,16 +1,3 @@
-# This file belongs at .github/workflows/release.yml.
-#
-# It is parked here because the token used to push this branch lacks GitHub's
-# `workflow` scope, which is required to create or modify anything under
-# .github/workflows/. To activate it:
-#
-#     gh auth refresh -s workflow
-#     git mv packaging/release.yml .github/workflows/release.yml
-#     git commit -m "Activate the release workflow" && git push
-#
-# Or paste it into the GitHub web editor at .github/workflows/release.yml, which
-# needs no extra scope.
-
 name: Build release binaries
 
 # PyInstaller cannot cross-compile -- a Windows .exe has to be produced on

@@ -58,8 +58,8 @@ python packaging/build.py --no-rename   # leave them as mmu-setup / mmu-mcp
 ```
 
 PyInstaller cannot cross-compile. A Windows `.exe` must be built on Windows and
-a macOS binary on macOS, which is why the release workflow fans out
-across four runners (Windows, Linux, Intel Mac, Apple silicon Mac) rather than
+a macOS binary on macOS, which is why `.github/workflows/release.yml`
+fans out across four runners (Windows, Linux, Intel Mac, Apple silicon Mac) rather than
 building everything in one job. `build.py` is what each runner calls, so a local
 build reproduces a release build exactly.
 
@@ -68,10 +68,6 @@ glibc is forward-compatible but not backward-compatible, so a binary built
 against a new glibc will not start on an older distribution.
 
 ---
-
-The workflow itself is parked at `packaging/release.yml` rather than
-`.github/workflows/release.yml`: the token that pushed this branch lacks
-GitHub's `workflow` scope. Its header says how to move it into place.
 
 ## Layout
 

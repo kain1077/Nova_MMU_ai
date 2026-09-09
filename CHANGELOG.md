@@ -11,7 +11,7 @@ between minor versions, and will say so here when they do.
 - **Packaged installers.** Two single-file binaries per platform, built in
   `packaging/`: `mmu-setup` (installer, launcher, doctor) and `mmu-mcp` (the MCP bridge,
   frozen). Neither needs Python installed. Built for Windows, Linux, Intel Mac and Apple
-  silicon by the release workflow in `packaging/release.yml`; PyInstaller cannot
+  silicon by `.github/workflows/release.yml`; PyInstaller cannot
   cross-compile, so that is four runners rather than one.
 
   Docker is still a genuine prerequisite — Neo4j is a JVM database and does not fold into
