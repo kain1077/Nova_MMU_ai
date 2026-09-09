@@ -7,6 +7,19 @@ on:
   push:
     tags:
       - "v*"
+  # Build and smoke-test on pull requests that touch what goes into a binary, so
+  # a broken installer is caught in review rather than during a release. Scoped
+  # by path deliberately: an ordinary PR should not spend four runners, and a
+  # workflow that is slow on every change is one people learn to ignore.
+  pull_request:
+    paths:
+      - "packaging/**"
+      - ".github/workflows/release.yml"
+      - "mmu_mcp_server.py"
+      - "Dockerfile"
+      - "docker-compose.yml"
+      - "requirements.txt"
+      - ".env.example"
   workflow_dispatch:
     inputs:
       draft_release:
