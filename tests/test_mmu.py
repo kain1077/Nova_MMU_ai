@@ -1277,3 +1277,124 @@ def test_unset_per_request_state_matches_the_old_defaults():
     assert core._last_read_path == "v2"
     assert core._last_read_ms == 0
     assert core._last_addr_map == {}
+
+
+# ─────────────────────────────────────────────────────────────
+#  AGING WRITE BATCHING (pure)
+#
+#  The aging pass runs on EVERY recall and walks every memory in the graph.
+#  Each address rewrite used to be its own Cypher query AND its own Bolt
+#  session, so one recall on a 500-memory graph could issue 500 sequential
+#  round trips before returning.
+# ─────────────────────────────────────────────────────────────
+
+class _FakeGraph:
+    """
+    Minimal stand-in for Neo4j that enforces the one rule this pass depends
+    on: m.address is UNIQUE, so a rewrite into an occupied address must not
+    move the node.
+    """
+
+    def __init__(self):
+        self.addr_to_color = {}
+        self.trips = 0
+        self.rows = 0
+
+    def write_color_updates_batch(self, updates):
+        self.trips += 1
+        self.rows += len(updates)
+        landed = {}
+        for old, new, color in updates:
+            if old not in self.addr_to_color:
+                continue                       # no such node: nothing written
+            if new != old and new in self.addr_to_color:
+                self.addr_to_color[old] = color    # target taken: colour only
+                landed[old] = old
+            else:
+                self.addr_to_color.pop(old)
+                self.addr_to_color[new] = color
+                landed[old] = new
+        return landed
+
+
+def _aging_fixture(monkeypatch, tmp_path, count=60):
+    mmu_server = pytest.importorskip("mmu_server")
+    monkeypatch.setattr(mmu_server, "AGING_MIN_MEMORIES", 5, raising=False)
+
+    fake = _FakeGraph()
+    monkeypatch.setattr(mmu_server.n4j, "write_color_updates_batch",
+                        fake.write_color_updates_batch)
+
+    from light_index_v2 import LightIndexV2
+    core = mmu_server.MMUCore.__new__(mmu_server.MMUCore)
+    core._req = __import__("threading").local()
+    core._addr_collisions = set()
+    core.v2_index = LightIndexV2(path=str(tmp_path / "idx.json"))
+
+    addrs = []
+    for i in range(count):
+        # The first six share CON 001, which is what a duplicate CON looks
+        # like -- their USE counters converge and the addresses collide.
+        con = 1 if i < 6 else i
+        a = f"{con:03d}.005.500.{i % 20:03d},001|0.000.000"
+        if a in addrs:
+            continue
+        addrs.append(a)
+        core.v2_index.add(a, [f"kw{i % 10}"], color="Green")
+        fake.addr_to_color[a] = "Green"
+    return core, fake, addrs
+
+
+def test_aging_uses_one_round_trip_per_pass(monkeypatch, tmp_path):
+    """One batched write per aging pass, however many memories change."""
+    core, fake, addrs = _aging_fixture(monkeypatch, tmp_path)
+
+    for expected_trips in (1, 2, 3):
+        core._age_memories(recalled=addrs[:2])
+        assert fake.trips == expected_trips, (
+            f"expected {expected_trips} round trip(s), got {fake.trips}")
+
+    # The point of the change: rows written greatly exceeds trips taken.
+    assert fake.rows > 50, "fixture too small to be meaningful"
+    assert fake.trips == 3
+
+
+def test_batched_aging_keeps_index_and_graph_in_step(monkeypatch, tmp_path):
+    """
+    Batching must not reintroduce drift.
+
+    Deferring the index writes until after the batch means the in-memory
+    collision check can no longer see a claim made moments earlier by another
+    memory in the same pass -- hence the `claimed` set. Without it two
+    memories converging on one address both believe they got it, and the index
+    ends up disagreeing with the graph about who owns what. Duplicate CONs in
+    the fixture guarantee real collisions here.
+    """
+    core, fake, addrs = _aging_fixture(monkeypatch, tmp_path)
+
+    for _ in range(4):
+        core._age_memories(recalled=addrs[:2])
+        indexed = set(core.v2_index.shortcut_cache)
+        graphed = set(fake.addr_to_color)
+        assert not (graphed - indexed), f"MISSING from index: {sorted(graphed - indexed)[:3]}"
+        assert not (indexed - graphed), f"PHANTOM in index: {sorted(indexed - graphed)[:3]}"
+
+    # Colours must agree too, not just the address sets.
+    for addr, meta in core.v2_index.shortcut_cache.items():
+        assert meta.get("color") == fake.addr_to_color[addr], f"colour drift at {addr}"
+
+
+def test_aging_survives_an_unreachable_graph(monkeypatch, tmp_path):
+    """
+    A batch that writes nothing must leave the index completely untouched, so
+    the two stores stay in step and the next recall retries from where it is.
+    """
+    core, fake, addrs = _aging_fixture(monkeypatch, tmp_path)
+    before = dict(core.v2_index.shortcut_cache)
+
+    monkeypatch.setattr(__import__("mmu_server").n4j,
+                        "write_color_updates_batch", lambda updates: {})
+    core._age_memories(recalled=addrs[:2])
+
+    assert set(core.v2_index.shortcut_cache) == set(before), (
+        "index moved despite the graph writing nothing")

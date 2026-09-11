@@ -590,7 +590,13 @@ def write_color_update(old_address, new_address, new_color):
     """
     When aging changes an address (USE counter increments),
     update the Memory node's address and color in Neo4j.
-    For Blue transitions: also marks the node as archived.
+
+    Colour is the only thing written. Blue IS the archived state -- there is no
+    separate `archived` property, and this docstring used to claim one.
+
+    Prefer write_color_updates_batch() for the aging pass, which is the only
+    caller that has more than one update in hand. This single-update form
+    remains for one-off changes.
 
     Returns THE ADDRESS THE NODE CARRIES AFTERWARDS, or None if nothing was
     written at all. The caller must key its own index update off that return
@@ -653,6 +659,79 @@ def write_color_update(old_address, new_address, new_color):
     except Exception as e:
         log.warning(f"Neo4j color update failed: {e}")
         return None
+
+
+def write_color_updates_batch(updates):
+    """
+    Apply many aging updates in ONE round trip.
+
+    `updates` is a list of (old_address, new_address, new_color). Returns
+    {old_address: landed_address} containing only the rows that actually
+    wrote -- an address missing from the result means no node was found, which
+    is the batch equivalent of write_color_update() returning None, and the
+    caller must leave its index alone for that memory.
+
+    WHY THIS EXISTS. The aging pass runs on EVERY recall and walks every
+    memory in the graph; each one whose USE counter advances needed an address
+    rewrite. Done one at a time, that was a separate Cypher query AND a
+    separate Bolt session per memory -- neo4j_session() opens a new one per
+    call -- so a single recall on a 500-memory graph could issue 500 sequential
+    round trips before returning. The counters clamp at ARCHIVE_THRESH so it
+    settles, but every newly added memory restarts its own climb, and a growing
+    graph therefore never fully quiesces.
+
+    The collision rule is unchanged and still enforced here, not just by the
+    caller's in-memory pre-check. UNWIND processes rows in order within one
+    transaction, and each row's OPTIONAL MATCH sees the writes of the rows
+    before it -- so a row moving INTO an address another row is vacating
+    behaves exactly as it did when these were sequential calls. A row that
+    loses the race keeps its old address, its colour still lands, and the
+    returned map says where it actually ended up.
+    """
+    if not updates:
+        return {}
+
+    s = neo4j_session()
+    if s is None:
+        return {}
+
+    rows = [{"old_addr": o, "new_addr": n, "new_color": c} for o, n, c in updates]
+    try:
+        with s:
+            # MATCH rather than OPTIONAL MATCH on `old`: a row whose node is
+            # gone should produce no result row, so the caller sees it as
+            # "nothing written" and leaves its index untouched.
+            #
+            # When old_addr == new_addr the OPTIONAL MATCH finds the node
+            # itself, so the address SET is skipped -- correct, since it is
+            # already the address being asked for -- and the colour still
+            # lands.
+            result = s.run("""
+                UNWIND $rows AS row
+                MATCH (old:Memory {address: row.old_addr})
+                OPTIONAL MATCH (clash:Memory {address: row.new_addr})
+                SET old.color = row.new_color
+                FOREACH (_ IN CASE WHEN clash IS NULL THEN [1] ELSE [] END |
+                    SET old.address = row.new_addr)
+                RETURN row.old_addr AS requested, old.address AS landed
+            """, rows=rows)
+            landed = {r["requested"]: r["landed"] for r in result}
+    except Exception as e:
+        log.warning(f"Neo4j batched colour update failed: {e}")
+        return {}
+
+    missing = len(rows) - len(landed)
+    if missing:
+        log.warning("Neo4j colour batch: %d of %d addresses matched no node",
+                    missing, len(rows))
+    held = [(o, n) for o, n, _c in updates
+            if o in landed and landed[o] != n]
+    if held:
+        log.warning(
+            "Neo4j colour batch: %d address(es) could not move -- target taken. "
+            "Colour applied, USE counter held back. First: %s -> %s",
+            len(held), held[0][0], held[0][1])
+    return landed
 
 
 def write_addr_rename(old_address, new_address):
