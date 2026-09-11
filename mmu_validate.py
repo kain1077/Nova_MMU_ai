@@ -296,8 +296,13 @@ def main():
 
     s = sub.add_parser("snapshot", help="capture one snapshot")
     s.add_argument("--label", required=True, help="name for this snapshot, e.g. 'before'")
+    # 8766 is this repo's second-instance convention, matching
+    # tests/test_mmu.py and mmu_recall_speed_test.py. Override with
+    # --base-url or MMU_VALIDATE_BASE; confirm which container is actually
+    # listening before you do, since container name and port are configurable
+    # and a disposable instance is only disposable if you picked the right one.
     s.add_argument("--base-url", default=os.environ.get("MMU_VALIDATE_BASE",
-                                                        "http://127.0.0.1:8181"))
+                                                        "http://127.0.0.1:8766"))
     s.add_argument("--top-k", type=int, default=10)
     s.add_argument("--repeat", type=int, default=2,
                    help="passes over the probe set (default: 2)")

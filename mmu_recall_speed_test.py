@@ -39,7 +39,7 @@ USAGE
   python mmu_recall_speed_test.py --prompts "who wrote this" "project deadline"
   python mmu_recall_speed_test.py --prompts-file probes.txt
   python mmu_recall_speed_test.py --skip-color-check
-  python mmu_recall_speed_test.py --base-url http://127.0.0.1:8181
+  python mmu_recall_speed_test.py --base-url http://127.0.0.1:8766
 """
 
 from __future__ import annotations
