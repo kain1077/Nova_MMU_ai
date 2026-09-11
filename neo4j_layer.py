@@ -347,7 +347,7 @@ def write_memory(address, keywords_str, payload, color,
         log.debug(f"Neo4j write OK: {address}")
 
     except Exception as e:
-        log.warning(f"Neo4j write failed (SQLite unaffected): {e}")
+        log.warning(f"Neo4j write failed (index unaffected): {e}")
 
 
 def write_recall_edges(recalled_addresses, session_id):
@@ -356,7 +356,7 @@ def write_recall_edges(recalled_addresses, session_id):
       - RECALLED_IN edges from each Memory to the Session node
       - CO_RECALLED edges between every pair of non-pinned co-recalled memories
         (bidirectional MERGE, weight increments each time)
-    Called by recall() after SQLite aging pass.
+    Called by recall() after the aging pass.
     """
     if not recalled_addresses:
         return
@@ -443,7 +443,7 @@ def write_recall_edges(recalled_addresses, session_id):
                  f"{pairs_written} CO_RECALLED edges written")
 
     except Exception as e:
-        log.warning(f"Neo4j recall edges failed (SQLite unaffected): {e}")
+        log.warning(f"Neo4j recall edges failed (recall unaffected): {e}")
 
 
 # ─────────────────────────────────────────────

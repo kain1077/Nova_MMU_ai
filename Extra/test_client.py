@@ -15,11 +15,33 @@ Tests:
     6. Delete test memories
 """
 
+import os
+import sys
+import urllib.parse
+
 import requests
 import json
 import time
 
-BASE = "http://127.0.0.1:8765"
+# Defaults to the second-instance port, NOT 8765. This script pins memories,
+# saves memories, and fires a deliberate burst of unrelated recalls to
+# demonstrate aging -- so pointed at a real graph it injects test data AND
+# ages memories the burst did not touch. It used to hardcode 8765 with no way
+# to override it. Same reasoning as tests/test_mmu.py and
+# mmu_recall_speed_test.py; all three now agree.
+BASE = os.environ.get("MMU_BASE", "http://127.0.0.1:8766").rstrip("/")
+
+PRODUCTION_PORT = 8765
+if urllib.parse.urlparse(BASE).port == PRODUCTION_PORT and \
+        os.environ.get("MMU_TEST_ALLOW_PRODUCTION", "").strip() in ("", "0", "false", "False"):
+    sys.exit(
+        f"\nRefusing to run against {BASE}.\n\n"
+        f"Port {PRODUCTION_PORT} is the default MMU port, so it is usually where a\n"
+        f"real graph lives. This script writes memories and ages the ones it does\n"
+        f"not recall.\n\n"
+        f"Set MMU_BASE to a disposable instance, or MMU_TEST_ALLOW_PRODUCTION=1 if\n"
+        f"this really is throwaway.\n"
+    )
 
 def sep(label):
     print(f"\n{'─'*55}")
@@ -164,4 +186,4 @@ data = r.json()
 print(f"  Total memories: {data['total_memories']}")
 print(f"  Color summary:  {data['color_summary']}")
 print(f"\n  ✅ All tests complete — MMU server is working!")
-print(f"  📋 Point LM Studio tools at http://127.0.0.1:8765")
+print(f"  📋 Point LM Studio tools at your MMU instance (this run used {BASE})")

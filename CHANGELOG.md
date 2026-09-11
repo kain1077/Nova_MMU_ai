@@ -4,6 +4,101 @@ Notable changes, newest first. Versions follow [semantic versioning](https://sem
 with the caveat that MMU is pre-1.0 — the HTTP API and the graph schema can still change
 between minor versions, and will say so here when they do.
 
+## [Unreleased]
+
+An audit pass: two concurrency bugs with real data loss behind them, one
+write-amplification fix on the hottest path, and the removal of code that
+could not run.
+
+### Fixed
+
+- **Concurrent requests could corrupt the v2 index, and did.** Every MMU
+  endpoint is a sync `def`, so Starlette runs it in a worker threadpool and two
+  requests genuinely overlap — and the idle daemon polls every 30 seconds
+  against the same server a conversation is using. There was not one lock in
+  the codebase. `json.dump()` walking a live index dict raised "dictionary
+  changed size during iteration", and `save()` built its temp path as a fixed
+  `self.path + ".tmp"`, so two savers wrote into one file and both renamed the
+  result. A stress run of four writers and four readers put **172 cards on disk
+  out of 909 added**. The index is the read path, so a lost card is a memory
+  that no longer exists as far as recall is concerned. `LightIndexV2` now takes
+  a reentrant lock, readers included — a torn read of a half-applied rename is
+  the same silent disappearance — and saves to a pid- and thread-unique temp
+  file.
+
+- **Per-request state leaked between concurrent recalls.** The session id, the
+  aging pass's rename map, and the read path and timing were plain attributes
+  on the one shared `MMUCore`. Each is written during a request and read later
+  in that same request, so an overlapping recall overwrote them in between: in
+  a six-thread test, four threads read a fifth's session id. The damaging case
+  is the rename map, because `/recall` rewrites its result addresses through it
+  and those addresses go straight back to `/rate` and seed anticipation — both
+  miss silently when the address is wrong. Now `threading.local`, behind
+  properties that keep every call site unchanged.
+
+- **A `docker run` without compose wrote a v1-named index.** The Dockerfile set
+  `MMU_INDEX_PATH=/data/memory_index.json`; only compose's override made it the
+  v2 path. It also set `MMU_ARCHIVE_THRESH=10`, contradicting both compose and
+  `.env.example` at 20.
+
+### Changed
+
+- **The aging pass writes once per recall, not once per memory.** It runs on
+  every `/recall` and walks the whole graph; each address rewrite was its own
+  Cypher query and, since `neo4j_session()` opens a session per call, its own
+  Bolt session — so a recall on a 500-memory graph could issue 500 sequential
+  round trips before returning. `write_color_updates_batch()` applies the pass
+  in one `UNWIND`. Three aging passes over a 60-memory fixture went from **104
+  round trips to 3**. The collision rule is unchanged and still enforced in the
+  database rather than only by the caller's in-memory pre-check.
+
+- **Every tool that writes to a graph now refuses the port a real one lives
+  on.** `tests/test_mmu.py` got this guard in 0.1.2, after a bare `pytest` aged
+  four of someone's real memories. The other two tools that write were never
+  given it: `mmu_recall_speed_test.py` defaulted to 8765, and
+  `Extra/test_client.py` **hardcoded** 8765 with no override at all while
+  pinning memories, saving memories, and firing a deliberate burst of unrelated
+  recalls to demonstrate aging. Both now default to 8766 and refuse 8765
+  without an explicit opt-in.
+
+### Added
+
+- **`mmu_validate.py`** — captures a JSON snapshot of a running instance
+  (health, index-vs-graph agreement, embedding coverage, recall latency) and
+  diffs two of them, so "I optimized it and nothing broke" is a measurement
+  rather than a claim. Calls `/index_repair` in dry-run only: a tool that
+  repairs while it observes cannot be trusted to report what it found. Refuses
+  8765 and also 7474, which is not an MMU endpoint at all — it is the Neo4j
+  browser, and it grants full database access.
+
+- **Six regression tests** covering index corruption under concurrency,
+  per-request state isolation, aging round-trip count, index/graph agreement
+  across aging passes with duplicate CONs forcing real collisions, and an
+  unreachable graph leaving the index untouched. All fail against the previous
+  commit.
+
+### Removed
+
+- **`neo4j_backfill.py`** and **`Extra/graph_viz.py`** — 445 lines that both
+  `import sqlite3` and read `memory_system.db`, a store removed in Phase 3.
+  Neither could run. Same reasoning that removed `Extra/light_index_v2.py` in
+  0.1.2.
+
+- **Four dead Dockerfile `ENV` lines.** `NEO4J_READS` and `MMU_USE_V2_INDEX`
+  are read by no code in the repository; `MMU_DB_PATH` pointed at the removed
+  SQLite file; `MMU_V2_INDEX_PATH` is a host-side migration script's variable,
+  not one the server reads.
+
+### Known, not changed
+
+- **`/recall` mints a fresh session id per call**, so every recall MERGEs a new
+  `:Session` node that nothing ever reaps, and `RECALLED_IN` cannot group a
+  conversation. The MCP bridge already mints a stable per-conversation id and
+  the server's middleware already captures it; `mmu_recall()` is also the one
+  bridge call that does not send it. Left alone deliberately for now — the
+  bridge describes `RECALLED_IN` as per-query bookkeeping, so changing it is a
+  design decision rather than a bug fix.
+
 ## [0.1.2] — 2026-09-07
 
 Second pass on outside review. Four issues filed by @kumilange; two of them turned out to
