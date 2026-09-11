@@ -39,7 +39,7 @@ USAGE
   python mmu_recall_speed_test.py --prompts "who wrote this" "project deadline"
   python mmu_recall_speed_test.py --prompts-file probes.txt
   python mmu_recall_speed_test.py --skip-color-check
-  python mmu_recall_speed_test.py --base-url http://127.0.0.1:8765
+  python mmu_recall_speed_test.py --base-url http://127.0.0.1:8181
 """
 
 from __future__ import annotations
@@ -52,6 +52,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -59,6 +60,26 @@ from pathlib import Path
 # Matches MMU_ARCHIVE_THRESH's default. The real value could differ if you've
 # overridden it -- this is a heuristic guard, not an authoritative check.
 ARCHIVE_THRESH = 20
+
+# The port a normal MMU install listens on, and therefore the one this script
+# must not aim at without being told to. This tool fires /recall, and every
+# /recall ages every memory it does not return -- the same reasoning that moved
+# tests/test_mmu.py off this port as a default. The two now agree.
+PRODUCTION_PORT = "8765"
+
+
+def guard_production(base_url, allowed):
+    """Refuse a real graph's port unless explicitly permitted."""
+    if urllib.parse.urlparse(base_url).port != int(PRODUCTION_PORT) or allowed:
+        return
+    sys.exit(
+        f"\nRefusing to benchmark {base_url}.\n\n"
+        f"Port {PRODUCTION_PORT} is the default MMU port, so it is usually where a\n"
+        f"real graph lives. This script fires /recall, and every /recall ages every\n"
+        f"memory it does not return.\n\n"
+        f"Point --base-url at a disposable instance, or pass --allow-production if\n"
+        f"this really is throwaway.\n"
+    )
 
 DEFAULT_PROMPTS = [
     "what am I working on",
@@ -279,8 +300,11 @@ def main():
         description="Measure MMU /recall latency (read_ms and round-trip).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--base-url", default=os.environ.get("MMU_BASE", "http://127.0.0.1:8765"),
-                   help="MMU server base URL (default: $MMU_BASE or http://127.0.0.1:8765)")
+    p.add_argument("--base-url", default=os.environ.get("MMU_BASE", "http://127.0.0.1:8766"),
+                   help="MMU server base URL (default: $MMU_BASE or http://127.0.0.1:8766, "
+                        "the second-instance convention)")
+    p.add_argument("--allow-production", action="store_true",
+                   help=f"Permit running against port {PRODUCTION_PORT}, where a real graph lives")
     p.add_argument("--top-k", type=int, default=10)
     p.add_argument("--repeat", type=int, default=1,
                    help="Passes over the probe set (default: 1)")
@@ -316,6 +340,7 @@ def main():
         prompts = DEFAULT_PROMPTS
 
     base_url = args.base_url.rstrip("/")
+    guard_production(base_url, args.allow_production)
 
     print(cyan("=== MMU recall speed test ==="))
     print(f"Base URL: {base_url} | top_k={args.top_k} | "
