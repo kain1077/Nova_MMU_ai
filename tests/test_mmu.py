@@ -1140,3 +1140,140 @@ def test_ingest_path_confinement():
     st, d = _call("POST", "/ingest",
                   {"source_path": "../../etc/passwd", "source_type": "text"})
     assert st == 400 and "/docs" in d["detail"]
+
+
+# ─────────────────────────────────────────────────────────────
+#  CONCURRENCY (pure)
+#
+#  Every MMU endpoint is a sync `def`, so Starlette runs it in a worker
+#  thread and two requests genuinely overlap. There is also always a second
+#  caller -- the idle daemon polls every 30 seconds against the same server a
+#  conversation is using.
+#
+#  Both tests below fail on the unsynchronized versions of this code. The
+#  index one lost 737 of 909 cards; the state one had four threads read a
+#  fifth thread's session id.
+# ─────────────────────────────────────────────────────────────
+
+def test_index_survives_concurrent_writers_and_readers(tmp_path):
+    """
+    Readers and writers hitting LightIndexV2 at once must not corrupt it.
+
+    Unsynchronized, this raised "dictionary changed size during iteration"
+    from json.dump walking a live dict, and FileNotFoundError from two savers
+    sharing one fixed ".tmp" filename -- one renamed it out from under the
+    other. Writes were silently lost: the on-disk index ended up with a
+    fraction of the cards that had been added.
+    """
+    import json as _json
+    import threading as _threading
+    from light_index_v2 import LightIndexV2
+
+    idx = LightIndexV2(path=str(tmp_path / "idx.json"))
+    for i in range(100):
+        idx.add(f"001.{i % 900:03d}.500.001,001|1.000.000",
+                [f"kw{i % 20}", f"w{i}"], color="Green")
+
+    errors = []
+
+    def writer(n):
+        try:
+            for i in range(60):
+                idx.add(f"9{n:02d}.{i % 900:03d}.500.001,001|1.000.000",
+                        [f"kw{i % 20}", f"t{n}"], color="Green")
+                idx.save()
+        except Exception as e:      # noqa: BLE001 -- the assertion reports it
+            errors.append(f"writer: {e!r}")
+
+    def reader():
+        try:
+            for i in range(120):
+                idx.gate(f"kw{i % 20}")
+                idx.stats()
+        except Exception as e:      # noqa: BLE001
+            errors.append(f"reader: {e!r}")
+
+    threads = ([_threading.Thread(target=writer, args=(n,)) for n in range(4)] +
+               [_threading.Thread(target=reader) for _ in range(4)])
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"concurrent access raised: {errors[:3]}"
+
+    # Every write must have survived, and the file must still be readable.
+    expected = 100 + 4 * 60
+    blob = _json.loads((tmp_path / "idx.json").read_text())
+    assert len(blob["shortcut_cache"]) == expected, (
+        f"expected {expected} cards on disk, found "
+        f"{len(blob['shortcut_cache'])} -- writes were lost")
+
+    # A save that fails midway must not leave a temp file behind to be
+    # mistaken for an index.
+    assert not [f for f in os.listdir(tmp_path) if ".tmp" in f]
+
+
+def test_per_request_state_does_not_leak_between_threads():
+    """
+    The session id, rename map, read path and timing belong to one in-flight
+    recall, not to the shared MMUCore singleton.
+
+    Held as plain attributes they leaked across concurrent requests: a
+    response could report another request's read_path, and -- the damaging
+    case -- /recall could rewrite its result addresses through an addr_map
+    built by a different query. Those addresses go straight back to /rate and
+    seed anticipation, and both miss silently when the address is wrong.
+    """
+    import threading as _threading
+
+    mmu_server = pytest.importorskip("mmu_server")
+
+    core = mmu_server.MMUCore.__new__(mmu_server.MMUCore)
+    core._req = _threading.local()
+
+    leaks = []
+    barrier = _threading.Barrier(6)
+
+    def worker(n):
+        core._current_session_id = f"session-{n}"
+        core._last_read_path = f"path-{n}"
+        core._last_addr_map = {f"a{n}": f"b{n}"}
+        barrier.wait()          # maximize interleaving
+        for _ in range(500):
+            if core._current_session_id != f"session-{n}":
+                leaks.append(("session_id", n, core._current_session_id))
+                return
+            if core._last_read_path != f"path-{n}":
+                leaks.append(("read_path", n, core._last_read_path))
+                return
+            if core._last_addr_map != {f"a{n}": f"b{n}"}:
+                leaks.append(("addr_map", n, core._last_addr_map))
+                return
+
+    threads = [_threading.Thread(target=worker, args=(n,)) for n in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not leaks, f"per-request state leaked across threads: {leaks[:3]}"
+
+
+def test_unset_per_request_state_matches_the_old_defaults():
+    """
+    Call sites used getattr(mmu, "_last_read_path", "v2") and friends. The
+    properties must return those same defaults, or a thread that reads before
+    writing changes behaviour rather than preserving it.
+    """
+    import threading as _threading
+
+    mmu_server = pytest.importorskip("mmu_server")
+
+    core = mmu_server.MMUCore.__new__(mmu_server.MMUCore)
+    core._req = _threading.local()
+
+    assert core._current_session_id == "default"
+    assert core._last_read_path == "v2"
+    assert core._last_read_ms == 0
+    assert core._last_addr_map == {}
