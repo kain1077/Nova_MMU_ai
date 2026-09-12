@@ -132,18 +132,6 @@ hottest path, and the removal of code that could not run.
   right up to the point its output was needed. Authored and tested on Linux,
   where the default encoding hid it. Output is ASCII now.
 
-- **`/health` reported an empty graph as zero memories.** `get_neo4j_stats()`
-  chained three `MATCH` clauses through `WITH`, and such a chain yields no rows
-  at all if any link matches nothing — the `CO_RECALLED` link matches nothing
-  until the first recall creates an edge. A graph holding 60 memories and 110
-  keywords reported `{"memories": 0, "keywords": 0, "status": "connected"}`.
-  Wrong on precisely the graphs whose state is hardest to confirm another way:
-  a fresh instance, or one restored from a dump before any recall. It also
-  silently defeated `mmu_validate.py`, which reads graph size from `/health`,
-  so its integrity check would have compared 0 to 0 and passed while saying
-  nothing. Three independent `COUNT {}` subqueries now, so an empty pattern
-  contributes 0 instead of erasing the other two.
-
 - **Five of the six new regression tests never ran anywhere.**
   `pytest.importorskip("mmu_server")` skipped silently when `fastapi` was
   absent from the host — which is normal, since it is a container dependency.
