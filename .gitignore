@@ -63,3 +63,10 @@ desktop.ini
 # Benchmark output: checkpoints, per-run JSON and reports. The harness is
 # tracked; what it produces on someone's machine is not.
 bench/results/
+
+# ── Packaging output ─────────────────────────────────
+# PyInstaller's working directory and the binaries it produces. Released
+# artifacts come from CI, not from anyone's laptop.
+dist/
+build/
+*.spec.bak

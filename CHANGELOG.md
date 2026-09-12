@@ -6,11 +6,96 @@ between minor versions, and will say so here when they do.
 
 ## [Unreleased]
 
-An audit pass: two concurrency bugs with real data loss behind them, one
-write-amplification fix on the hottest path, and the removal of code that
-could not run.
+Packaged installers for every platform, and an audit pass: two concurrency
+bugs with real data loss behind them, one write-amplification fix on the
+hottest path, and the removal of code that could not run.
+
+### Added
+
+- **Packaged installers.** Two single-file binaries per platform, built in
+  `packaging/`: `mmu-setup` (installer, launcher, doctor) and `mmu-mcp` (the MCP bridge,
+  frozen). Neither needs Python installed. Built for Windows, Linux, Intel Mac and Apple
+  silicon by `.github/workflows/release.yml`; PyInstaller cannot
+  cross-compile, so that is four runners rather than one.
+
+  Docker is still a genuine prerequisite — Neo4j is a JVM database and does not fold into
+  an executable — so `mmu-setup` packages *everything around* MMU rather than MMU itself.
+  What it removes is the error-prone part of the install:
+
+  - **The embedding dimension is measured, not asked for.** The README's install asks you
+    to `curl` your endpoint and count the numbers in the response. That number is baked
+    into the Neo4j vector index at creation time, and getting it wrong produces a graph
+    that accepts saves and silently never embeds them. `mmu-setup` probes LM Studio,
+    Ollama, llama.cpp and vLLM, embeds a test string, counts the vector, and rewrites
+    `127.0.0.1` to `host.docker.internal` so the container can actually reach it.
+  - **The startup self-check is parsed, not printed.** A dimension mismatch fails the
+    install instead of sitting in a log waiting to be grepped.
+  - **MCP client config is merged, never replaced**, with a timestamped backup. The
+    README warns that most clients replace their config and tells you to paste every
+    server by hand; this adds one key and leaves the rest alone.
+  - `.env` is generated *inside* `.env.example`, so all 121 lines of explanation survive.
+    The generated Neo4j password is alphanumeric on purpose: docker compose expands
+    `${...}` using values from `.env`, so a `$` in the password reaches the container
+    mangled and presents as a wrong password against a correct-looking file.
+
+  `mmu-setup doctor` checks Docker, project files, `.env`, the endpoint's actual
+  dimension against the configured one, the server and every registered client — and
+  reports all of them rather than stopping at the first failure.
+
+- **`mmu_validate.py`** — captures a JSON snapshot of a running instance
+  (health, index-vs-graph agreement, embedding coverage, recall latency) and
+  diffs two of them, so "I optimized it and nothing broke" is a measurement
+  rather than a claim. Calls `/index_repair` in dry-run only: a tool that
+  repairs while it observes cannot be trusted to report what it found. Refuses
+  8765 and also 7474, which is not an MMU endpoint at all — it is the Neo4j
+  browser, and it grants full database access.
+
+- **Six regression tests** covering index corruption under concurrency,
+  per-request state isolation, aging round-trip count, index/graph agreement
+  across aging passes with duplicate CONs forcing real collisions, and an
+  unreachable graph leaving the index untouched. All fail against the previous
+  commit.
+
+### Changed
+
+- **The aging pass writes once per recall, not once per memory.** It runs on
+  every `/recall` and walks the whole graph; each address rewrite was its own
+  Cypher query and, since `neo4j_session()` opens a session per call, its own
+  Bolt session — so a recall on a 500-memory graph could issue 500 sequential
+  round trips before returning. `write_color_updates_batch()` applies the pass
+  in one `UNWIND`. Three aging passes over a 60-memory fixture went from **104
+  round trips to 3**. The collision rule is unchanged and still enforced in the
+  database rather than only by the caller's in-memory pre-check.
+
+  Measured against a live instance over real Bolt: ~60 address rewrites per
+  recall collapse to one query, and median `/recall` goes from **404 ms to
+  326 ms, −20%** on a 60-memory graph (40 measured calls after 10 warm-up,
+  replicated on both builds). `read_ms` is unchanged, as it should be — the
+  index read path is untouched and the whole saving is in the write phase.
+
+- **Every tool that writes to a graph now refuses the port a real one lives
+  on.** `tests/test_mmu.py` got this guard in 0.1.2, after a bare `pytest` aged
+  four of someone's real memories. The other two tools that write were never
+  given it: `mmu_recall_speed_test.py` defaulted to 8765, and
+  `Extra/test_client.py` **hardcoded** 8765 with no override at all while
+  pinning memories, saving memories, and firing a deliberate burst of unrelated
+  recalls to demonstrate aging. Both now default to 8766 and refuse 8765
+  without an explicit opt-in.
 
 ### Fixed
+
+- **The MCP bridge works when frozen.** `mmu_mcp_server.py` located `.env` relative to
+  `__file__`, which under PyInstaller points into a temporary extraction directory that
+  is recreated at every launch — so a frozen bridge silently saw none of `.env`, exactly
+  the failure the loader was written to fix. It now looks beside its own executable and
+  then in the platform install directory. The staleness check had the same root cause and
+  now watches the executable, which restores the detection rather than merely silencing
+  it.
+
+- **Uninstalling one MMU no longer unregisters another.** MCP client config is global
+  while an install is not, so tearing down a second checkout removed the entry pointing at
+  the first. Removal is now gated on the entry actually launching the project being
+  removed; anything else is reported and left alone. Found by doing it.
 
 - **Concurrent requests could corrupt the v2 index, and did.** Every MMU
   endpoint is a sync `def`, so Starlette runs it in a worker threadpool and two
@@ -41,41 +126,33 @@ could not run.
   v2 path. It also set `MMU_ARCHIVE_THRESH=10`, contradicting both compose and
   `.env.example` at 20.
 
-### Changed
+- **`mmu_validate.py compare` crashed on every Windows console.** It printed
+  U+2192 into cp1252 and died with `UnicodeEncodeError` before emitting a
+  single number. `snapshot` never reaches that line, so the tool looked healthy
+  right up to the point its output was needed. Authored and tested on Linux,
+  where the default encoding hid it. Output is ASCII now.
 
-- **The aging pass writes once per recall, not once per memory.** It runs on
-  every `/recall` and walks the whole graph; each address rewrite was its own
-  Cypher query and, since `neo4j_session()` opens a session per call, its own
-  Bolt session — so a recall on a 500-memory graph could issue 500 sequential
-  round trips before returning. `write_color_updates_batch()` applies the pass
-  in one `UNWIND`. Three aging passes over a 60-memory fixture went from **104
-  round trips to 3**. The collision rule is unchanged and still enforced in the
-  database rather than only by the caller's in-memory pre-check.
+- **`/health` reported an empty graph as zero memories.** `get_neo4j_stats()`
+  chained three `MATCH` clauses through `WITH`, and such a chain yields no rows
+  at all if any link matches nothing — the `CO_RECALLED` link matches nothing
+  until the first recall creates an edge. A graph holding 60 memories and 110
+  keywords reported `{"memories": 0, "keywords": 0, "status": "connected"}`.
+  Wrong on precisely the graphs whose state is hardest to confirm another way:
+  a fresh instance, or one restored from a dump before any recall. It also
+  silently defeated `mmu_validate.py`, which reads graph size from `/health`,
+  so its integrity check would have compared 0 to 0 and passed while saying
+  nothing. Three independent `COUNT {}` subqueries now, so an empty pattern
+  contributes 0 instead of erasing the other two.
 
-- **Every tool that writes to a graph now refuses the port a real one lives
-  on.** `tests/test_mmu.py` got this guard in 0.1.2, after a bare `pytest` aged
-  four of someone's real memories. The other two tools that write were never
-  given it: `mmu_recall_speed_test.py` defaulted to 8765, and
-  `Extra/test_client.py` **hardcoded** 8765 with no override at all while
-  pinning memories, saving memories, and firing a deliberate burst of unrelated
-  recalls to demonstrate aging. Both now default to 8766 and refuse 8765
-  without an explicit opt-in.
-
-### Added
-
-- **`mmu_validate.py`** — captures a JSON snapshot of a running instance
-  (health, index-vs-graph agreement, embedding coverage, recall latency) and
-  diffs two of them, so "I optimized it and nothing broke" is a measurement
-  rather than a claim. Calls `/index_repair` in dry-run only: a tool that
-  repairs while it observes cannot be trusted to report what it found. Refuses
-  8765 and also 7474, which is not an MMU endpoint at all — it is the Neo4j
-  browser, and it grants full database access.
-
-- **Six regression tests** covering index corruption under concurrency,
-  per-request state isolation, aging round-trip count, index/graph agreement
-  across aging passes with duplicate CONs forcing real collisions, and an
-  unreachable graph leaving the index untouched. All fail against the previous
-  commit.
+- **Five of the six new regression tests never ran anywhere.**
+  `pytest.importorskip("mmu_server")` skipped silently when `fastapi` was
+  absent from the host — which is normal, since it is a container dependency.
+  That covered both concurrency regressions and all three batched-aging
+  regressions: the tests written for this very branch. Skips print beside
+  passes, so the suite read as green. The skip now names the missing dependency
+  and the command that fixes it, and `tests/conftest.py` repeats it in the
+  pytest report header, which collection-time output capture cannot swallow.
+  With the dependency present the suite goes from **64 to 70 passing**.
 
 ### Removed
 
