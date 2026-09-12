@@ -89,6 +89,36 @@ if _AIMED_AT_PRODUCTION:
     print(f"\n!! {_PRODUCTION_REASON}\n", file=sys.stderr)
 
 
+# mmu_server imports fastapi, a container dependency that is routinely absent
+# on the host. pytest.importorskip() turned that into five SILENT skips: the
+# two per-request-state regressions and all three batched-aging regressions did
+# not run on any machine -- not in CI, not on the author's box -- and a summary
+# line that prints skips next to passes reads as green. These tests cover the
+# server itself, so a missing fastapi is a broken environment, not an optional
+# extra, and it should say so.
+try:
+    import mmu_server as _mmu_server
+    _MMU_SERVER_ERROR = None
+except Exception as e:          # ImportError normally; a half-built env can raise others
+    _mmu_server = None
+    _MMU_SERVER_ERROR = f"{type(e).__name__}: {e}"
+
+_SERVER_IMPORT_REASON = (
+    f"cannot import mmu_server ({_MMU_SERVER_ERROR}). These tests exercise the "
+    f"server module directly, so this is a missing host dependency rather than "
+    f"an optional extra -- install it with: pip install -r requirements.txt"
+)
+
+needs_mmu_server = pytest.mark.skipif(_mmu_server is None, reason=_SERVER_IMPORT_REASON)
+
+if _mmu_server is None:
+    # Mirrors the production banner above, for anyone importing this module
+    # outside pytest. Under pytest both banners are swallowed by collection-
+    # time capture, which is why conftest.py repeats them in the report
+    # header, where nothing can capture them.
+    print("\n!! " + _SERVER_IMPORT_REASON + "\n", file=sys.stderr)
+
+
 def _call(method, path, payload=None, timeout=120, headers=None):
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(
@@ -1214,6 +1244,7 @@ def test_index_survives_concurrent_writers_and_readers(tmp_path):
     assert not [f for f in os.listdir(tmp_path) if ".tmp" in f]
 
 
+@needs_mmu_server
 def test_per_request_state_does_not_leak_between_threads():
     """
     The session id, rename map, read path and timing belong to one in-flight
@@ -1227,7 +1258,7 @@ def test_per_request_state_does_not_leak_between_threads():
     """
     import threading as _threading
 
-    mmu_server = pytest.importorskip("mmu_server")
+    mmu_server = _mmu_server
 
     core = mmu_server.MMUCore.__new__(mmu_server.MMUCore)
     core._req = _threading.local()
@@ -1260,6 +1291,7 @@ def test_per_request_state_does_not_leak_between_threads():
     assert not leaks, f"per-request state leaked across threads: {leaks[:3]}"
 
 
+@needs_mmu_server
 def test_unset_per_request_state_matches_the_old_defaults():
     """
     Call sites used getattr(mmu, "_last_read_path", "v2") and friends. The
@@ -1268,7 +1300,7 @@ def test_unset_per_request_state_matches_the_old_defaults():
     """
     import threading as _threading
 
-    mmu_server = pytest.importorskip("mmu_server")
+    mmu_server = _mmu_server
 
     core = mmu_server.MMUCore.__new__(mmu_server.MMUCore)
     core._req = _threading.local()
@@ -1318,7 +1350,7 @@ class _FakeGraph:
 
 
 def _aging_fixture(monkeypatch, tmp_path, count=60):
-    mmu_server = pytest.importorskip("mmu_server")
+    mmu_server = _mmu_server
     monkeypatch.setattr(mmu_server, "AGING_MIN_MEMORIES", 5, raising=False)
 
     fake = _FakeGraph()
@@ -1345,6 +1377,7 @@ def _aging_fixture(monkeypatch, tmp_path, count=60):
     return core, fake, addrs
 
 
+@needs_mmu_server
 def test_aging_uses_one_round_trip_per_pass(monkeypatch, tmp_path):
     """One batched write per aging pass, however many memories change."""
     core, fake, addrs = _aging_fixture(monkeypatch, tmp_path)
@@ -1359,6 +1392,7 @@ def test_aging_uses_one_round_trip_per_pass(monkeypatch, tmp_path):
     assert fake.trips == 3
 
 
+@needs_mmu_server
 def test_batched_aging_keeps_index_and_graph_in_step(monkeypatch, tmp_path):
     """
     Batching must not reintroduce drift.
@@ -1384,6 +1418,7 @@ def test_batched_aging_keeps_index_and_graph_in_step(monkeypatch, tmp_path):
         assert meta.get("color") == fake.addr_to_color[addr], f"colour drift at {addr}"
 
 
+@needs_mmu_server
 def test_aging_survives_an_unreachable_graph(monkeypatch, tmp_path):
     """
     A batch that writes nothing must leave the index completely untouched, so
