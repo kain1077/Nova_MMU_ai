@@ -771,11 +771,23 @@ def get_neo4j_stats():
         return {"status": "disabled"}
     try:
         with s:
+            # Three independent COUNT subqueries, NOT a chain of MATCHes.
+            #
+            # The chained form this replaces returned ZERO ROWS whenever any
+            # link in it matched nothing -- and the CO_RECALLED link matches
+            # nothing until the first recall creates an edge. A brand new graph
+            # therefore reported "connected, 0 memories, 0 keywords" while
+            # holding a full set of both. /health is the first thing anyone
+            # looks at, and it lied on exactly the graphs whose state is least
+            # obvious. It also silently defeated any tool that reads graph size
+            # from /health, mmu_validate.py's integrity check among them.
+            #
+            # COUNT {} evaluates each pattern separately, so an empty one
+            # contributes 0 instead of erasing the other two.
             counts = s.run("""
-                MATCH (m:Memory)  WITH count(m) AS mem
-                MATCH (k:Keyword) WITH mem, count(k) AS kw
-                MATCH ()-[r:CO_RECALLED]-() WITH mem, kw, count(r)/2 AS co
-                RETURN mem, kw, co
+                RETURN COUNT { MATCH (m:Memory)  RETURN m } AS mem,
+                       COUNT { MATCH (k:Keyword) RETURN k } AS kw,
+                       COUNT { MATCH ()-[r:CO_RECALLED]-() RETURN r } / 2 AS co
             """).single()
             hubs = s.run("""
                 MATCH (m:Memory)-[r:CO_RECALLED]-()
