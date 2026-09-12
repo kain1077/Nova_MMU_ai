@@ -31,18 +31,18 @@ permissions:
   contents: read
 
 jobs:
+  # The suite lives in tests.yml, which runs on every pull request rather than
+  # only the ones matching this workflow's paths filter. Called from here so a
+  # tag build is still gated on it, and so there is one copy of those steps
+  # instead of two that can drift apart.
+  #
+  # On a pull request that matches the paths above, this means the suite runs
+  # twice: once from tests.yml's own pull_request trigger and once through this
+  # call. That is one extra fifteen-second ubuntu job on a minority of PRs, and
+  # it buys an unconditional gate that needs no `if:` gymnastics to read.
   test:
     name: Tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: pip install -r requirements-dev.txt
-      # The live tests skip themselves when no server is listening, so this runs
-      # the pure tier only -- which is the tier that should gate a release.
-      - run: pytest tests/ -v
+    uses: ./.github/workflows/tests.yml
 
   build:
     name: ${{ matrix.label }}

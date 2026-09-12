@@ -40,6 +40,29 @@ between minor versions, and will say so here when they do.
 
 ### Fixed
 
+- **CI ran no tests on a pull request that changed only code or tests.** The
+  suite was a job inside `release.yml`, whose `pull_request` trigger is scoped
+  by a paths filter listing what goes into a binary -- `packaging/**`, the
+  Dockerfile, `requirements.txt`. That list never mentioned `mmu_server.py`,
+  `neo4j_layer.py`, `light_index_v2.py` or `tests/**`, so a server-only or
+  test-only PR matched nothing, ran nothing, and displayed an empty check list
+  while doing it -- which reads as "nothing to check" rather than "nothing was
+  checked". The suite now lives in its own `tests.yml` with no paths filter at
+  all, and `release.yml` calls it so a tag build is still gated on it. The
+  four-runner binary matrix stays path-scoped; that scoping was right for an
+  expensive job and only wrong as a gate on a fifteen-second one.
+
+- **`/health` reported an empty graph as zero memories.** `get_neo4j_stats()`
+  chained three `MATCH` clauses through `WITH`, and such a chain yields no rows
+  at all if any single link matches nothing -- the `CO_RECALLED` link matches
+  nothing until the first recall creates an edge. A graph holding 60 memories
+  and 110 keywords reported `{"status": "connected", "memories": 0,
+  "keywords": 0}`. Wrong on precisely the graphs whose state is hardest to
+  confirm another way: a fresh instance, or one restored from a dump before
+  any recall. It also silently defeated any tool that reads graph size from
+  `/health`. Three independent `COUNT {}` subqueries now, so an empty pattern
+  contributes 0 instead of erasing the other two.
+
 - **One un-encodable character could eat a whole idle daemon log line.**
   Windows gives stdout the ANSI code page whenever it is not a real console --
   piped, redirected, or run under a service wrapper -- and memories routinely
