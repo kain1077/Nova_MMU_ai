@@ -155,6 +155,20 @@ log = logging.getLogger("idle_daemon")
 log.setLevel(logging.INFO)
 _fmt = logging.Formatter("%(asctime)s | %(levelname)-7s | %(message)s")
 
+# Windows gives stdout the ANSI code page (cp1252 here) whenever it is not a
+# real console -- piped, redirected, or run under a service wrapper. Memories
+# routinely carry characters that page cannot encode: the physics notes alone
+# bring the increment sign, square roots and minus signs. logging does not
+# degrade on an encode failure, it prints a UnicodeEncodeError traceback
+# *instead of* the line, so one such character loses the whole message. The
+# file handler below already pins utf-8; this gives stdout the same guarantee.
+# Done on the stream rather than the handler so --show-prompt, which prints the
+# assembled prompt directly, is covered by the same fix.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+except (AttributeError, OSError):                          # pragma: no cover
+    pass                                                   # already wrapped, or not reconfigurable
+
 _console = logging.StreamHandler(sys.stdout)
 _console.setFormatter(_fmt)
 log.addHandler(_console)

@@ -63,6 +63,17 @@ between minor versions, and will say so here when they do.
   `/health`. Three independent `COUNT {}` subqueries now, so an empty pattern
   contributes 0 instead of erasing the other two.
 
+- **One un-encodable character could eat a whole idle daemon log line.**
+  Windows gives stdout the ANSI code page whenever it is not a real console --
+  piped, redirected, or run under a service wrapper -- and memories routinely
+  carry characters cp1252 cannot encode; the physics notes alone bring
+  increment signs, square roots and minus signs. `logging` does not degrade on
+  an encode failure, it prints a `UnicodeEncodeError` traceback *instead of*
+  the line, so a single such character lost the entire message. The file
+  handler already pinned utf-8; stdout now gets the same guarantee, applied to
+  the stream rather than the handler so `--show-prompt`, which prints the
+  assembled prompt directly, is covered by the same fix.
+
 - **The MCP bridge works when frozen.** `mmu_mcp_server.py` located `.env` relative to
   `__file__`, which under PyInstaller points into a temporary extraction directory that
   is recreated at every launch — so a frozen bridge silently saw none of `.env`, exactly
