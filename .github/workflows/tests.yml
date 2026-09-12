@@ -1,0 +1,46 @@
+name: Tests
+
+# The test suite, on its own workflow and on purpose.
+#
+# This used to be a job inside release.yml, which is triggered by a paths
+# filter listing what goes into a binary: packaging/**, the Dockerfile,
+# requirements.txt and so on. That filter never mentioned mmu_server.py,
+# neo4j_layer.py, light_index_v2.py or tests/** -- so a pull request that
+# changed only the server or only the tests ran no tests at all, and showed a
+# clean, empty check list while doing it. A PR fixing a bug in neo4j_layer.py
+# with a regression test attached was merged past CI without either being run.
+#
+# There is deliberately NO paths filter here. A gap in one is what caused the
+# problem, and this job is a single ubuntu runner that finishes in about
+# fifteen seconds -- the cost of running it on every pull request is far below
+# the cost of not noticing it did not.
+#
+# The four-runner binary matrix in release.yml stays path-scoped as it was.
+# That scoping was the right call for an expensive job; it was only wrong as a
+# gate on the cheap one.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # Called by release.yml so a tag build is still gated on the suite, without
+  # a second copy of these steps drifting out of sync with this one.
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt
+      # The live tests skip themselves when no server is listening, so this runs
+      # the pure tier only -- which is the tier that should gate a release.
+      - run: pytest tests/ -v

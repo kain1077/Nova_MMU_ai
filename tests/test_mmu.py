@@ -484,6 +484,36 @@ def test_health():
 
 
 @live
+def test_health_graph_counts_are_not_silently_zero():
+    """
+    A connected graph holding memories must never report zero of them.
+
+    get_neo4j_stats() chained three MATCH clauses through WITH. Such a chain
+    yields no rows at all if any single link matches nothing, and the
+    CO_RECALLED link matches nothing until the first recall creates an edge --
+    so a fresh instance holding 60 memories and 110 keywords reported
+    {"status": "connected", "memories": 0, "keywords": 0}. Wrong on exactly
+    the graphs whose state is hardest to confirm another way, and it silently
+    defeated any tool reading graph size from /health.
+
+    Note this invariant only catches the regression while the graph has no
+    CO_RECALLED edges, which is the state a fresh or freshly restored instance
+    is in. On a warm graph the old query happened to be correct.
+    """
+    _, d = _call("GET", "/health")
+    n4j = d.get("neo4j") or {}
+    if n4j.get("status") != "connected":
+        pytest.skip("Neo4j not connected on this instance")
+    if not d.get("total_memories"):
+        pytest.skip("empty instance -- zero is the honest answer here")
+
+    assert n4j.get("memories"), (
+        f"index reports {d['total_memories']} memories but a connected graph "
+        f"reports {n4j.get('memories')}; co_recalled={n4j.get('co_recalled')}"
+    )
+
+
+@live
 def test_endpoints_survive_any_graph_size():
     """Including an empty one -- no 500s, sane empty structures."""
     for path in ("/health", "/embedding_status", "/insights", "/session_bundle",
