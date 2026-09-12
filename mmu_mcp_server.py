@@ -22,10 +22,41 @@ import json
 import uuid
 import requests
 
+_FROZEN = getattr(sys, "frozen", False)
+
+
+def _env_search_dirs():
+    """
+    Directories that might hold the project's .env, best guess first.
+
+    Running from a checkout, .env sits beside this file and that is the end of
+    it. Frozen into the mmu-mcp binary there is no such file: __file__ points
+    inside PyInstaller's temporary extraction directory, which is created fresh
+    on every launch and deleted on exit. So a frozen build looks beside its own
+    executable, then in the directory the installer installs to -- which is
+    where compose reads the same .env from.
+    """
+    dirs = []
+    if _FROZEN:
+        dirs.append(os.path.dirname(os.path.abspath(sys.executable)))
+        if sys.platform == "win32":
+            base = os.environ.get("LOCALAPPDATA")
+            if base:
+                dirs.append(os.path.join(base, "MMU"))
+        elif sys.platform == "darwin":
+            dirs.append(os.path.expanduser("~/Library/Application Support/MMU"))
+        else:
+            data_home = os.environ.get("XDG_DATA_HOME")
+            dirs.append(os.path.join(data_home, "mmu") if data_home
+                        else os.path.expanduser("~/.local/share/mmu"))
+    else:
+        dirs.append(os.path.dirname(os.path.abspath(__file__)))
+    return dirs
+
+
 def _load_env_file():
     """
-    Load .env from this file's directory into os.environ, without overriding
-    anything already set.
+    Load .env into os.environ, without overriding anything already set.
 
     Every other component gets .env through docker-compose, which injects it
     into the container. This one is a HOST process launched by the chat client,
@@ -37,21 +68,23 @@ def _load_env_file():
     Real environment variables still win, so an MCP config that sets one
     explicitly keeps working.
     """
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-    try:
-        with open(path, encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                os.environ.setdefault(k.strip(), v.strip())
-    except FileNotFoundError:
-        pass
-    except Exception:
-        # A malformed .env must not stop the MCP server from starting; the
-        # defaults below are all still valid.
-        pass
+    for directory in _env_search_dirs():
+        path = os.path.join(directory, ".env")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    os.environ.setdefault(k.strip(), v.strip())
+            return
+        except FileNotFoundError:
+            continue
+        except Exception:
+            # A malformed .env must not stop the MCP server from starting; the
+            # defaults below are all still valid.
+            return
 # Modification time of this file as it was when Python imported it. Compared
 # against the file on disk at every tool call: if disk is newer, this process
 # is running code that no longer exists and the client has not been restarted.
@@ -60,8 +93,14 @@ def _load_env_file():
 # detection is the whole remedy. It is worth having because the failure is
 # otherwise completely silent: a tool added an hour ago is simply absent, and
 # the model looks like it is refusing to use it.
+#
+# Frozen, the file to watch is the executable, not __file__: PyInstaller
+# extracts the sources to a temporary directory at launch, so __file__ has an
+# mtime of a few milliseconds ago and comparing against it can never detect
+# anything. Replacing the binary while a client holds it open produces exactly
+# the same silent staleness, so the check is still worth having there.
 try:
-    _SOURCE_PATH = os.path.abspath(__file__)
+    _SOURCE_PATH = os.path.abspath(sys.executable if _FROZEN else __file__)
     _SOURCE_MTIME = os.path.getmtime(_SOURCE_PATH)
 except Exception:
     _SOURCE_PATH, _SOURCE_MTIME = None, None
@@ -81,7 +120,7 @@ def _staleness_warning():
     edited = _dt.datetime.fromtimestamp(current).strftime("%Y-%m-%d %H:%M")
     return (
         "!! STALE MCP SERVER. This process loaded its code before "
-        f"{edited}, and mmu_mcp_server.py has been edited since. Tools added "
+        f"{edited}, and {os.path.basename(_SOURCE_PATH)} has changed since. Tools added "
         "in that edit are NOT available in this session, however many times "
         "they are attempted. Nothing here can fix that -- the chat client must "
         "be restarted to reload the MCP server. Say so rather than retrying.\n\n"
