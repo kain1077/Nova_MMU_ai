@@ -9,4 +9,9 @@
 
 -r requirements-host.txt
 
+# The server's own dependencies. Five regression tests import mmu_server
+# directly -- the two concurrency ones and all three batched-aging ones --
+# and without fastapi installed they skipped silently, here and in CI.
+-r requirements.txt
+
 pytest>=8.0

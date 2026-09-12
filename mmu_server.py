@@ -84,6 +84,7 @@ import re
 import uuid
 import time
 import logging
+import threading
 from datetime import datetime
 import neo4j_layer as n4j
 from light_index_v2 import LightIndexV2
@@ -629,11 +630,72 @@ def _embedding_text(keywords, payload):
 
 
 class MMUCore:
+    """
+    One instance, shared by every request.
+
+    Four values here belong to a single in-flight recall rather than to the
+    instance: the session id the caller set, the rename map the aging pass
+    produced, and the read path and timing the endpoint reports back. They are
+    written during a request and read later in that same request.
+
+    Endpoints are sync `def`, so Starlette runs them in a worker threadpool and
+    two recalls genuinely overlap. Held as plain attributes, the second recall
+    overwrote the first one's values between its own write and read -- so a
+    response could carry another request's read_path and timing, and, far
+    worse, /recall could rewrite its result addresses through an addr_map built
+    by a different query. Those addresses go straight back to /rate and seed
+    Phase 10 anticipation, and both miss silently when the address is wrong.
+
+    threading.local() gives each worker thread its own copy. The properties
+    below keep every existing call site unchanged; the storage underneath is
+    per-thread, and a request never leaves its thread.
+    """
+
     def __init__(self):
         self.v2_index = LightIndexV2(path=V2_INDEX_PATH)
         # Address pairs whose aging rename has been refused because the target
         # was already taken. Purely for log deduplication -- see _age_memories.
+        # Genuinely instance-wide: the point is to dedupe across requests.
         self._addr_collisions = set()
+        self._req = threading.local()
+
+    # ── per-request scratch state ─────────────
+    #
+    # Defaults match what the old getattr(..., default) call sites used, so a
+    # thread that reads one of these without writing it first behaves exactly
+    # as before.
+
+    @property
+    def _current_session_id(self):
+        return getattr(self._req, "session_id", "default")
+
+    @_current_session_id.setter
+    def _current_session_id(self, value):
+        self._req.session_id = value
+
+    @property
+    def _last_addr_map(self):
+        return getattr(self._req, "addr_map", {})
+
+    @_last_addr_map.setter
+    def _last_addr_map(self, value):
+        self._req.addr_map = value
+
+    @property
+    def _last_read_path(self):
+        return getattr(self._req, "read_path", "v2")
+
+    @_last_read_path.setter
+    def _last_read_path(self, value):
+        self._req.read_path = value
+
+    @property
+    def _last_read_ms(self):
+        return getattr(self._req, "read_ms", 0)
+
+    @_last_read_ms.setter
+    def _last_read_ms(self, value):
+        self._req.read_ms = value
         card_count = len(self.v2_index.shortcut_cache)
         print(f"MMUCore ready | {card_count} memories in v2 index | Phase 3 (Neo4j + v2 only)")
 
@@ -1047,6 +1109,15 @@ class MMUCore:
             return list(addr_map.values())
         now_ts      = time.time()   # one clock reading for the whole pass
 
+        # Collected here and written in ONE round trip after the loop. This
+        # used to be a Cypher query -- and a fresh Bolt session -- per memory,
+        # on a pass that runs on every recall and walks the whole graph.
+        pending = []            # (addr, new_addr, new_color)
+        # Targets already spoken for by an earlier row of this same pass. The
+        # index is not updated until after the batch, so the collision check
+        # below cannot see a claim made moments ago by another memory.
+        claimed = set()
+
         # Phase 10: stamp the recalled set BEFORE aging, so a memory recalled
         # this turn is never simultaneously judged stale by the same pass.
         self.v2_index.touch(recalled, when=now_ts)
@@ -1155,7 +1226,15 @@ class MMUCore:
             # Nothing is lost by holding. USE is a decay counter, not a
             # timestamp; failing to advance it once delays this memory's next
             # colour transition by a single recall.
-            if new_addr != addr and new_addr in self.v2_index.shortcut_cache:
+            # `claimed` is the batching half of this check. Note the effect of
+            # deferring index writes: an address being VACATED by an earlier
+            # row still looks occupied here, so a memory that could have moved
+            # into it holds instead. That is the conservative direction, and it
+            # costs exactly what holding always costs -- one pass of delay on a
+            # decay counter -- while keeping the graph and the index agreeing
+            # about who owns what.
+            if new_addr != addr and (new_addr in self.v2_index.shortcut_cache
+                                     or new_addr in claimed):
                 # Warn once per contested pair, not once per recall: a held
                 # address stays held until the occupant ages off it, so an
                 # undeduped warning here would repeat on every /recall for the
@@ -1170,36 +1249,42 @@ class MMUCore:
                 new_addr = addr
 
             if new_addr != addr or new_color != color:
-                # Neo4j is the record, so it moves first and the index follows
-                # WHAT LANDED -- never what was asked for. write_color_update
-                # returns the address the node actually carries afterwards, or
-                # None if it wrote nothing at all. Following the request rather
-                # than the result is the other half of this bug: an index that
-                # renames past a graph write that never happened drifts just as
-                # badly, only in the opposite direction.
-                landed = n4j.write_color_update(addr, new_addr, new_color)
-                if landed is None:
-                    # Graph unreachable or the node is gone. Leave the index
-                    # untouched: the two stores stay in step, and the next
-                    # recall retries this memory from where it is.
-                    continue
-                if landed != addr and not self.v2_index.rename(addr, landed):
-                    # The graph moved it and the index would not -- only
-                    # reachable if the two had already drifted apart. Say so
-                    # loudly; /index_repair reconciles it using the keyword
-                    # list, which this loop does not have. Carry on with the
-                    # address the GRAPH now holds: it is the record, and
-                    # handing callers the old one makes /rate and Phase 10's
-                    # cluster seeds miss silently, which is the defect the
-                    # address map exists to prevent.
-                    log.error(
-                        "aging: graph moved %s to %s but the index refused. "
-                        "Run POST /index_repair?apply=true.", addr, landed
-                    )
-                else:
-                    self.v2_index.set_color(landed, new_color)
-                if addr in addr_map:
-                    addr_map[addr] = landed
+                if new_addr != addr:
+                    claimed.add(new_addr)
+                pending.append((addr, new_addr, new_color))
+
+        # ── one round trip for the whole pass ──
+        #
+        # Neo4j is the record, so it moves first and the index follows WHAT
+        # LANDED -- never what was asked for. An address absent from the
+        # returned map wrote nothing at all (node gone, or the graph is
+        # unreachable), exactly as write_color_update() returning None meant.
+        # Following the request rather than the result is how an index drifts
+        # past a graph write that never happened.
+        landed_map = n4j.write_color_updates_batch(pending)
+
+        for addr, _requested, new_color in pending:
+            landed = landed_map.get(addr)
+            if landed is None:
+                # Leave the index untouched: the two stores stay in step, and
+                # the next recall retries this memory from where it is.
+                continue
+            if landed != addr and not self.v2_index.rename(addr, landed):
+                # The graph moved it and the index would not -- only reachable
+                # if the two had already drifted apart. Say so loudly;
+                # /index_repair reconciles it using the keyword list, which
+                # this loop does not have. Carry on with the address the GRAPH
+                # now holds: it is the record, and handing callers the old one
+                # makes /rate and Phase 10's cluster seeds miss silently, which
+                # is the defect the address map exists to prevent.
+                log.error(
+                    "aging: graph moved %s to %s but the index refused. "
+                    "Run POST /index_repair?apply=true.", addr, landed
+                )
+            else:
+                self.v2_index.set_color(landed, new_color)
+            if addr in addr_map:
+                addr_map[addr] = landed
 
         self.v2_index.save()
         # Phase 10: expose the rename mapping. Callers hold addresses captured

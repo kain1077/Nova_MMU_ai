@@ -29,6 +29,8 @@ import os
 import json
 import time
 import logging
+import threading
+import functools
 from difflib import SequenceMatcher
 
 log = logging.getLogger("light_index_v2")
@@ -74,9 +76,37 @@ def tokenize(text):
     return words, stems
 
 
+def _synchronized(method):
+    """
+    Serialize a LightIndexV2 method against the instance lock.
+
+    Applied to the readers as well as the writers. A reader that iterates
+    keyword_index while an aging pass rewrites it raises RuntimeError, and a
+    reader that returns a half-applied rename is worse than one that waits:
+    the index IS the read path, so a torn read is a memory that silently does
+    not exist. Contention is negligible in practice -- one conversation plus a
+    daemon polling every 30 seconds.
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
 class LightIndexV2:
 
+    # Every MMU endpoint is a sync `def`, which means Starlette runs it in a
+    # worker thread rather than on the event loop -- so two requests really do
+    # execute this class at the same time. There is also always a second
+    # caller: the idle daemon polls every 30s and calls /maintain and
+    # /remember against the same server a conversation is using.
+    #
+    # Reentrant because the mutators call each other: rename() calls _link(),
+    # add() calls bake_similar(). A plain Lock would deadlock on the first
+    # rename.
     def __init__(self, path=INDEX_PATH, neo4j_layer=None):
+        self._lock = threading.RLock()
         self.path = path
         self.n4j = neo4j_layer
         self.keyword_index = {}      # term/stem -> set(address)  single words
@@ -136,24 +166,43 @@ class LightIndexV2:
 
 
     def save(self):
-        blob = {
-            "keyword_index":    {k: sorted(v) for k, v in self.keyword_index.items()},
-            "word_parts_index": {k: sorted(v) for k, v in self.word_parts_index.items()},
-            "compound_index": {k: sorted(v) for k, v in self.compound_index.items()},
-            "shortcut_cache": self.shortcut_cache,
-            "generation": self.generation,
-            "saved_at": time.time(),
-        }
-        tmp = self.path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(blob, f)
-        os.replace(tmp, self.path)   # atomic — no half-written index
+        # The blob is built under the lock for two reasons. json.dump() walks
+        # these dicts lazily, so a concurrent write during serialization raises
+        # "dictionary changed size during iteration" -- and even when it does
+        # not raise, it can persist a keyword_index that disagrees with the
+        # shortcut_cache it was captured beside.
+        with self._lock:
+            blob = {
+                "keyword_index":    {k: sorted(v) for k, v in self.keyword_index.items()},
+                "word_parts_index": {k: sorted(v) for k, v in self.word_parts_index.items()},
+                "compound_index": {k: sorted(v) for k, v in self.compound_index.items()},
+                "shortcut_cache": dict(self.shortcut_cache),
+                "generation": self.generation,
+                "saved_at": time.time(),
+            }
+            # Unique per call. os.replace is atomic, but a fixed ".tmp" name is
+            # not the thing being replaced -- two savers sharing one temp file
+            # interleave their bytes INTO it and then both rename the result.
+            tmp = f"{self.path}.{os.getpid()}.{threading.get_ident()}.tmp"
+            try:
+                with open(tmp, "w") as f:
+                    json.dump(blob, f)
+                os.replace(tmp, self.path)   # atomic — no half-written index
+            except Exception:
+                # Never leave a partial temp file behind to be mistaken for an
+                # index, and never mask the original error.
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
     
 
     # ─────────────────────────────────────────
     #  TIER 1 — THE GATE
     # ─────────────────────────────────────────
 
+    @_synchronized
     def gate(self, prompt):
         words, stems = tokenize(prompt)
         prompt_word_set = set(words)
@@ -181,6 +230,7 @@ class LightIndexV2:
     #  TIER 2 — SHORTCUT EXPANSION
     # ─────────────────────────────────────────
 
+    @_synchronized
     def _is_fresh(self, addr):
         card = self.shortcut_cache.get(addr)
         if not card:
@@ -196,6 +246,7 @@ class LightIndexV2:
             return False
         return True
 
+    @_synchronized
     def expand(self, seed_addrs):
         """
         Pull pre-computed neighbors for the seed hits.
@@ -224,6 +275,7 @@ class LightIndexV2:
 
         return scored, cold
 
+    @_synchronized
     def touch(self, addresses, when=None):
         """
         Mark addresses as recalled just now (Phase 10 aging).
@@ -237,6 +289,7 @@ class LightIndexV2:
             if card is not None:
                 card["touched_at"] = ts
 
+    @_synchronized
     def days_since_touch(self, address, now=None):
         """
         Days since this memory was last recalled, or None if unknown.
@@ -285,6 +338,7 @@ class LightIndexV2:
     #  WRITE PATH — KEEPING TIERS IN SYNC
     # ─────────────────────────────────────────
 
+    @_synchronized
     def add(self, address, keywords, color="Green", priority=5,
             src_type=0, neighbors=None):
         self.generation += 1
@@ -334,6 +388,7 @@ class LightIndexV2:
             "touched_at": time.time(),
         }
 
+    @_synchronized
     def bake_similar(self, address, keywords):
         """
         Pre-compute SIMILAR_TO neighbors at write time by scanning the
@@ -362,6 +417,7 @@ class LightIndexV2:
             self.shortcut_cache[address]["neighbors"] = baked
         return baked
 
+    @_synchronized
     def bump_corecall(self, addresses):
         """
         Called after a recall. Adds/strengthens CO_RECALLED shortcuts
@@ -393,6 +449,7 @@ class LightIndexV2:
         if self.generation % 5 == 0:
             self.save()
 
+    @_synchronized
     def _link(self, src, dst):
         """
         Add or strengthen a single co-recall shortcut.
@@ -417,12 +474,14 @@ class LightIndexV2:
             # 0.30 = normalized weight=1 baseline (consistent with rebuild)
             card["neighbors"].append([dst, 0.30, "corecall"])
 
+    @_synchronized
     def set_color(self, address, color):
         """Color matrix transitions must update the card, not just Neo4j."""
         if address in self.shortcut_cache:
             self.shortcut_cache[address]["color"] = color
             self.save()   # color changes affect gate filtering — persist immediately
 
+    @_synchronized
     def rename(self, old_addr, new_addr):
         """
         Aging renames addresses. Both tiers must follow or the index
@@ -486,6 +545,7 @@ class LightIndexV2:
     #  BACKFILL FROM NEO4J
     # ─────────────────────────────────────────
 
+    @_synchronized
     def rebuild_from_neo4j(self, driver):
         """
         One-time build of both tiers from the existing graph.
@@ -561,6 +621,7 @@ class LightIndexV2:
                              for c in self.shortcut_cache.values()),
         }
 
+    @_synchronized
     def remove(self, address):
         """
         Remove a memory from both tiers and clean up neighbor references.
@@ -579,6 +640,7 @@ class LightIndexV2:
     #  STATS
     # ─────────────────────────────────────────
 
+    @_synchronized
     def stats(self):
         n = [len(c.get("neighbors", [])) for c in self.shortcut_cache.values()]
         fresh = sum(1 for a in self.shortcut_cache if self._is_fresh(a))
