@@ -40,6 +40,17 @@ between minor versions, and will say so here when they do.
 
 ### Fixed
 
+- **`/health` reported an empty graph as zero memories.** `get_neo4j_stats()`
+  chained three `MATCH` clauses through `WITH`, and such a chain yields no rows
+  at all if any single link matches nothing -- the `CO_RECALLED` link matches
+  nothing until the first recall creates an edge. A graph holding 60 memories
+  and 110 keywords reported `{"status": "connected", "memories": 0,
+  "keywords": 0}`. Wrong on precisely the graphs whose state is hardest to
+  confirm another way: a fresh instance, or one restored from a dump before
+  any recall. It also silently defeated any tool that reads graph size from
+  `/health`. Three independent `COUNT {}` subqueries now, so an empty pattern
+  contributes 0 instead of erasing the other two.
+
 - **The MCP bridge works when frozen.** `mmu_mcp_server.py` located `.env` relative to
   `__file__`, which under PyInstaller points into a temporary extraction directory that
   is recreated at every launch — so a frozen bridge silently saw none of `.env`, exactly
