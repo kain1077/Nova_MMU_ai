@@ -55,6 +55,19 @@ DEFAULT_PROBES = [
 ]
 
 
+# Windows consoles default to cp1252. `compare` printed U+2192 and died with
+# UnicodeEncodeError before emitting a single number, on the one platform this
+# tool is most likely to be run from -- it was authored and tested on Linux,
+# where the default encoding hid it. Output is ASCII now; this is the belt to
+# that braces, so anything non-ASCII added later degrades to a replacement
+# character rather than taking the whole run down.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except (AttributeError, OSError):
+        pass
+
+
 def _c(code, s):
     return s if os.environ.get("NO_COLOR") else f"\033[{code}m{s}\033[0m"
 
@@ -231,7 +244,7 @@ def _delta(before, after, label, unit="ms", lower_is_better=True):
         pct_s = f" ({pct:+.1f}%)"
     else:
         pct_s = ""
-    arrow = "→"
+    arrow = "->"
     line = f"  {label}: {before}{unit} {arrow} {after}{unit}{pct_s}"
     if abs(d) < 1e-9:
         return line
@@ -248,12 +261,12 @@ def compare(a, b):
     print(bold("Integrity"))
     ca, cb = ha.get("total_memories"), hb.get("total_memories")
     note = "" if ca == cb else red("  <-- CARD COUNT CHANGED")
-    print(f"  index cards: {ca} → {cb}{note}")
+    print(f"  index cards: {ca} -> {cb}{note}")
 
     na = (ha.get("neo4j") or {}).get("memories")
     nb = (hb.get("neo4j") or {}).get("memories")
     note = "" if na == nb else red("  <-- GRAPH COUNT CHANGED")
-    print(f"  graph nodes: {na} → {nb}{note}")
+    print(f"  graph nodes: {na} -> {nb}{note}")
 
     for snap, name in ((a, "before"), (b, "after")):
         r = snap.get("index_repair") or {}
