@@ -12,6 +12,34 @@ hottest path, and the removal of code that could not run.
 
 ### Added
 
+- **Skills can grow.** `POST /skills/{id}/members` adds memories to an existing
+  skill; `POST /skills/{id}/members/remove` takes them back out and restores their
+  pre-skill colour. Crystallization could create a skill and delete one and nothing
+  in between: `crystallize_skill()` always CREATEs, and it refuses any memory an
+  active skill already owns, so adding a fourth memory to a three-memory skill meant
+  `/uncrystallize` followed by `/crystallize`.
+
+  That round trip is a replacement, not a rebuild. It mints a new `skill_id`, resets
+  `invocation_count` to zero, discards `created_at`, drops the embedding and keyword
+  edges, and cannot run at all while an active child extends the skill -- so the tree
+  had to be dismantled first. A skill with seven recorded invocations came back
+  claiming none, which meant the honest record of which skills are actually used was
+  the price of growing one.
+
+  Measured on the graph this was built against: all twelve skills held exactly three
+  members, the `min_cluster` floor. Not one had ever grown past its birth size,
+  because nothing could make it.
+
+  Both operations keep the skill's id, history and tree position. Adding takes the
+  same `confirmed=true` gate as `/crystallize` and the same `MMU_ALLOW_MODEL_CRYSTALLIZE`
+  rule, because it demotes real memories to Blue; removing is not gated the same way,
+  since it restores a memory rather than burying one. Removing the last member is
+  refused and points at `/uncrystallize` -- a Skill with no root system is still
+  matchable and still delivered, with nothing left to trace it back to. A skill can
+  rewrite its `trigger`/`procedure` in the same call and is re-indexed when it does,
+  dropping the old wording's keywords so it stops matching prompts about text it no
+  longer contains.
+
 - **Packaged installers.** Two single-file binaries per platform, built in
   `packaging/`: `mmu-setup` (installer, launcher, doctor) and `mmu-mcp` (the MCP bridge,
   frozen). Neither needs Python installed. Built for Windows, Linux, Intel Mac and Apple
