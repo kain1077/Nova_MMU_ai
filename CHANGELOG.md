@@ -58,6 +58,16 @@ hottest path, and the removal of code that could not run.
 
 ### Changed
 
+- **The workflow actions moved to their Node 24 releases.** `actions/checkout@v4` and
+  `actions/setup-python@v5` run on Node 20, which GitHub deprecated in September
+  2025. The runner has been force-executing them on Node 24 ever since and
+  annotating every run to say so; when that fallback is withdrawn, the workflows
+  stop working. Both are now on v7, and `upload-artifact` moves from v4 to v7 for
+  the same reason. `download-artifact` deliberately stays on v4 until it can be
+  exercised -- it runs only in the `release` job, which no pull request triggers,
+  so bumping it here would be an untested change to the one path that has to work
+  when a tag is cut.
+
 - **The aging pass writes once per recall, not once per memory.** It runs on
   every `/recall` and walks the whole graph; each address rewrite was its own
   Cypher query and, since `neo4j_session()` opens a session per call, its own
