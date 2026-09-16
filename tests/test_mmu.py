@@ -473,6 +473,148 @@ def test_previews_share_one_candidate_implementation():
             f"{fn.__name__} must not compute its own candidates"
 
 
+# ── Crystallized members stop accumulating ──
+#
+# The roadmap's stated reason for crystallizing is that a hot path CONVERTS
+# into a skill "rather than accumulating recall-weight without bound forever".
+# Nothing was wired to that. Members were paired like any other memory in both
+# the graph and this index, and the aging pass promoted them back out of Blue
+# on their first direct hit -- so a crystallized cluster went on thickening
+# exactly as if it had never been compressed. On the graph this was found on,
+# two of the three highest-degree hubs were crystallized members.
+
+
+def test_a_crystallized_member_does_not_thicken_its_cluster(tmp_path):
+    """
+    The behaviour the whole fix exists for. A member still surfaces -- it is
+    still a direct keyword hit -- it just stops making its own cluster denser
+    every time it does.
+    """
+    idx = _index(tmp_path)
+    for a in ("A", "B", "C"):
+        idx.add(a, [f"kw{a}"])
+    idx.set_skill_member(["B"], True)
+
+    for _ in range(10):
+        idx.bump_corecall(["A", "B", "C"])
+
+    def neighbours(addr):
+        return {n[0] for n in idx.shortcut_cache[addr]["neighbors"]}
+
+    assert neighbours("A") == {"C"}, "A must not thicken toward the member"
+    assert neighbours("C") == {"A"}, "C must not thicken toward the member"
+    assert neighbours("B") == set(), "the member accumulates nothing"
+
+
+def test_unflagged_memories_still_pair_normally(tmp_path):
+    """
+    The exclusion must be membership, not a general dampening. Everything that
+    is not compressed keeps behaving exactly as it did.
+    """
+    idx = _index(tmp_path)
+    for a in ("A", "B"):
+        idx.add(a, [f"kw{a}"])
+    idx.bump_corecall(["A", "B"])
+    assert {n[0] for n in idx.shortcut_cache["A"]["neighbors"]} == {"B"}
+    assert {n[0] for n in idx.shortcut_cache["B"]["neighbors"]} == {"A"}
+
+
+def test_membership_is_carried_separately_from_colour(tmp_path):
+    """
+    Colour cannot encode this. A crystallized member and an archived memory are
+    both Blue and must age differently -- the archived one is MEANT to warm
+    back to Yellow when it resurfaces, the member is not. Reading membership
+    off the colour would either freeze archived memories or leak members, and
+    it leaked members.
+    """
+    idx = _index(tmp_path)
+    idx.add("A", ["kwa"], color="Blue")          # archived, not crystallized
+    idx.add("B", ["kwb"], color="Blue")          # crystallized member
+    idx.set_skill_member(["B"], True)
+    assert idx.shortcut_cache["A"]["skill_member"] is False
+    assert idx.shortcut_cache["B"]["skill_member"] is True
+
+
+def test_set_skill_member_reports_only_real_changes(tmp_path):
+    """
+    /index_repair reports how many flags it reconciled. A count of attempts
+    rather than changes would report work on every run and make a no-op repair
+    look like a repair.
+    """
+    idx = _index(tmp_path)
+    idx.add("A", ["kwa"])
+    assert idx.set_skill_member(["A"], True) == 1
+    assert idx.set_skill_member(["A"], True) == 0, "already flagged is not a change"
+    assert idx.set_skill_member(["missing"], True) == 0, "unknown address is not a change"
+    assert idx.set_skill_member(["A"], False) == 1
+
+
+def test_a_rebuild_does_not_uncompress_every_member():
+    """
+    rebuild_from_neo4j() discards both tiers and rebuilds from the graph. If it
+    dropped membership, every crystallized member would come back ageable and
+    pairing, and the only signal would be the graph slowly re-thickening.
+    """
+    import light_index_v2 as v2
+    src = inspect.getsource(v2.LightIndexV2.rebuild_from_neo4j)
+    assert "PROCEDURALIZED_FROM" in src, "the rebuild must read membership"
+    assert "skill_member=" in src,       "and must pass it to add()"
+
+
+def test_recalled_members_are_excluded_from_graph_pairing():
+    """
+    The other half, in Neo4j. write_recall_edges() paired Blue like any other
+    colour ("Include if Green/Yellow/Blue"), and it runs from mmu.recall()
+    BEFORE the endpoint knows which skills matched -- so the substitution was
+    invisible to the graph no matter what recall delivered.
+
+    Keyed on membership rather than colour precisely so the ordering stops
+    mattering: it is a property of the memory, not of this recall.
+    """
+    import neo4j_layer as n4j
+    src = inspect.getsource(n4j.write_recall_edges)
+    assert "PROCEDURALIZED_FROM" in src, \
+        "pairing must exclude memories compressed into a skill"
+    assert "Include if Green/Yellow/Blue" not in src, \
+        "Blue members must no longer be paired unconditionally"
+    # RECALLED_IN is episodic history and stays true for a member.
+    assert "RECALLED_IN" in src
+
+
+def test_membership_lookup_distinguishes_empty_from_unreachable():
+    """
+    /index_repair unflags anything the graph does not list as a member. An
+    unreachable graph returning [] instead of None would unflag every member in
+    the index on the strength of an answer that never arrived.
+    """
+    import neo4j_layer as n4j
+    src = inspect.getsource(n4j.get_skill_member_addresses)
+    assert "return None" in src, "unreachable must be distinguishable from empty"
+
+
+def test_the_aging_pass_leaves_crystallized_members_alone():
+    """
+    The leak itself. _age_memories() promotes Blue back to Yellow on recall,
+    which is right for an archived memory and wrong for a member -- and the
+    tier-1 keyword gate has no colour filter, so members DO get recalled
+    directly. The graph this was found on read 36 members against 34 Blue.
+
+    Read as text rather than imported: mmu_server pulls in a web framework that
+    CI does not install, which is why the endpoints have no round-trip
+    coverage either.
+    """
+    import pathlib
+    src = (pathlib.Path(__file__).resolve().parents[1] / "mmu_server.py").read_text(
+        encoding="utf-8")
+    body = src.split("def _age_memories", 1)[1].split("\n    def ", 1)[0]
+    assert 'meta.get("skill_member")' in body, \
+        "a memory compressed into a skill must not age"
+    # Ordering guard: the check has to sit above the Blue -> Yellow promotion,
+    # not below it, or the member is already warmed by the time it is skipped.
+    assert body.index('meta.get("skill_member")') < body.index('"Yellow" if color == "Blue"')
+
+
+
 # ═════════════════════════════════════════════════════════════
 #  LIVE
 # ═════════════════════════════════════════════════════════════

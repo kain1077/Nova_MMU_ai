@@ -340,7 +340,7 @@ class LightIndexV2:
 
     @_synchronized
     def add(self, address, keywords, color="Green", priority=5,
-            src_type=0, neighbors=None):
+            src_type=0, neighbors=None, skill_member=False):
         self.generation += 1
         for kw in keywords:
             if '%' in kw:
@@ -376,6 +376,10 @@ class LightIndexV2:
             "color": color,
             "priority": priority,
             "src_type": src_type,
+            # Compressed into an active Skill. Distinct from colour on purpose:
+            # a crystallized member and an archived memory are both Blue, and
+            # they must age differently -- see _age_memories().
+            "skill_member": bool(skill_member),
             "neighbors": neighbors or [],
             "gen": self.generation,
             "cached_at": time.time(),
@@ -429,8 +433,22 @@ class LightIndexV2:
         self.generation += 1
         addrs = list(dict.fromkeys(addresses))   # dedupe, keep order
 
-        for i, a in enumerate(addrs):
-            for b in addrs[i + 1:]:
+        # A memory compressed into a Skill stops accumulating co-recall weight.
+        # That is the whole stated point of crystallizing -- a hot path
+        # CONVERTS into a skill instead of thickening for ever -- and this
+        # mirror of the CO_RECALLED graph was one of the two places still
+        # thickening it. The skill records the delivery instead, through
+        # invocation_count.
+        #
+        # Excluded from PAIRING, not from recall: a member is still a direct
+        # keyword hit and still surfaces. It just stops making its own cluster
+        # denser every time it does, which is the feedback loop that made the
+        # graph's two heaviest hubs crystallized members.
+        pairing = [a for a in addrs
+                   if not self.shortcut_cache.get(a, {}).get("skill_member")]
+
+        for i, a in enumerate(pairing):
+            for b in pairing[i + 1:]:
                 # CO_RECALLED is bidirectional — write both directions
                 self._link(a, b)
                 self._link(b, a)
@@ -480,6 +498,32 @@ class LightIndexV2:
         if address in self.shortcut_cache:
             self.shortcut_cache[address]["color"] = color
             self.save()   # color changes affect gate filtering — persist immediately
+
+    @_synchronized
+    def set_skill_member(self, addresses, member=True):
+        """
+        Mark or unmark memories as compressed into an active Skill.
+
+        Kept separate from colour because colour cannot carry it: a
+        crystallized member and an archived memory are both Blue, and the two
+        must age differently. A member that is recalled has to STAY Blue, while
+        an archived memory that is recalled is meant to warm back to Yellow --
+        reading that distinction off the colour alone is how a crystallized
+        member climbed back out of compression on its first keyword hit.
+
+        Returns how many cards actually changed, so a repair can report work
+        done rather than work attempted.
+        """
+        changed = 0
+        for addr in addresses or ():
+            card = self.shortcut_cache.get(addr)
+            if card is None or bool(card.get("skill_member")) == bool(member):
+                continue
+            card["skill_member"] = bool(member)
+            changed += 1
+        if changed:
+            self.save()   # decides aging and pairing — persist immediately
+        return changed
 
     @_synchronized
     def rename(self, old_addr, new_addr):
@@ -565,6 +609,10 @@ class LightIndexV2:
                        m.color AS color,
                        m.priority AS priority,
                        m.src_type AS src_type,
+                       EXISTS {
+                           MATCH (m)-[:PROCEDURALIZED_FROM]->(sk:Skill)
+                           WHERE sk.status <> 'deprecated'
+                       } AS skill_member,
                        collect(DISTINCT k.term) AS keywords
             """)
             for r in rows:
@@ -574,6 +622,10 @@ class LightIndexV2:
                     color=r["color"] or "Green",
                     priority=r["priority"] if r["priority"] is not None else 5,
                     src_type=r["src_type"] or 0,
+                    # A rebuild that dropped this would un-compress every
+                    # crystallized member: they would age, promote out of Blue
+                    # and resume accumulating co-recall weight, silently.
+                    skill_member=bool(r["skill_member"]),
                 )
 
             # Bake SIMILAR_TO neighbors straight from the graph rather

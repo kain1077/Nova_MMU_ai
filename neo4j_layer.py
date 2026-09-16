@@ -354,9 +354,29 @@ def write_recall_edges(recalled_addresses, session_id):
     """
     After a recall hit:
       - RECALLED_IN edges from each Memory to the Session node
-      - CO_RECALLED edges between every pair of non-pinned co-recalled memories
+      - CO_RECALLED edges between every pair of co-recalled memories that are
+        neither pinned nor compressed into a Skill
         (bidirectional MERGE, weight increments each time)
     Called by recall() after the aging pass.
+
+    Crystallized members are excluded from PAIRING, and that exclusion is the
+    point of crystallizing. The roadmap's stated purpose is that a hot path
+    converts into a skill "rather than accumulating recall-weight without
+    bound forever" -- but this function paired Blue like any other colour, so a
+    crystallized cluster went on thickening its own edges on every recall,
+    exactly as if it had never been compressed. Two of the three highest-degree
+    hubs in the graph this was found on were crystallized members.
+
+    Note it is MEMBERSHIP that excludes, not colour. Reading it off Blue would
+    also silence archived memories, which are meant to re-warm when they
+    resurface, and would still miss a member that had already leaked back to
+    Yellow. Membership also makes this independent of when skills are matched:
+    this runs before the caller knows which skills matched, and does not need
+    to know.
+
+    RECALLED_IN is still written for members. "This surfaced during this
+    session" stays true, and it is episodic history rather than the weight
+    that biases retrieval.
     """
     if not recalled_addresses:
         return
@@ -371,19 +391,37 @@ def write_recall_edges(recalled_addresses, session_id):
         # Single session, single transaction block — no double-open
         with driver.session() as s:
 
-            # Step 1: filter Red nodes using actual Neo4j color
-            # Use OPTIONAL MATCH so missing nodes don't silently drop
-            non_pinned = []
+            # Step 1: decide who may pair, in ONE query.
+            #
+            # This was a round trip per recalled address -- a fresh Cypher
+            # query each, on the path that runs on every single recall. The
+            # membership check rides along in the same pass rather than
+            # doubling that count.
+            #
+            # A node absent from Neo4j returns no row and is still allowed to
+            # pair, which preserves the old behaviour: not yet written is not
+            # the same as pinned.
+            state = {}
+            for r in s.run("""
+                MATCH (m:Memory) WHERE m.address IN $addrs
+                RETURN m.address AS address,
+                       m.color   AS color,
+                       EXISTS {
+                           MATCH (m)-[:PROCEDURALIZED_FROM]->(sk:Skill)
+                           WHERE sk.status <> 'deprecated'
+                       } AS in_skill
+            """, addrs=list(recalled_addresses)):
+                state[r["address"]] = (r["color"], bool(r["in_skill"]))
+
+            non_pinned, compressed = [], []
             for addr in recalled_addresses:
-                rec = s.run(
-                    "OPTIONAL MATCH (m:Memory {address: $addr}) "
-                    "RETURN m.color AS color",
-                    addr=addr
-                ).single()
-                color = rec["color"] if rec else None
-                if color != "Red":
-                    # Include if Green/Yellow/Blue OR not yet in Neo4j
-                    non_pinned.append(addr)
+                color, in_skill = state.get(addr, (None, False))
+                if color == "Red":
+                    continue
+                if in_skill:
+                    compressed.append(addr)
+                    continue
+                non_pinned.append(addr)
 
             # Step 2: upsert Session node
             s.run("""
@@ -440,6 +478,7 @@ def write_recall_edges(recalled_addresses, session_id):
         log.info(f"Neo4j recall edges | session={session_id[:8]} | "
                  f"{len(recalled_addresses)} recalled | "
                  f"{len(non_pinned)} non-pinned | "
+                 f"{len(compressed)} compressed into skills | "
                  f"{pairs_written} CO_RECALLED edges written")
 
     except Exception as e:
@@ -2110,6 +2149,35 @@ def record_skill_invocation(skill_ids):
     except Exception as e:
         log.warning(f"record_skill_invocation failed: {e}")
         return False
+
+
+def get_skill_member_addresses():
+    """
+    Every memory compressed into an active Skill.
+
+    The v2 index carries this as a per-card flag, because the read path cannot
+    afford a graph query to decide whether a memory may age. This is the
+    authority that flag is reconciled against by /index_repair -- the two tiers
+    disagreeing about membership is the same class of drift as one having a
+    card the other has no node for, and it fails more quietly.
+
+    Returns None (not []) when the graph is unreachable, so a caller can tell
+    "no members" from "could not ask" and refuse to repair on the strength of
+    an answer it never got.
+    """
+    driver = get_driver()
+    if driver is None:
+        return None
+    try:
+        with driver.session() as s:
+            return [r["a"] for r in s.run("""
+                MATCH (m:Memory)-[:PROCEDURALIZED_FROM]->(sk:Skill)
+                WHERE sk.status <> 'deprecated'
+                RETURN DISTINCT m.address AS a
+            """)]
+    except Exception as e:
+        log.warning(f"get_skill_member_addresses failed: {e}")
+        return None
 
 
 def get_skills_needing_index():

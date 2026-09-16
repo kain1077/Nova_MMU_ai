@@ -1096,12 +1096,17 @@ class MMUCore:
         addr_map    = {a: a for a in recalled}
 
         # Small-graph guard. Counting from the in-memory index, so this costs
-        # nothing. Red is excluded (never ages) and documents are excluded
-        # (exempt since Phase 11), so this counts exactly the population the
-        # aging rules actually govern.
+        # nothing. Red is excluded (never ages), documents are excluded (exempt
+        # since Phase 11) and so are memories compressed into a skill, so this
+        # counts exactly the population the aging rules actually govern -- the
+        # comment claimed that before the skill exemption existed, and a count
+        # that includes exempt memories is how a graph stays above the floor
+        # while having almost nothing left to age.
         ageable = sum(
             1 for _a, _m in all_entries
-            if _m.get("color") != "Red" and _m.get("src_type") != 2
+            if _m.get("color") != "Red"
+            and _m.get("src_type") != 2
+            and not _m.get("skill_member")
         )
         if ageable < AGING_MIN_MEMORIES:
             log.debug("aging skipped: %d ageable memories < floor of %d",
@@ -1149,6 +1154,26 @@ class MMUCore:
             # CHUNK.LINE provenance encoded in the address stays a stable
             # identifier for the life of the memory.
             if p.get("src_type") == 2:
+                continue
+
+            # A memory compressed into an active Skill does not age.
+            #
+            # It used to. Blue is the demoted state, and the rule two branches
+            # down promotes Blue back to Yellow whenever it is recalled --
+            # written for archived memories, where warming back up is exactly
+            # right. A crystallized member is Blue for an entirely different
+            # reason, and the tier-1 keyword gate has no colour filter, so the
+            # first direct hit on a member promoted it out of compression:
+            # back into shortcut expansion, back into co-recall pairing, and
+            # accumulating again. The graph this was found on read 36 members
+            # against 34 Blue -- two had already leaked out.
+            #
+            # Skipping the pass entirely rather than pinning the colour also
+            # stops the address churn, and that matters more than it looks: a
+            # skill's member list IS a list of addresses, and rewriting them
+            # underneath it is what makes /crystallize report members that
+            # "matched no memory".
+            if meta.get("skill_member"):
                 continue
 
             if addr in recalled:
@@ -1971,6 +1996,12 @@ def crystallize(body: CrystallizeIn, x_mmu_source: Optional[str] = Header(None))
             mmu.v2_index.set_color(addr, "Blue")
         except Exception as e:
             log.warning("v2 index colour sync failed for %s: %s", addr, e)
+    # Colour alone cannot carry this. A crystallized member and an archived
+    # memory are both Blue, and the aging pass has to tell them apart: the
+    # archived one warms back to Yellow when it resurfaces, the member must
+    # stay compressed. Without the flag, the first keyword hit on a member
+    # undoes the demotion that was the whole point.
+    mmu.v2_index.set_skill_member(body.member_addresses, True)
     mmu.v2_index.save()
 
     # Phase 13.1: close the loop. If this member set was sitting in the review
@@ -2088,6 +2119,10 @@ def uncrystallize(skill_id: str, confirm: str = ""):
             mmu.v2_index.set_color(m["address"], m["color"])
         except Exception as e:
             log.warning("v2 index colour sync failed for %s: %s", m["address"], e)
+    # Restored members age and pair again. Only the ones actually restored --
+    # `still_demoted` are still owned by another active skill and stay
+    # compressed, the same asymmetry uncrystallize applies to colour.
+    mmu.v2_index.set_skill_member([m["address"] for m in info["restored"]], False)
     mmu.v2_index.save()
 
     return {"status": "uncrystallized", **info}
@@ -2147,6 +2182,15 @@ def index_repair(apply: bool = False):
       PHANTOM   in the index, absent from Neo4j. Occupies a slot in the gate
                 and can be ranked into a result whose payload no longer exists.
 
+      MISFILED  the two tiers disagree about whether a memory is compressed
+                into a Skill. This is the quietest of the three: nothing looks
+                broken, the memory is simply aged and paired as though it had
+                never been crystallized -- so it warms back out of Blue on its
+                first keyword hit and resumes thickening the cluster the skill
+                was supposed to replace. Every member crystallized before the
+                flag existed is in this state, which is why this reconciles
+                rather than assuming a fresh graph.
+
     Incremental on purpose: rebuild_from_neo4j() would fix both and also
     discard the shortcut cache and reset the generation counter, which is a
     heavy price for reinstating one card.
@@ -2161,6 +2205,21 @@ def index_repair(apply: bool = False):
     missing = [a for a in graph if a not in indexed]
     phantom = [a for a in indexed if a not in graph]
 
+    # Membership drift. get_skill_member_addresses() returns None when the
+    # graph could not be read, which is not the same as "no skills" -- treating
+    # it as the latter would unflag every member in the index on the strength
+    # of an answer that never came back.
+    members = n4j.get_skill_member_addresses()
+    misfiled_on, misfiled_off = [], []
+    if members is not None:
+        member_set = set(members)
+        for addr, card in mmu.v2_index.shortcut_cache.items():
+            flagged = bool(card.get("skill_member"))
+            if addr in member_set and not flagged:
+                misfiled_on.append(addr)
+            elif flagged and addr not in member_set:
+                misfiled_off.append(addr)
+
     result = {
         "status":       "repaired" if apply else "dry-run",
         "neo4j_total":  len(graph),
@@ -2169,10 +2228,19 @@ def index_repair(apply: bool = False):
         "phantom":      sorted(phantom),
         "missing_count": len(missing),
         "phantom_count": len(phantom),
+        "skill_members_total":   None if members is None else len(members),
+        "misfiled_unflagged":    sorted(misfiled_on),
+        "misfiled_stale_flag":   sorted(misfiled_off),
+        "misfiled_count":        len(misfiled_on) + len(misfiled_off),
     }
+    if members is None:
+        result["skill_members_note"] = (
+            "Skill membership could not be read from Neo4j and was NOT "
+            "reconciled. Nothing was unflagged on the strength of that.")
     if not apply:
+        drift = missing or phantom or misfiled_on or misfiled_off
         result["note"] = ("Nothing was written. Re-run with apply=true to fix."
-                          if (missing or phantom) else "Index and graph agree.")
+                          if drift else "Index and graph agree.")
         return result
 
     for addr in missing:
@@ -2188,9 +2256,20 @@ def index_repair(apply: bool = False):
     for addr in phantom:
         mmu.v2_index.remove(addr)
 
+    # Order matters: a card reinstated above starts unflagged, so membership is
+    # applied after the additions rather than before them.
+    if members is not None:
+        member_set = set(members)
+        mmu.v2_index.set_skill_member(
+            [a for a in mmu.v2_index.shortcut_cache if a in member_set], True)
+        mmu.v2_index.set_skill_member(
+            [a for a in mmu.v2_index.shortcut_cache if a not in member_set], False)
+
     mmu.v2_index.save()
-    result["note"] = (f"Added {len(missing)}, removed {len(phantom)}. "
-                      "Index and graph now agree.")
+    result["note"] = (
+        f"Added {len(missing)}, removed {len(phantom)}, "
+        f"reconciled {len(misfiled_on) + len(misfiled_off)} skill membership "
+        f"flag(s). Index and graph now agree.")
     return result
 
 
@@ -2284,6 +2363,7 @@ def crystallize_proposal(proposal_id: str, body: CrystallizeIn,
             mmu.v2_index.set_color(addr, "Blue")
         except Exception as e:
             log.warning("v2 index colour sync failed for %s: %s", addr, e)
+    mmu.v2_index.set_skill_member(addrs, True)
     mmu.v2_index.save()
 
     n4j.close_proposal_for_members(addrs, skill["skill_id"])

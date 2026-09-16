@@ -322,6 +322,13 @@ routine's root system: still there, still findable directly, no longer competing
 recall. On a graph where one large corpus dominates, that is the point — the compression
 is worth less than the un-biasing.
 
+Concretely, a member stops accumulating co-recall weight. It is still a direct keyword hit
+and still surfaces; it just stops making its own cluster denser every time it does, and it
+stays compressed rather than warming back out of Blue the way an archived memory is meant
+to. The Routine records the delivery instead, through its invocation count. That feedback
+loop is what the un-biasing actually is — without it, crystallizing changes what gets
+*delivered* while the graph goes on tilting further toward the same cluster.
+
 **Nothing crystallizes on its own.** The idle daemon looks for dense, coherent clusters
 and queues them as proposals; turning one into a Routine is a human decision, because it
 restructures memory rather than adding to it.
