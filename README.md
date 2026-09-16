@@ -114,6 +114,12 @@ Open `.env` and set at minimum:
 NEO4J_PASS=pick-something
 ```
 
+> **On Windows PowerShell, type `curl.exe`, not `curl`.** PowerShell aliases `curl` to
+> `Invoke-WebRequest`, which does not take `-X` and fails with *"A parameter cannot be
+> found that matches parameter name 'X'"*. The `.exe` reaches the real binary, which
+> Windows has shipped since 2018. This applies to every `curl` example in this document.
+> The PowerShell-native equivalent is `Invoke-RestMethod -Method Post -Uri "..."`.
+
 Then check your embedding model's dimension, because it must match exactly:
 
 ```bash
