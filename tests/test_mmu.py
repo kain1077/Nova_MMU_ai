@@ -614,6 +614,122 @@ def test_the_aging_pass_leaves_crystallized_members_alone():
     assert body.index('meta.get("skill_member")') < body.index('"Yellow" if color == "Blue"')
 
 
+# ── Phase 13.3: skill growth ──
+#
+# These are structural guards rather than round trips, for the same reason the
+# crystallization guards above are: the logic lives in Cypher and needs a real
+# Neo4j to execute. What they pin down is the set of properties that made
+# growth worth building -- if a later edit reintroduces CREATE here, or drops
+# the coalesce, the skill quietly goes back to being replaced rather than
+# grown and every number that depends on invocation_count goes with it.
+
+
+def test_growing_a_skill_never_creates_one():
+    """
+    The entire point of add_skill_members. crystallize_skill() CREATEs, which
+    is why growing a skill used to mean uncrystallize-and-rebuild: a new
+    skill_id, invocation_count back to zero, created_at gone, and the tree
+    edges deleted on the way out. A CREATE in this function would restore that
+    behaviour while looking like it had been fixed.
+    """
+    import neo4j_layer as n4j
+    src = inspect.getsource(n4j.add_skill_members)
+    assert "CREATE (sk:Skill" not in src, "growth must not mint a new skill"
+    assert "uuid.uuid4()" not in src,     "growth must not mint a new skill_id"
+    for frozen in ("invocation_count", "created_at", "skill_id:"):
+        assert f"SET sk.{frozen}" not in src, \
+            f"{frozen} is the skill's history and growth must not rewrite it"
+
+
+def test_growth_preserves_the_original_colour():
+    """
+    Members are restored to pre_skill_color when a skill is undone. Writing
+    that property unconditionally would overwrite the real original with Blue
+    for any memory demoted twice -- which is precisely what the coalesce in
+    crystallize_skill() exists to prevent, and adding members is the second
+    way a memory gets demoted.
+    """
+    import neo4j_layer as n4j
+    src = inspect.getsource(n4j.add_skill_members)
+    assert "coalesce(m.pre_skill_color, m.color)" in src, \
+        "an already-demoted member must keep its ORIGINAL colour"
+
+
+def test_a_skill_may_not_steal_another_skills_member():
+    """
+    Colour is single-valued, so two active skills owning one memory disagree
+    about what it should be the moment either is undone. crystallize_skill()
+    learned this from a real double-confirm; growth is the other door into the
+    same state and has to hold the same rule -- while still letting a caller
+    re-send a member this skill already owns, which is a no-op and not a
+    conflict with itself.
+    """
+    import neo4j_layer as n4j
+    src = inspect.getsource(n4j.add_skill_members)
+    assert "sk.skill_id <> $sid" in src, \
+        "ownership check must exclude the skill being grown"
+    assert "sk.status <> 'deprecated'" in src
+
+
+def test_removing_every_member_is_refused():
+    """
+    A Skill with no root system is still matchable and still delivered, with
+    nothing left to trace it back to. Emptying one is uncrystallize's job --
+    that deletes the Skill node too, so there is nothing left to match.
+    """
+    import neo4j_layer as n4j
+    src = inspect.getsource(n4j.remove_skill_members)
+    assert "uncrystallize" in src, \
+        "refusing to empty a skill must point at the operation that can"
+
+
+def test_removal_respects_a_second_owner():
+    """
+    Same rule uncrystallize_skill() applies: a memory another active skill
+    still owns stays Blue. Restoring it would contradict the skill that still
+    claims it.
+    """
+    import neo4j_layer as n4j
+    src = inspect.getsource(n4j.remove_skill_members)
+    assert "still_owned" in src and "still_demoted" in src
+
+
+def test_reindexing_a_rewritten_skill_drops_the_old_terms():
+    """
+    link_skill_keywords only ever MERGEd. That is correct for a new skill and
+    wrong for one whose procedure was rewritten: the old wording's terms stay
+    linked and the skill keeps matching prompts about text it no longer
+    contains. The default must stay MERGE-only so existing callers are
+    unaffected.
+    """
+    import neo4j_layer as n4j
+    sig = inspect.signature(n4j.link_skill_keywords)
+    assert sig.parameters["replace"].default is False, \
+        "existing callers must keep MERGE-only behaviour"
+    src = inspect.getsource(n4j.link_skill_keywords)
+    assert "DELETE r" in src
+
+
+def test_a_grown_skill_compresses_its_new_members_too():
+    """
+    The seam between growth and compression. A member added to an existing
+    skill has to be marked compressed exactly as one added at crystallization
+    is -- colour alone cannot carry it, since an archived memory is Blue too.
+    Miss this and growing a skill quietly produces members that keep ageing and
+    keep pairing: less compressed than the three it was created with, and
+    nothing on the skill says which of its members are which.
+    """
+    import pathlib
+    src = (pathlib.Path(__file__).resolve().parents[1] / "mmu_server.py").read_text(
+        encoding="utf-8")
+    add = src.split('@app.post("/skills/{skill_id}/members")', 1)[1].split("@app.post(", 1)[0]
+    assert 'set_skill_member(info["added"], True)' in add, \
+        "an added member must be marked compressed, not merely recoloured"
+    rm = src.split('@app.post("/skills/{skill_id}/members/remove")', 1)[1].split("@app.post(", 1)[0]
+    assert 'set_skill_member([r["address"] for r in info["removed"]], False)' in rm, \
+        "only RESTORED members lose the flag -- still_demoted keep it"
+
+
 
 # ═════════════════════════════════════════════════════════════
 #  LIVE

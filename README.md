@@ -353,6 +353,33 @@ curl -X POST "http://127.0.0.1:8765/skills/<skill_id>/uncrystallize?confirm=UNCR
 That deletes the Routine, restores each member to the colour it had before, and returns the
 proposal to the queue.
 
+A Routine can also **grow** without being rebuilt. Adding a memory used to mean
+uncrystallizing and crystallizing again, which returns a different id with its invocation
+count back at zero — so the record of which Routines actually get used was the price of
+extending one, and a Routine with children could not be touched at all without taking the
+tree apart first.
+
+```bash
+# add two memories to an existing Routine, and say what it now covers
+curl -X POST "http://127.0.0.1:8765/skills/<skill_id>/members" \
+  -H 'Content-Type: application/json' \
+  -d '{"member_addresses": ["<addr1>", "<addr2>"], "confirmed": true,
+       "procedure": "rewritten to cover the new members"}'
+
+# take one back out — it returns to the colour it had before
+curl -X POST "http://127.0.0.1:8765/skills/<skill_id>/members/remove" \
+  -H 'Content-Type: application/json' \
+  -d '{"member_addresses": ["<addr1>"]}'
+```
+
+The id, the invocation count and the tree edges survive both. Adding takes the same
+`confirmed: true` gate as crystallizing, because it demotes real memories; removing does
+not, because it restores them. Removing the *last* member is refused and points you at
+uncrystallize — a Routine with no root system is still matchable and still delivered, with
+nothing left to trace it back to. Rewriting the trigger or procedure re-indexes the
+Routine and drops the old wording's keywords, so it stops matching prompts about text it
+no longer contains.
+
 Routines form a tree. A narrow routine can extend a general one, so a common topic resolves
 through one node instead of a dozen memories:
 

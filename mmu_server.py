@@ -342,6 +342,25 @@ class CrystallizeIn(BaseModel):
     extends:          Optional[str] = None
 
 
+class SkillMembersIn(BaseModel):
+    # Phase 13.3. Explicit addresses for the same reason CrystallizeIn takes
+    # them: aging rewrites addresses in place, so anything resolved from a
+    # stored id could name different memories than the caller reviewed.
+    member_addresses: List[str]
+    confirmed:        bool = False   # must be explicitly true -- this demotes
+    # Growing a skill usually means its procedure no longer describes what it
+    # covers. Editing that text used to require the same destroy-and-rebuild
+    # that adding a member did, so it is available in the same call.
+    trigger:          Optional[str] = None
+    procedure:        Optional[str] = None
+
+
+class SkillMemberRemoveIn(BaseModel):
+    # No `confirmed` flag on purpose. Adding a member buries a memory in Blue;
+    # removing one restores it. The gate belongs on the destructive direction.
+    member_addresses: List[str]
+
+
 class RecallIn(BaseModel):
     prompt:       str
     top_k:        int  = 10
@@ -577,9 +596,13 @@ def _link_parent(skill_id, parent_id):
         return f"not linked: {e}"
 
 
-def _index_skill(skill_id, trigger, procedure):
+def _index_skill(skill_id, trigger, procedure, replace_keywords=False):
     """
     Make a skill retrievable: embed it and link it into the Keyword graph.
+
+    replace_keywords=True is for re-indexing after the text changed: the old
+    wording's terms are dropped first, so a rewritten procedure stops matching
+    prompts about what it used to say.
 
     Best-effort and never raises. A skill that fails to index is still a
     perfectly good skill, it is just invisible until /skills/reindex catches
@@ -600,7 +623,8 @@ def _index_skill(skill_id, trigger, procedure):
 
     try:
         terms = ingest.extract_keywords(text)
-        keyworded = n4j.link_skill_keywords(skill_id, terms)
+        keyworded = n4j.link_skill_keywords(skill_id, terms,
+                                           replace=replace_keywords)
     except Exception as e:
         log.warning("Skill keyword linking failed for %s: %s", skill_id, e)
 
@@ -2144,6 +2168,119 @@ def reindex_skills():
     return {"status": "reindexed", "count": len(done), "skills": done,
             "note": ("Nothing needed indexing." if not done else
                      "These skills are now retrievable through /recall.")}
+
+
+# ───────────────────────────────────────────
+#  PHASE 13.3 -- SKILL GROWTH
+# ───────────────────────────────────────────
+#
+# A skill could be created and destroyed and never edited. Adding one memory
+# meant /uncrystallize followed by /crystallize, which returns a different
+# skill_id with invocation_count back at zero -- so the record of which skills
+# actually get used was the price of growing one. It also could not run at all
+# while an active child extended the skill, which made the tree something you
+# had to take apart to change anything underneath it.
+#
+# The human gate is exactly the gate on /crystallize, for exactly the same
+# reason: adding a member demotes a real memory to Blue. Removing one is not
+# gated the same way -- it restores a memory rather than burying it, and the
+# asymmetry is deliberate.
+
+
+@app.post("/skills/{skill_id}/members")
+def add_skill_members(skill_id: str, body: SkillMembersIn,
+                      x_mmu_source: Optional[str] = Header(None)):
+    """
+    Add memories to an existing skill, keeping its id, history and tree edges.
+
+    Optionally rewrites trigger/procedure in the same call and re-indexes, so
+    a skill that grows can say what it now covers. Requires confirmed=true:
+    this demotes memories to Blue, same as crystallizing.
+    """
+    _guard_model_write(x_mmu_source)
+
+    resolved, why = n4j.resolve_skill_id(skill_id)
+    if not resolved:
+        raise HTTPException(404, why)
+
+    if not body.confirmed:
+        raise HTTPException(
+            400,
+            "Refusing to add members without confirmed=true. This demotes the "
+            "named memories to Blue and is not something to trigger by accident."
+        )
+
+    info, why = n4j.add_skill_members(resolved, body.member_addresses)
+    if not info:
+        raise HTTPException(400, why)
+
+    # The v2 index mirrors colour, and the added memories were just demoted.
+    # Same follow-up /crystallize does -- an index that still calls them Green
+    # keeps offering them through expansion, which is the half of the demotion
+    # that actually affects retrieval.
+    for addr in info["added"]:
+        try:
+            mmu.v2_index.set_color(addr, "Blue")
+        except Exception as e:
+            log.warning("v2 index colour update failed for %s: %s", addr, e)
+    # Colour alone cannot carry this -- a member and an archived memory are
+    # both Blue and must age differently. Without the flag an added member
+    # would keep ageing and keep pairing, so growing a skill would quietly
+    # produce members less compressed than the ones it was created with.
+    mmu.v2_index.set_skill_member(info["added"], True)
+
+    reindexed = None
+    if body.trigger is not None or body.procedure is not None:
+        updated, why_text = n4j.update_skill_text(
+            resolved, trigger=body.trigger, procedure=body.procedure)
+        if not updated:
+            # The membership change is already committed and correct. A failed
+            # text edit is reported, not raised -- rolling the members back
+            # over it would undo the part that worked.
+            info["text_update"] = f"not applied: {why_text}"
+        else:
+            info["trigger"]   = updated["trigger"]
+            info["procedure"] = updated["procedure"]
+            reindexed = _index_skill(resolved, updated["trigger"],
+                                     updated["procedure"], replace_keywords=True)
+
+    return {"status": "members_added", **info,
+            **({"reindexed": reindexed} if reindexed else {}),
+            "note": ("Skill id, invocation_count and tree edges are unchanged. "
+                     "Members are demoted to Blue and restored by "
+                     "POST /skills/{id}/members/remove.")}
+
+
+@app.post("/skills/{skill_id}/members/remove")
+def remove_skill_members(skill_id: str, body: SkillMemberRemoveIn):
+    """
+    Take memories back out of a skill and restore their pre-skill colour.
+
+    Refuses to remove the last member -- that is /uncrystallize, which also
+    deletes the Skill rather than leaving one that can still be matched with
+    nothing behind it.
+    """
+    resolved, why = n4j.resolve_skill_id(skill_id)
+    if not resolved:
+        raise HTTPException(404, why)
+
+    info, why = n4j.remove_skill_members(resolved, body.member_addresses)
+    if not info:
+        raise HTTPException(400, why)
+
+    for row in info["removed"]:
+        try:
+            mmu.v2_index.set_color(row["address"], row["color"])
+        except Exception as e:
+            log.warning("v2 index colour restore failed for %s: %s",
+                        row["address"], e)
+    # Only the ones actually restored. `still_demoted` are still owned by
+    # another active skill and stay compressed, the same asymmetry this
+    # endpoint already applies to colour.
+    mmu.v2_index.set_skill_member([r["address"] for r in info["removed"]], False)
+
+    return {"status": "members_removed", **info}
+
 
 
 @app.get("/meta_skill_candidates")

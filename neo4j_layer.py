@@ -1974,6 +1974,294 @@ def uncrystallize_skill(skill_id):
 
 
 # ═════════════════════════════════════════════
+#  PHASE 13.3 — SKILL GROWTH
+# ═════════════════════════════════════════════
+#
+# Crystallization could create a skill and delete a skill, and nothing in
+# between. crystallize_skill() always CREATEs, and it refuses any memory an
+# active skill already owns -- so the only way to add a fourth memory to a
+# three-memory skill was to uncrystallize it and build it again.
+#
+# That round trip is not a rebuild, it is a replacement. It mints a new
+# skill_id, resets invocation_count to zero, discards created_at, drops the
+# embedding and the keyword edges, and cannot run at all while an active child
+# extends the skill -- so the tree has to be dismantled first. A skill that
+# earned seven invocations came back claiming none, and the honest record of
+# which skills are actually used was the thing being destroyed to add one
+# memory.
+#
+# Measured on the graph this was written against: all twelve skills held
+# exactly three members, the min_cluster floor. Not one had grown past its
+# birth size, because nothing could make it.
+#
+# These two functions are the missing middle. Membership changes; identity,
+# history and tree position do not.
+
+
+def add_skill_members(skill_id, member_addresses):
+    """
+    Add memories to an existing skill. ONE transaction, all-or-nothing.
+
+    The validation is deliberately the same as crystallize_skill()'s, because
+    the hazards are the same ones: addresses go stale between reading a list
+    and acting on it, and a memory owned by two active skills has two
+    disagreeing opinions about what colour it should be when either is undone.
+
+    Returns (info, None) or (None, reason) with nothing half-applied.
+
+    Re-adding a memory this skill already owns is a no-op, not an error --
+    reported in `already_members` so a caller that sent a superset sees what
+    actually changed rather than a failure it has to interpret.
+    """
+    driver = get_driver()
+    if driver is None:
+        return None, "no database connection"
+    if not member_addresses:
+        return None, "no member addresses given"
+
+    member_addresses = list(dict.fromkeys(member_addresses))
+
+    try:
+        with driver.session() as s:
+            rec = s.run("""
+                MATCH (sk:Skill {skill_id: $sid})
+                RETURN sk.status AS status, sk.trigger AS trigger
+            """, sid=skill_id).single()
+            if not rec:
+                return None, "no such skill"
+            if rec["status"] == "deprecated":
+                return None, (
+                    "that skill is deprecated. Adding members would demote them "
+                    "to Blue and bury them under a skill nothing can match -- "
+                    "which is the exact state uncrystallize_skill() exists to "
+                    "get out of."
+                )
+
+            def _tx(tx):
+                live = [r["a"] for r in tx.run("""
+                    MATCH (m:Memory) WHERE m.address IN $addrs
+                    RETURN m.address AS a
+                """, addrs=member_addresses)]
+                if len(live) != len(member_addresses):
+                    missing = [a for a in member_addresses if a not in live]
+                    raise ValueError(
+                        f"{len(missing)} of {len(member_addresses)} member "
+                        f"addresses matched no memory: {', '.join(missing)}. "
+                        "MMU addresses are rewritten in place when a memory is "
+                        "recalled, so a stale address is the usual cause -- "
+                        "re-read the skill's members and send the addresses "
+                        "they have now."
+                    )
+
+                # Owned by a DIFFERENT active skill. This skill's own members
+                # are excluded: re-sending one is the no-op above, not a
+                # conflict with itself.
+                taken = [r["a"] for r in tx.run("""
+                    MATCH (m:Memory)-[:PROCEDURALIZED_FROM]->(sk:Skill)
+                    WHERE m.address IN $addrs
+                      AND sk.skill_id <> $sid
+                      AND sk.status <> 'deprecated'
+                    RETURN DISTINCT m.address AS a
+                """, addrs=member_addresses, sid=skill_id)]
+                if taken:
+                    raise ValueError(
+                        f"{len(taken)} memory(ies) already belong to another "
+                        f"active skill: {', '.join(taken)}. Remove them from "
+                        "that skill first, or uncrystallize it -- retrying "
+                        "this call will fail identically every time."
+                    )
+
+                existing = {r["a"] for r in tx.run("""
+                    MATCH (m:Memory)-[:PROCEDURALIZED_FROM]->(:Skill {skill_id: $sid})
+                    WHERE m.address IN $addrs
+                    RETURN m.address AS a
+                """, addrs=member_addresses, sid=skill_id)}
+                fresh = [a for a in member_addresses if a not in existing]
+
+                if fresh:
+                    tx.run("""
+                        MATCH (sk:Skill {skill_id: $sid})
+                        MATCH (m:Memory) WHERE m.address IN $addrs
+                        MERGE (m)-[:PROCEDURALIZED_FROM]->(sk)
+                        // Same coalesce as crystallize_skill: keep the ORIGINAL
+                        // colour if this memory was ever demoted before, so an
+                        // undo restores what it actually was rather than Blue.
+                        SET m.pre_skill_color = coalesce(m.pre_skill_color, m.color),
+                            m.color           = 'Blue'
+                    """, sid=skill_id, addrs=fresh)
+
+                    tx.run("""
+                        MATCH (m:Memory) WHERE m.address IN $addrs
+                        REMOVE m.skill_candidate_id
+                    """, addrs=fresh)
+
+                total = tx.run("""
+                    MATCH (m:Memory)-[:PROCEDURALIZED_FROM]->(:Skill {skill_id: $sid})
+                    RETURN count(DISTINCT m) AS n
+                """, sid=skill_id).single()["n"]
+                return fresh, sorted(existing), int(total)
+
+            added, already, total = s.execute_write(_tx)
+
+        log.info("Added %d memories to skill %s (now %d members)",
+                 len(added), skill_id, total)
+        return {
+            "skill_id":        skill_id,
+            "trigger":         rec["trigger"],
+            "added":           added,
+            "already_members": already,
+            "member_count":    total,
+        }, None
+    except Exception as e:
+        log.warning(f"add_skill_members failed (nothing applied): {e}")
+        return None, str(e)
+
+
+def remove_skill_members(skill_id, member_addresses):
+    """
+    Take memories back out of a skill and restore their colour.
+
+    Refuses to remove the last member. A Skill with no root system is a claim
+    with no evidence behind it -- still matchable, still delivered, and no
+    longer traceable to anything that justified it. Emptying a skill is what
+    uncrystallize_skill() is for, and it says so rather than leaving the caller
+    to discover the difference.
+
+    A memory another active skill still owns stays Blue and keeps its recorded
+    colour, reported in `still_demoted` -- restoring it would contradict the
+    skill that still claims it. Same rule uncrystallize_skill() applies.
+
+    Returns (info, None) or (None, reason).
+    """
+    driver = get_driver()
+    if driver is None:
+        return None, "no database connection"
+    if not member_addresses:
+        return None, "no member addresses given"
+
+    member_addresses = list(dict.fromkeys(member_addresses))
+
+    try:
+        with driver.session() as s:
+            if not s.run("MATCH (sk:Skill {skill_id:$sid}) RETURN count(sk) AS n",
+                         sid=skill_id).single()["n"]:
+                return None, "no such skill"
+
+            def _tx(tx):
+                rows = [dict(r) for r in tx.run("""
+                    MATCH (m:Memory)-[rel:PROCEDURALIZED_FROM]->(sk:Skill {skill_id: $sid})
+                    WHERE m.address IN $addrs
+                    OPTIONAL MATCH (m)-[:PROCEDURALIZED_FROM]->(other:Skill)
+                    WHERE other.skill_id <> $sid AND other.status <> 'deprecated'
+                    WITH m, count(other) AS others
+                    RETURN m.address AS address,
+                           m.pre_skill_color AS pre,
+                           m.pre_skill_color IS NULL AS guessed,
+                           others > 0 AS still_owned
+                """, sid=skill_id, addrs=member_addresses)]
+
+                found = {r["address"] for r in rows}
+                not_members = [a for a in member_addresses if a not in found]
+                if not_members:
+                    raise ValueError(
+                        f"{len(not_members)} address(es) are not members of this "
+                        f"skill: {', '.join(not_members)}. Addresses are rewritten "
+                        "on recall -- re-read the skill's members and use the "
+                        "addresses it reports now."
+                    )
+
+                total = tx.run("""
+                    MATCH (m:Memory)-[:PROCEDURALIZED_FROM]->(:Skill {skill_id: $sid})
+                    RETURN count(DISTINCT m) AS n
+                """, sid=skill_id).single()["n"]
+                if len(found) >= int(total):
+                    raise ValueError(
+                        f"that would remove all {total} members and leave the "
+                        "skill with no root system. Use uncrystallize to retire "
+                        "the skill itself, which also deletes the Skill node "
+                        "instead of leaving one that can still be matched and "
+                        "delivered with nothing behind it."
+                    )
+
+                tx.run("""
+                    MATCH (m:Memory)-[rel:PROCEDURALIZED_FROM]->(:Skill {skill_id: $sid})
+                    WHERE m.address IN $addrs
+                    DELETE rel
+                """, sid=skill_id, addrs=member_addresses)
+
+                restore = [r for r in rows if not r["still_owned"]]
+                for r in restore:
+                    tx.run("""
+                        MATCH (m:Memory {address: $a})
+                        SET m.color = $c
+                        REMOVE m.pre_skill_color
+                    """, a=r["address"], c=r["pre"] or "Green")
+
+                return rows, restore, int(total) - len(found)
+
+            rows, restore, remaining = s.execute_write(_tx)
+
+        log.info("Removed %d memories from skill %s (%d remain)",
+                 len(rows), skill_id, remaining)
+        return {
+            "skill_id":       skill_id,
+            "removed":        [{"address": r["address"], "color": r["pre"] or "Green"}
+                               for r in restore],
+            "still_demoted":  [r["address"] for r in rows if r["still_owned"]],
+            "colors_guessed": [r["address"] for r in restore if r["guessed"]],
+            "member_count":   remaining,
+        }, None
+    except Exception as e:
+        log.warning(f"remove_skill_members failed (nothing applied): {e}")
+        return None, str(e)
+
+
+def update_skill_text(skill_id, trigger=None, procedure=None):
+    """
+    Rewrite a skill's trigger and/or procedure in place.
+
+    Growth without this is half an operation: a skill that gains a fourth
+    member usually needs its procedure to say so, and the only way to change
+    that text used to be the same uncrystallize-and-rebuild that loses the
+    skill's identity.
+
+    Returns (changed_fields, None) or (None, reason). The caller re-indexes --
+    the embedding and keyword edges are derived from this text, and leaving
+    them pointing at the old wording makes the skill retrievable by what it
+    used to say.
+    """
+    driver = get_driver()
+    if driver is None:
+        return None, "no database connection"
+
+    sets, params = [], {"sid": skill_id}
+    if trigger is not None and str(trigger).strip():
+        sets.append("sk.trigger = $trigger")
+        params["trigger"] = str(trigger).strip()
+    if procedure is not None and str(procedure).strip():
+        sets.append("sk.procedure = $procedure")
+        params["procedure"] = str(procedure).strip()
+    if not sets:
+        return None, "nothing to update"
+
+    try:
+        with driver.session() as s:
+            rec = s.run(f"""
+                MATCH (sk:Skill {{skill_id: $sid}})
+                SET {', '.join(sets)}
+                RETURN sk.trigger AS trigger, sk.procedure AS procedure
+            """, **params).single()
+            if not rec:
+                return None, "no such skill"
+        return {"trigger": rec["trigger"], "procedure": rec["procedure"],
+                "changed": [s.split("=")[0].strip().split(".")[1] for s in sets]}, None
+    except Exception as e:
+        log.warning(f"update_skill_text failed: {e}")
+        return None, str(e)
+
+
+
+# ═════════════════════════════════════════════
 #  PHASE 13.2 — SKILL DELIVERY
 # ═════════════════════════════════════════════
 #
@@ -2013,7 +2301,7 @@ def write_skill_embedding(skill_id, vector):
         return False
 
 
-def link_skill_keywords(skill_id, terms):
+def link_skill_keywords(skill_id, terms, replace=False):
     """
     Link a Skill into the same Keyword graph memories use.
 
@@ -2021,6 +2309,13 @@ def link_skill_keywords(skill_id, terms):
     rather than a parallel vocabulary: a skill about dimensional relativity and
     a memory about dimensional relativity should match the same term, or the
     keyword gate would need to learn about skills as a special case.
+
+    replace=True drops the skill's existing HAS_KEYWORD edges first. This
+    function only ever MERGEd, which is right when indexing a new skill and
+    wrong when re-indexing one whose procedure was rewritten: the terms from
+    the old wording stay linked, and the skill keeps matching prompts about
+    text it no longer contains. Default stays False so existing callers
+    behave exactly as before.
     """
     driver = get_driver()
     if driver is None or not terms:
@@ -2028,6 +2323,11 @@ def link_skill_keywords(skill_id, terms):
     try:
         n = 0
         with driver.session() as s:
+            if replace:
+                s.run("""
+                    MATCH (sk:Skill {skill_id: $sid})-[r:HAS_KEYWORD]->(:Keyword)
+                    DELETE r
+                """, sid=skill_id)
             for term in terms:
                 term = (term or "").strip().lower()
                 if not term:
