@@ -84,6 +84,51 @@ hottest path, and the removal of code that could not run.
 
 ### Fixed
 
+- **Crystallizing a cluster now actually relieves the recall bias it was built to
+  relieve.** The roadmap's stated purpose is that a hot path *converts* into a Routine
+  "rather than accumulating recall-weight without bound forever," and the README says the
+  un-biasing is worth more than the compression. Nothing was wired to either claim.
+
+  `write_recall_edges()` paired Blue like any other colour -- the comment read *"Include
+  if Green/Yellow/Blue"* -- and it runs from `mmu.recall()` **before** the endpoint knows
+  which skills matched, so the substitution was invisible to the graph no matter what
+  recall delivered. `bump_corecall()`, the index's mirror of those edges, did the same.
+  A crystallized cluster went on thickening its own CO_RECALLED edges on every recall,
+  exactly as if it had never been compressed. On the graph this was found on, **two of
+  the three highest-degree hubs were crystallized members**, at 36 and 35 connections.
+
+  Members are now excluded from co-recall *pairing* in both tiers. They are not excluded
+  from recall: a member is still a direct keyword hit and still surfaces. It just stops
+  making its own cluster denser every time it does. `RECALLED_IN` is still written --
+  "this surfaced during this session" stays true, and it is episodic history rather than
+  the weight that biases retrieval. The Skill records the delivery through
+  `invocation_count`, which is where that signal belongs.
+
+- **A crystallized memory no longer climbs back out of compression on its first keyword
+  hit.** `_age_memories()` promotes Blue to Yellow when a memory is recalled, which is
+  right for an archived memory -- warm, just back from the archive -- and wrong for a
+  Routine member, which is Blue for an entirely different reason. The tier-1 keyword gate
+  has no colour filter, so members are recalled directly and were promoted straight back
+  into shortcut expansion and co-recall pairing. The graph this was found on reported 36
+  members against 34 Blue: two had already leaked out.
+
+  Colour could not carry the distinction, so the v2 index card gained a `skill_member`
+  flag, set by every crystallize path and cleared by every reverse. Members are now
+  skipped by the aging pass entirely rather than having their colour pinned, which also
+  stops their addresses being rewritten -- and that matters more than it looks, because a
+  Routine's member list *is* a list of addresses, and rewriting them underneath it is what
+  makes `/crystallize` report members that "matched no memory".
+
+  `POST /index_repair` reconciles the flag as a third kind of drift, `MISFILED`, alongside
+  `MISSING` and `PHANTOM`. Every member crystallized before the flag existed is in that
+  state, so this is a repair rather than an assumption of a fresh graph. It refuses to
+  unflag anything when the graph cannot be read, rather than treating "could not ask" as
+  "no members".
+
+  `write_recall_edges()` also stopped asking Neo4j for each recalled address separately --
+  it was one round trip per address on the path that runs on every recall. Colour and
+  membership now come back in a single query.
+
 - **CI ran no tests on a pull request that changed only code or tests.** The
   suite was a job inside `release.yml`, whose `pull_request` trigger is scoped
   by a paths filter listing what goes into a binary -- `packaging/**`, the
