@@ -4,7 +4,7 @@ A persistent, structured memory system for local and cloud language models.
 
 MMU gives a model long-term memory that survives across conversations: it stores what it
 learns as a graph, retrieves by keyword *and* by meaning, and lets memories strengthen or
-fade with use. It connects to any MCP-capable client — Claude, LM Studio, and others — and
+fade with use. It connects to any MCP-capable client Claude, LM Studio, and others and
 runs entirely on your own machine.
 
 ---
@@ -23,7 +23,7 @@ runs entirely on your own machine.
   searchable with page-level provenance. Reference material never ages.
 - **Proactive suggestions.** Recall can carry a small "you might also want" list drawn
   from connections across different domains.
-- **Routines.** Memories that cluster densely can be crystallized into a `Routine` node —
+- **Routines.** Memories that cluster densely can be crystallized into a `Routine` node
   with human confirmation, never automatically.
 
 Everything runs locally. See [Privacy](#privacy).
@@ -48,7 +48,7 @@ supplies the model.
 Linux; `host.docker.internal` is wired up explicitly in `docker-compose.yml` so it
 resolves on plain Docker Engine too, not just Docker Desktop. The host-side scripts are
 Python and platform-agnostic. Development and day-to-day use so far has been on Windows,
-so that's the path with the most hours on it -- macOS and Linux should be clean, but if
+so that's the path with the most hours on it.  MacOS and Linux should be clean, but if
 you hit something, please open an issue, since a report is the only way it gets found.
 
 ---
@@ -78,7 +78,7 @@ containers, waits for the self-check to pass, and merges MMU into your chat
 client's MCP config without disturbing any other server you have configured.
 
 There is a second binary, `mmu-mcp`. Put it next to `mmu-setup` before running
-setup and the installer will wire your client to it — which means the MCP bridge
+setup and the installer will wire your client to it. Which means the MCP bridge
 no longer needs Python on your machine at all.
 
 The binaries are not code-signed, so Windows SmartScreen and macOS Gatekeeper
@@ -96,7 +96,7 @@ mmu-setup stop       # stop; memories stay on the volumes
 
 `doctor` is the one worth knowing. It checks Docker, the project files, `.env`,
 the embedding endpoint's *actual* dimension against the configured one, the
-server, and whether your chat clients are registered — and reports all of them,
+server, and whether your chat clients are registered and reports all of them,
 rather than stopping at the first failure. Paste its output into a bug report and
 most of the obvious questions are already answered.
 
@@ -136,7 +136,7 @@ Start it:
 docker compose up -d
 ```
 
-Then check the log — MMU prints a self-check on every start:
+Then check the log - MMU prints a self-check on every start:
 
 ```bash
 docker compose logs mmu-server | grep -A10 "MMU self-check"
@@ -154,7 +154,7 @@ MMU self-check
   Empty graph -- this is a fresh install.
 ```
 
-If those last two numbers disagree, stop and fix it — see
+If those last two numbers disagree, stop and fix it. See
 [Troubleshooting](#troubleshooting).
 
 ---
@@ -164,7 +164,7 @@ If those last two numbers disagree, stop and fix it — see
 The MCP bridge runs on your machine rather than inside the container.
 
 If you are using the packaged `mmu-mcp` binary, it has no dependencies and
-`mmu-setup connect` has already registered it — skip to
+`mmu-setup connect` has already registered it and skip to
 [Giving the model web search](#giving-the-model-web-search). Otherwise install
 the bridge's dependencies:
 
@@ -189,14 +189,14 @@ MMU speaks [MCP](https://modelcontextprotocol.io). Point your client at
 That gives the model four tools: `get_session_context` (call first, loads the
 bundle), `recall_memory`, `save_memory`, and `rate_memory`.
 
-Use `python3` instead of `python` if that's what your system calls it — on most macOS and
+Use `python3` instead of `python` if that's what your system calls it. On most macOS and
 Linux installs, bare `python` either isn't on `PATH` or points at Python 2. Both `command`
 and the path in `args` are passed straight to your MCP client, so an absolute path to the
 interpreter (a virtualenv's, say) works and is the more reliable choice.
 
 ### Giving the model web search
 
-MMU does not browse, and shouldn't — it's a memory system. Run a search MCP server
+MMU does not browse, and shouldn't, it's a memory system. Run a search MCP server
 *alongside* it and let the model do its own reading, then save what it judges worth
 keeping. `mcp_config_example.json` in this repo shows both wired together using
 [duckduckgo-mcp-server](https://github.com/nickclyde/duckduckgo-mcp-server) (MIT, no API
@@ -288,7 +288,7 @@ What MMU does about it:
 - Every web memory carries its source URL, so anything odd is traceable.
 - Private and loopback addresses are refused, redirects are not followed, responses are
   size-capped, and only HTML/plain text is parsed. Without those, `/ingest` would be a
-  way to make MMU fetch and store things only MMU can reach — its own `/export`, your
+  way to make MMU fetch and store things only MMU can reach its own `/export`, your
   database, or a cloud metadata endpoint.
 
 **Prefer having your model read a page and save its own summary** over storing raw page
@@ -304,7 +304,7 @@ to do), stored as one node and delivered instead of its source memories.
 
 > **Why "Routine" and not "Skill".** This was called a Skill until v0.1.2. That collided
 > with [Agent Skills](https://modelcontextprotocol.io), the `SKILL.md` files a person
-> writes to tell a model how to do something — and since MMU is an MCP server usually
+> writes to tell a model how to do something and since MMU is an MCP server usually
 > attached to a model that also has those, both meanings arrived in one context window at
 > once. They are near-opposites: an Agent Skill is authored by a human and lives in a
 > file; a Routine is *emergent*, derived by compressing memories that kept surfacing
@@ -319,14 +319,14 @@ to do), stored as one node and delivered instead of its source memories.
 
 The source memories are **never deleted**. They are demoted to Blue and become the
 routine's root system: still there, still findable directly, no longer competing in every
-recall. On a graph where one large corpus dominates, that is the point — the compression
+recall. On a graph where one large corpus dominates, that is the point the compression
 is worth less than the un-biasing.
 
 Concretely, a member stops accumulating co-recall weight. It is still a direct keyword hit
 and still surfaces; it just stops making its own cluster denser every time it does, and it
 stays compressed rather than warming back out of Blue the way an archived memory is meant
 to. The Routine records the delivery instead, through its invocation count. That feedback
-loop is what the un-biasing actually is — without it, crystallizing changes what gets
+loop is what the un-biasing actually is without it, crystallizing changes what gets
 *delivered* while the graph goes on tilting further toward the same cluster.
 
 **Nothing crystallizes on its own.** The idle daemon looks for dense, coherent clusters
@@ -342,7 +342,7 @@ python mmu_review.py --sweep            # look for new candidates now
 ```
 
 Confirming shows exactly which memories will be demoted and requires you to type
-`CRYSTALLIZE`. You write the trigger and the procedure — nothing else does.
+`CRYSTALLIZE`. You write the trigger and the procedure. Nothing else does.
 
 Everything is reversible:
 
@@ -355,7 +355,7 @@ proposal to the queue.
 
 A Routine can also **grow** without being rebuilt. Adding a memory used to mean
 uncrystallizing and crystallizing again, which returns a different id with its invocation
-count back at zero — so the record of which Routines actually get used was the price of
+count back at zero. So the record of which Routines actually get used was the price of
 extending one, and a Routine with children could not be touched at all without taking the
 tree apart first.
 
@@ -375,7 +375,7 @@ curl -X POST "http://127.0.0.1:8765/skills/<skill_id>/members/remove" \
 The id, the invocation count and the tree edges survive both. Adding takes the same
 `confirmed: true` gate as crystallizing, because it demotes real memories; removing does
 not, because it restores them. Removing the *last* member is refused and points you at
-uncrystallize — a Routine with no root system is still matchable and still delivered, with
+uncrystallize, a Routine with no root system is still matchable and still delivered, with
 nothing left to trace it back to. Rewriting the trigger or procedure re-indexes the
 Routine and drops the old wording's keywords, so it stops matching prompts about text it
 no longer contains.
@@ -397,8 +397,8 @@ reverse routines itself. **Off by default, and the default is the recommendation
 that drafts a proposal can then approve its own draft, and the review stops being a
 review. It is enforced server-side, not merely by hiding the tool.
 
-Useful for testing the whole loop, and the reason reversal is available to the model too
-— being able to create without being able to undo is the worse half to hand out.
+Useful for testing the whole loop, and the reason reversal is available to the model too.  
+Being able to create without being able to undo is the worse half to hand out.
 
 ---
 
@@ -409,7 +409,7 @@ system. Nothing is uploaded, phoned home, or shared.
 
 The only outbound network calls MMU makes are to the endpoints **you** configure in
 `.env`: your embeddings endpoint (`MMU_EMBEDDING_BASE`) and, if you run the optional idle
-daemon, your model endpoint. This is verifiable — `neo4j_layer.py`, `light_index_v2.py`
+daemon, your model endpoint. This is verifiable that `neo4j_layer.py`, `light_index_v2.py`
 and `ingest.py` make no network calls at all, and `mmu_server.py` makes exactly two, both
 in `EmbeddingClient`.
 
@@ -429,7 +429,7 @@ To remove everything including the database itself: `docker compose down -v`.
 
 ## Security
 
-MMU binds to **`127.0.0.1` only** by default — the API on 8765, and Neo4j's browser (7474)
+MMU binds to **`127.0.0.1` only** by default and the API on 8765, and Neo4j's browser (7474)
 and bolt (7687) ports. Nothing is reachable from your network unless you change
 `MMU_BIND`.
 
@@ -439,7 +439,7 @@ memories. Two things follow:
 
 - **CORS is disabled** (`MMU_CORS_ORIGINS` empty). Without this, any website you visited
   could read `/export` or call `/forget_all` against your own machine from the browser.
-  Only enable it if you build a browser UI, and then list exact origins — never `*`.
+  Only enable it if you build a browser UI, and then list exact origins, never `*`.
 - **If you ever set `MMU_BIND=0.0.0.0`, set `MMU_API_KEY` too.** Never one without the
   other. With a key set, every endpoint except `/health` requires
   `X-MMU-Key: <key>` or `Authorization: Bearer <key>`.
@@ -472,7 +472,7 @@ worth knowing early:
 ## Changing your database password
 
 `NEO4J_PASS` in `.env` is applied **only when Neo4j first initializes an empty data
-directory.** Editing it later does nothing to an existing database — the password stays
+directory.** Editing it later does nothing to an existing database and the password stays
 what it was, and MMU then fails to connect because `.env` and the database disagree.
 
 To rotate it on a database that already has data, change it *inside* Neo4j first:
@@ -495,7 +495,7 @@ first `docker compose up` and it is applied at initialization.
 
 > Early commits in this repository's history contain `mmupassword`, the placeholder used
 > during development. It was only ever a local container credential, it has been rotated,
-> and every install generates its own from `.env` — but if you are forking this, set your
+> and every install generates its own from `.env` but if you are forking this, set your
 > own password rather than that one.
 
 ---
@@ -511,7 +511,7 @@ docker compose logs mmu-server | grep -A10 "MMU self-check"
 ```
 
 If "Actual dim" differs from "Configured dim", set `MMU_EMBEDDING_DIM` to the actual
-value, then rebuild the index — vectors from different models are not comparable:
+value, then rebuild the index and vectors from different models are not comparable:
 
 ```bash
 docker exec mmu-neo4j cypher-shell -u neo4j -p YOUR_PASS "DROP INDEX memory_embedding"
@@ -525,7 +525,7 @@ Your embedding server is running but wants an API token. LM Studio can require o
 (Developer → server settings). Either set `MMU_EMBEDDING_API_KEY` in `.env`, or turn the
 token requirement off.
 
-Nothing is lost while this is broken — saves still succeed, recall falls back to
+Nothing is lost while this is broken as saves still succeed, recall falls back to
 keyword-only, and `POST /backfill_embeddings` embeds whatever was missed once it's fixed.
 
 **"Embedding backend UNREACHABLE"**
@@ -534,7 +534,7 @@ MMU runs inside Docker, so `localhost` in `MMU_EMBEDDING_BASE` means *the contai
 your machine. Use `http://host.docker.internal:1234/v1`. Also confirm your embedding
 server is actually running and has a model loaded.
 
-Recall still works without it, keyword-only, and saves still succeed — memories just go
+Recall still works without it, keyword-only, and saves still succeed but memories just go
 un-embedded until you run `/backfill_embeddings`.
 
 **"required variable NEO4J_PASS is missing a value"**
@@ -543,7 +543,7 @@ You skipped `cp .env.example .env`, or didn't set the password in it.
 
 **Memories are disappearing / going dormant**
 
-They aren't deleted — they've aged to Blue, which is dormant, not gone. Recall brings them
+They aren't deleted, they've aged to Blue, which is dormant, not gone. Recall brings them
 back. If it's happening too aggressively, raise `MMU_ARCHIVE_MIN_DAYS`.
 
 **Checking overall health**
@@ -575,7 +575,7 @@ Useful for testing without touching your real memories. Use a different project 
 distinct ports and volumes:
 
 Clone to a separate directory, then in its `.env` override the ports **and the
-container names** — Docker container names are global, so a different compose
+container names**. Docker container names are global, so a different compose
 project name is not enough on its own:
 
 ```
@@ -609,7 +609,7 @@ before it reaches a container. The **live** tests hit a running server and skip
 themselves automatically when nothing is listening.
 
 **The live tests default to port 8766, not 8765.** They write memories, and every
-`/recall` they make ages every memory it *doesn't* return — Green to Yellow, and far
+`/recall` they make ages every memory it *doesn't* return Green to Yellow, and far
 enough to Blue. So a bare `pytest tests/` runs the pure tier and skips the live tier
 unless a throwaway instance is listening on 8766:
 
@@ -642,13 +642,13 @@ own `read_ms` alongside full round-trip time. Standard library only:
 python mmu_recall_speed_test.py --prompts "my dog" "the thing I decided last week"
 ```
 
-Replace the default prompts with ones that actually hit your graph — a latency probe for
+Replace the default prompts with ones that actually hit your graph. A latency probe for
 something you never stored is measuring a miss. Keep the set fixed after that, so runs
 stay comparable to each other.
 
 It refuses by default to fire more `/recall` calls than `MMU_ARCHIVE_THRESH`, because
 recall ages every memory it *doesn't* return, and a big burst can archive conversational
-memories as a side effect. That is not hypothetical — it happened twice during earlier
+memories as a side effect. That is not hypothetical. It happened twice during earlier
 validation runs, which is why the guard is there.
 
 ---
@@ -719,7 +719,7 @@ sequenceDiagram
 ```
 
 That last step is the one that surprises people: recall is **not** side-effect-free. Every
-call ages the memories it did not return, which is how disuse is measured — and why the
+call ages the memories it did not return, which is how disuse is measured and why the
 test suite and the benchmark harness both refuse to run against a graph you care about.
 
 ### Remember and ingest
@@ -828,7 +828,7 @@ flowchart LR
 ```
 
 Two things this is meant to make obvious. **The idle daemon is the only component that
-talks to a chat model** — the server itself calls nothing but `/v1/embeddings`. And
+talks to a chat model** the server itself calls nothing but `/v1/embeddings`. And
 `./documents` is mounted read-only, so `/ingest` can read your originals and cannot reach
 outside that directory or modify anything in it.
 
@@ -846,7 +846,7 @@ What it buys is the part that isn't storage. MMU's behaviour is mostly *edges*:
 between fuzzy-matched keywords, the density-of-cluster calculation that nominates a group
 of memories for crystallization into a Routine, and the parent/child structure of the
 routine tree itself. Those are traversals over a graph that changes shape as you use it.
-In SQLite they'd be recursive CTEs over a join table, hand-maintained — writable, but the
+In SQLite they'd be recursive CTEs over a join table, hand-maintained, writable, but the
 schema would end up being a graph database with extra steps, and the crystallization
 sweep is the piece that would suffer most.
 
@@ -874,7 +874,7 @@ first ones that exist.
 
 The design point worth knowing before the results land: one of the baselines is flat
 vector search over **the same embeddings MMU uses**, with the graph switched off. The gap
-between that and MMU is what the graph layer is actually worth — the `CO_RECALLED`
+between that and MMU is what the graph layer is actually worth. The `CO_RECALLED`
 weights, the keyword gate, the routines. If there's no gap, there's no gap, and that gets
 published too. A benchmark that can only flatter the thing it measures isn't one.
 
@@ -909,7 +909,7 @@ reader doesn't have to go find it.
   `max(existing)+1`, which handed the same number back out if the highest-numbered memory
   was deleted. They now come from a monotonic `:Counter` node that is never recomputed
   from the population. An existing graph seeds that counter from its current maximum on
-  first run, so nothing gets renumbered — but any collision that already happened before
+  first run, so nothing gets renumbered but any collision that already happened before
   you upgraded stays. Those are detectable (group by the CON segment of the address and
   look for counts above one) and not repairable: nothing records which memory held the
   number first, so there is no principled way to decide which one keeps it. The
@@ -926,8 +926,8 @@ reader doesn't have to go find it.
   not per conversation, so `/session_resume` reflects one call's memories, not a whole
   chat's.
 - **Emotion/valence rating is mostly unused.** The schema is live and `/rate` works, but
-  most memories are never rated, so anything that leans on valence -- negative-memory
-  weighting, mood-aware retrieval -- is currently running on sparse data.
+  most memories are never rated, so anything that leans on valence, negative-memory
+  weighting, mood-aware retrieval is currently running on sparse data.
 - **Temporal pattern detection needs real elapsed time to say anything.** It's implemented
   and was validated against a graph with months of real usage behind it. A fresh install
   won't have anything interesting to report here for a while, and that's expected, not
