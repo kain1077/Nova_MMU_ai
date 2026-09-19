@@ -1721,3 +1721,164 @@ def test_aging_survives_an_unreachable_graph(monkeypatch, tmp_path):
 
     assert set(core.v2_index.shortcut_cache) == set(before), (
         "index moved despite the graph writing nothing")
+
+
+# ═════════════════════════════════════════════════════════════
+#  Backend refusals say what the backend said
+# ═════════════════════════════════════════════════════════════
+
+def test_backend_error_reads_the_nested_llama_cpp_body():
+    """
+    Session summaries were placeholders for days because raise_for_status()
+    reports "400 Client Error: Bad Request for url: ..." and drops the body --
+    and the body is the only place the token counts appear.
+
+    The awkward part is the shape: llama.cpp-backed servers return a JSON
+    document nested inside a string, behind a prose prefix, so the parser
+    cannot test whether the value starts with a brace.
+    """
+    import json as _json
+    import mmu_idle_daemon as d
+    inner = _json.dumps({"error": {
+        "code": 400,
+        "message": "request (8810 tokens) exceeds the available context size "
+                   "(8192 tokens), try increasing it",
+        "type": "exceed_context_size_error",
+        "n_prompt_tokens": 8810,
+        "n_ctx": 8192}})
+    body = _json.dumps({"error": "Engine protocol predict request returned 400: " + inner})
+
+    e = d._backend_error(400, body)
+    assert e.overflow is True
+    assert e.n_prompt == 8810 and e.n_ctx == 8192
+    assert "8810 tokens" in e.message
+    assert "Engine protocol" not in e.message, "the inner message is the specific one"
+
+
+def test_backend_error_distinguishes_overflow_from_other_faults():
+    """
+    Overflow is the one a caller can act on by sending less. A missing model or
+    a dead server does not get better when retried smaller, so mislabelling one
+    as the other buys a pointless retry loop.
+    """
+    import json as _json
+    import mmu_idle_daemon as d
+    body = _json.dumps({"error": {"message": 'Invalid model identifier "".',
+                                  "code": "model_not_found"}})
+    e = d._backend_error(400, body)
+    assert e.overflow is False
+    assert "Invalid model identifier" in e.message
+
+
+@pytest.mark.parametrize("body", ["", "Internal Server Error", "{not json",
+                                  '{"detail":[{"msg":"bad"}]}'])
+def test_backend_error_never_raises_on_a_body_it_cannot_read(body):
+    """An unparseable body is still a body worth reporting."""
+    import mmu_idle_daemon as d
+    e = d._backend_error(500, body)
+    assert e.status == 500
+    assert isinstance(e.message, str)
+
+
+def test_context_length_ignores_the_embedding_model():
+    """
+    The embedding model is loaded for most of the server's life -- every recall
+    uses it -- and reports a 2048 window. Counting it as a chat candidate
+    collapsed the prompt budget to the floor at every depth: a deep pass
+    assembled 2043 characters and called it context.
+
+    "Assume the smallest loaded window" is the right rule. It just has to be
+    the smallest window something could actually reason in.
+    """
+    import mmu_idle_daemon as d
+
+    class FakeResp:
+        status_code = 200
+        @staticmethod
+        def json():
+            return {"data": [
+                {"id": "chat-big",  "state": "loaded",     "type": "vlm",
+                 "loaded_context_length": 176640},
+                {"id": "embedder",  "state": "loaded",     "type": "embeddings",
+                 "loaded_context_length": 2048},
+                {"id": "chat-idle", "state": "not-loaded", "type": "llm",
+                 "loaded_context_length": 131072},
+            ]}
+
+    llm = d.LMStudioClient(base="http://127.0.0.1:1/v1", model="local-model")
+    real = d.requests.get
+    d.requests.get = lambda *a, **k: FakeResp()
+    try:
+        assert llm.context_length() == 176640, "the embedder must not set the budget"
+    finally:
+        d.requests.get = real
+
+
+def test_context_length_keeps_every_loaded_model_when_types_are_absent():
+    """
+    Only backends that say what a model IS get filtered. One that reports no
+    type keeps the old behaviour rather than having a guess applied to it.
+    """
+    import mmu_idle_daemon as d
+
+    class FakeResp:
+        status_code = 200
+        @staticmethod
+        def json():
+            return {"data": [
+                {"id": "a", "state": "loaded", "loaded_context_length": 8192},
+                {"id": "b", "state": "loaded", "loaded_context_length": 32768},
+            ]}
+
+    llm = d.LMStudioClient(base="http://127.0.0.1:1/v1", model="local-model")
+    real = d.requests.get
+    d.requests.get = lambda *a, **k: FakeResp()
+    try:
+        assert llm.context_length() == 8192, "smallest loaded, as before"
+    finally:
+        d.requests.get = real
+
+
+def test_halving_a_transcript_leaves_the_system_message_alone():
+    """
+    The system message carries the JSON shape the reply has to match. Trimming
+    it would trade a prompt that does not fit for a reply that cannot parse.
+    """
+    import mmu_idle_daemon as d
+    system = {"role": "system", "content": "Reply with ONLY JSON: {...}"}
+    user   = {"role": "user", "content": "turn text. " * 500}
+    out = d._halve_transcript_message([system, user])
+    assert out[0] == system
+    assert len(out[1]["content"]) < len(user["content"])
+    assert "trimmed to fit" in out[1]["content"]
+
+
+def test_halving_reports_nothing_left_to_cut():
+    """
+    The shrink loop has to terminate. A message already small enough returns
+    None so the caller re-raises instead of retrying an identical request.
+    """
+    import mmu_idle_daemon as d
+    assert d._halve_transcript_message([{"role": "user", "content": "hi"}]) is None
+    assert d._halve_transcript_message([{"role": "system", "content": "x" * 5000}]) is None
+
+
+def test_prompt_budget_reserves_room_for_tools_and_the_reply():
+    """
+    The window covers the prompt, the tool schemas sent beside it, and the
+    tokens reserved for the reply. Budgeting only the first is what let a
+    prompt that "fit" get rejected on arrival.
+    """
+    import mmu_idle_daemon as d
+
+    class Fake:
+        def __init__(self, n): self.n = n
+        def context_length(self): return self.n
+
+    small = d._prompt_char_budget(Fake(8192))
+    big   = d._prompt_char_budget(Fake(176640))
+    assert small < big
+    assert small <= (8192 - d.MAX_TOKENS - d.TOOL_SCHEMA_RESERVE) * d.CHARS_PER_TOKEN
+    assert big == d.IDLE_MAX_CHARS, "a large window is capped by the char ceiling"
+    assert d._prompt_char_budget(Fake(None)) is None, "unknown context keeps the default"
+    assert d._prompt_char_budget(Fake(512)) == 2000, "an unusable window still returns a floor"
