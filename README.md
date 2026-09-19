@@ -186,8 +186,15 @@ MMU speaks [MCP](https://modelcontextprotocol.io). Point your client at
 }
 ```
 
-That gives the model four tools: `get_session_context` (call first, loads the
-bundle), `recall_memory`, `save_memory`, and `rate_memory`.
+That gives the model five tools: `get_session_context` (call first, loads the bundle),
+`recall_memory`, `save_memory`, `rate_memory`, and `review_routines` — which is read-only,
+and reports what is sitting in the crystallization queue without being able to act on it.
+
+Four more exist and are **not** registered by default: `crystallize_routine`,
+`link_routine`, `unlink_routine` and `uncrystallize_routine` appear only when
+`MMU_ALLOW_MODEL_CRYSTALLIZE=true`. They restructure memory, so they are also refused
+server-side rather than merely hidden from the tool list — see
+[Letting a model do it](#letting-a-model-do-it).
 
 Use `python3` instead of `python` if that's what your system calls it. On most macOS and
 Linux installs, bare `python` either isn't on `PATH` or points at Python 2. Both `command`
@@ -392,10 +399,13 @@ active child cannot be deleted out from under it.
 
 ### Letting a model do it
 
-`MMU_ALLOW_MODEL_CRYSTALLIZE=true` gives your model tools to review, create, branch and
-reverse routines itself. **Off by default, and the default is the recommendation:** a model
-that drafts a proposal can then approve its own draft, and the review stops being a
-review. It is enforced server-side, not merely by hiding the tool.
+`MMU_ALLOW_MODEL_CRYSTALLIZE=true` gives your model tools to create, branch and reverse
+routines itself. Reviewing is not part of that bargain and never was: `review_routines` is
+always registered, because reading the queue changes nothing.
+
+**Off by default, and the default is the recommendation:** a model that drafts a proposal
+can then approve its own draft, and the review stops being a review. It is enforced
+server-side, not merely by hiding the tool.
 
 Useful for testing the whole loop, and the reason reversal is available to the model too.  
 Being able to create without being able to undo is the worse half to hand out.
