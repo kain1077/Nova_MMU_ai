@@ -111,6 +111,29 @@ MAX_TOKENS    = int(os.environ.get("MMU_IDLE_MAX_TOKENS",   "1200"))
 # json_schema still reasons first. So this has to clear the reasoning floor
 # with room to spare, not be sized to the visible answer.
 SUMMARY_MAX_TOKENS = int(os.environ.get("MMU_SESSION_SUMMARY_MAX_TOKENS", "4000"))
+
+# How many times a session summary may halve its transcript when the backend
+# says the prompt does not fit. Two halvings take a 40-turn transcript to a
+# quarter, which has cleared every real overflow seen so far; past that the
+# summary would be describing so little of the conversation that a placeholder
+# is the more honest answer.
+SUMMARY_SHRINK_TRIES = int(os.environ.get("MMU_SESSION_SUMMARY_SHRINK_TRIES", "2"))
+
+# Ceiling on the assembled cognition prompt. Matches /idle_prompt's own default
+# so behaviour is unchanged when the backend will not report a context length;
+# when it will, the real window wins and this is only the upper bound.
+IDLE_MAX_CHARS = int(os.environ.get("MMU_IDLE_MAX_CHARS", "24000"))
+
+# Characters per token, for sizing a prompt against a context measured in
+# tokens. English prose runs about 4; this context is denser than prose --
+# addresses, JSON, GRP codes -- and guessing high is the failure that produces
+# a 400, so the estimate leans low on purpose.
+CHARS_PER_TOKEN = float(os.environ.get("MMU_CHARS_PER_TOKEN", "3.0"))
+
+# Tokens to hold back from the prompt budget for the tool schemas, which are
+# sent alongside it on every cognition pass and are not small -- save_memory
+# alone carries the whole GRP taxonomy in its description.
+TOOL_SCHEMA_RESERVE = int(os.environ.get("MMU_TOOL_SCHEMA_RESERVE", "1500"))
 LOG_PATH      = os.environ.get("MMU_IDLE_LOG", "mmu_idle_daemon.log")
 
 DEFAULT_THRESHOLDS = {
@@ -384,12 +407,15 @@ class MMUClient:
     def health(self):
         return self._get("/health", timeout=10)
 
-    def idle_prompt(self, depth, include_maintenance=True):
+    def idle_prompt(self, depth, include_maintenance=True, max_chars=None):
         # Generous timeout: this runs the full Phase 6 maintenance pass first.
-        return self._get("/idle_prompt",
-                         params={"depth": depth,
-                                 "include_maintenance": str(include_maintenance).lower()},
-                         timeout=120)
+        params = {"depth": depth,
+                  "include_maintenance": str(include_maintenance).lower()}
+        # Only sent when the caller worked one out from a real context length;
+        # otherwise /idle_prompt keeps its own default and nothing changes.
+        if max_chars:
+            params["max_chars"] = str(int(max_chars))
+        return self._get("/idle_prompt", params=params, timeout=120)
 
     def remember(self, content, keywords, grp_code, priority, depth):
         return self._post("/remember", {
@@ -461,6 +487,103 @@ class MMUClient:
 #  LM STUDIO CLIENT
 # ─────────────────────────────────────────────
 
+class LMStudioError(RuntimeError):
+    """
+    A backend refusal, with the backend's own explanation attached.
+
+    This exists because raise_for_status() does not have one. It produces
+    "400 Client Error: Bad Request for url: http://127.0.0.1:1234/v1/chat/
+    completions" and discards the response body -- and the body is where the
+    server says things like "request (8810 tokens) exceeds the available
+    context size (8192 tokens)". Session summaries failed that way for days
+    and the log could only report that something, somewhere, was bad.
+    """
+
+    def __init__(self, status, message, *, overflow=False, n_prompt=None, n_ctx=None):
+        super().__init__(message)
+        self.status   = status
+        self.message  = message
+        self.overflow = overflow      # context window exceeded, not a real fault
+        self.n_prompt = n_prompt      # tokens the server counted, when it said
+        self.n_ctx    = n_ctx         # room it had, when it said
+
+
+def _backend_error(status, body_text):
+    """
+    Dig the human-readable failure out of an OpenAI-compatible error body.
+
+    Two shapes turn up. The simple one is an error object with a message field.
+    The awkward one comes from llama.cpp-backed servers, which nest a whole
+    JSON document inside the message STRING, behind a prose prefix -- so the
+    useful part is a level further down than the first shape, and it cannot be
+    found by testing whether the value starts with a brace.
+
+    Rather than parse the nesting exactly -- a third shape would break that
+    again -- pull the innermost "message" found anywhere, and fall back to the
+    raw text when there is none. An unreadable body still beats no body.
+    """
+    msg, n_prompt, n_ctx = (body_text or "").strip()[:500], None, None
+    try:
+        payload = json.loads(body_text)
+        found = []
+
+        def embedded(text):
+            """The JSON hiding inside a string, or None."""
+            i, j = text.find("{"), text.rfind("}")
+            if i == -1 or j <= i:
+                return None
+            try:
+                return json.loads(text[i:j + 1])
+            except Exception:
+                return None
+
+        def walk(node, depth=0):
+            if depth > 8:                            # cycles are impossible in
+                return                               # JSON, runaway nesting is not
+            if isinstance(node, dict):
+                for k, v in node.items():
+                    if k == "message" and isinstance(v, str):
+                        found.append(v)
+                        inner = embedded(v)
+                        if inner is not None:
+                            walk(inner, depth + 1)
+                    elif k == "n_prompt_tokens" and isinstance(v, int):
+                        found.append(("prompt", v))
+                    elif k == "n_ctx" and isinstance(v, int):
+                        found.append(("ctx", v))
+                    else:
+                        walk(v, depth + 1)
+            elif isinstance(node, list):
+                for v in node:
+                    walk(v, depth + 1)
+            elif isinstance(node, str):
+                inner = embedded(node)
+                if inner is not None:
+                    walk(inner, depth + 1)
+
+        walk(payload)
+        texts = [f for f in found if isinstance(f, str)]
+        if texts:
+            msg = texts[-1]                          # innermost is the specific one
+        for tag, val in [f for f in found if isinstance(f, tuple)]:
+            if tag == "prompt":
+                n_prompt = val
+            else:
+                n_ctx = val
+    except Exception:
+        pass    # a body we cannot parse is still a body worth reporting
+
+    # The overflow case is worth naming because it is the one the caller can
+    # actually do something about -- send less -- as opposed to a missing model
+    # or a dead server, where retrying smaller changes nothing.
+    low = msg.lower()
+    overflow = ("exceed_context_size" in low
+                or "context size" in low
+                or "context length" in low
+                or "too many tokens" in low)
+    return LMStudioError(status, msg, overflow=overflow, n_prompt=n_prompt, n_ctx=n_ctx)
+
+
 class LMStudioClient:
     """
     OpenAI-compatible chat client. LM Studio, Ollama's OpenAI shim, llama.cpp
@@ -492,6 +615,59 @@ class LMStudioClient:
         except Exception:
             return False
 
+    def context_length(self):
+        """
+        How much room the backend actually has, or None if it will not say.
+
+        Worth asking, because MMU_IDLE_MODEL defaults to the placeholder
+        "local-model" and LM Studio resolves that to whichever model happens to
+        be loaded first. Two models loaded at once can mean a 176k window on
+        one pass and an 8k window on the next, for the same config and the same
+        prompt -- which is what made the session-summary 400s look intermittent
+        and unrelated to size.
+
+        Uses LM Studio's native /api/v0/models, which reports load state and
+        the context length the model was actually loaded with (not its maximum).
+        Other OpenAI-compatible backends do not serve this; they get None and
+        the char-budget fallback, exactly as before.
+        """
+        try:
+            root = self.base[:-3] if self.base.endswith("/v1") else self.base
+            r = requests.get(f"{root}/api/v0/models", headers=self._headers(), timeout=5)
+            if r.status_code != 200:
+                return None
+            models = r.json().get("data") or []
+            loaded = [m for m in models if m.get("state") == "loaded"]
+            # Exclude anything that cannot answer a chat request. The embedding
+            # model is loaded for most of the server's life -- every recall uses
+            # it -- and reports a 2048 window, so counting it as a candidate
+            # collapses the budget to its floor for every depth: a deep pass
+            # assembling 2043 characters and calling it context. "Assume the
+            # smallest loaded window" is the right rule; it just has to be the
+            # smallest window something could actually reason in.
+            #
+            # Only filtered when the backend says what a model is. A backend
+            # that reports no type keeps the old behaviour rather than having a
+            # guess applied to it.
+            typed = [m for m in loaded if m.get("type")]
+            if typed:
+                loaded = [m for m in typed
+                          if m.get("type") not in ("embeddings", "embedding")]
+            if not loaded:
+                return None
+            # Match the configured name when it is real. When it is the
+            # "local-model" placeholder, the backend picks the first loaded
+            # model, so assume the smallest loaded window rather than the
+            # first: guessing high here is what produces the 400.
+            named = [m for m in loaded if m.get("id") == self.model]
+            pool  = named or loaded
+            lens  = [m.get("loaded_context_length") or m.get("max_context_length")
+                     for m in pool]
+            lens  = [n for n in lens if isinstance(n, int) and n > 0]
+            return min(lens) if lens else None
+        except Exception:
+            return None
+
     def chat(self, messages, tools=None, max_tokens=MAX_TOKENS, timeout=600):
         payload = {
             "messages":    messages,
@@ -505,7 +681,11 @@ class LMStudioClient:
 
         r = requests.post(f"{self.base}/chat/completions", json=payload,
                           headers=self._headers(), timeout=timeout)
-        r.raise_for_status()
+        if r.status_code >= 400:
+            # Not raise_for_status(): see LMStudioError. The body is the only
+            # place the backend says WHY, and every caller above this wants to
+            # know -- one of them can fix an overflow by sending less.
+            raise _backend_error(r.status_code, r.text)
         return r.json()
 
 
@@ -541,7 +721,8 @@ def run_pass(depth, mmu, llm, dry_run=False):
 
     # ── Step 1: maintenance + prompt assembly (server side) ──
     try:
-        bundle = mmu.idle_prompt(depth, include_maintenance=True)
+        bundle = mmu.idle_prompt(depth, include_maintenance=True,
+                                 max_chars=_prompt_char_budget(llm))
     except Exception as e:
         log.error("Could not fetch idle prompt: %s", e)
         result["error"] = f"idle_prompt failed: {e}"
@@ -613,6 +794,20 @@ def run_pass(depth, mmu, llm, dry_run=False):
             log.warning("Hit MAX_TOOL_ROUNDS (%d) -- ending pass", MAX_TOOL_ROUNDS)
 
         result["ok"] = True
+
+    except LMStudioError as e:
+        # Separated from the generic handler below so an overflow reads as the
+        # sizing problem it is. A deep pass assembles far more context than a
+        # light one, so this is the failure that shows up as "cognition works
+        # in the morning and not at night" when a bigger pass comes due.
+        if e.overflow:
+            log.error("Model call did not fit the backend's context: %s. The %s "
+                      "prompt is too large for the model currently loaded -- load "
+                      "one with a larger context, or lower MMU_IDLE_MAX_CHARS.",
+                      e.message, depth)
+        else:
+            log.error("Model call failed (HTTP %s): %s", e.status, e.message)
+        result["error"] = e.message
 
     except Exception as e:
         log.error("Model call failed: %s", e)
@@ -925,6 +1120,58 @@ def parse_conversation_transcript(path, max_turns=40, max_chars_per_turn=800):
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
 
+def _prompt_char_budget(llm):
+    """
+    Characters of cognition prompt the loaded model can actually take, or None
+    to leave /idle_prompt on its own default.
+
+    The window has to cover three things, not one: the prompt, the tool schemas
+    sent beside it, and the tokens reserved for the reply. Budgeting only the
+    first is what let a prompt that "fit" get rejected on arrival.
+    """
+    ctx = llm.context_length()
+    if not ctx:
+        return None
+    usable = ctx - MAX_TOKENS - TOOL_SCHEMA_RESERVE
+    if usable <= 0:
+        # A window this small cannot run a pass at all. Return the floor and
+        # let the backend say so in its own words rather than silently sending
+        # something guaranteed to fail.
+        return 2000
+    return max(2000, min(IDLE_MAX_CHARS, int(usable * CHARS_PER_TOKEN)))
+
+
+def _halve_transcript_message(messages):
+    """
+    Return `messages` with the transcript cut roughly in half, or None if there
+    is nothing left worth cutting.
+
+    Only the user message is touched: the system message carries the JSON shape
+    the reply has to match, and trimming that would trade a prompt that does
+    not fit for a reply that cannot be parsed.
+
+    Keeps the head and the tail and drops the middle, the same shape
+    /idle_prompt uses when it trims. A conversation's opening sets the subject
+    and its end is where it landed; the part most safely lost is in between.
+    """
+    out, cut_any = [], False
+    for m in messages:
+        if m.get("role") != "user" or not isinstance(m.get("content"), str):
+            out.append(m)
+            continue
+        text = m["content"]
+        if len(text) < 800:          # already small; the overflow is elsewhere
+            out.append(m)
+            continue
+        keep = len(text) // 2
+        head = text[: int(keep * 0.6)]
+        tail = text[-int(keep * 0.4):]
+        marker = "\n\n  [...transcript trimmed to fit the model's context...]\n\n"
+        out.append({**m, "content": head + marker + tail})
+        cut_any = True
+    return out if cut_any else None
+
+
 def _message_text(message):
     """Plain text of an OpenAI-style chat message, tolerating list content."""
     content = (message or {}).get("content")
@@ -1199,12 +1446,41 @@ class IdleLoop:
             log.warning("Session-close attempt for %s failed: %s", session_id[:8], e)
 
     def _summary_call(self, messages, max_tokens):
-        """One session-summary completion. Returns the choice dict."""
+        """
+        One session-summary completion, shrinking the transcript if the backend
+        says it will not fit. Returns the choice dict.
+
+        The overflow retry has to shrink the PROMPT, not the reply budget. The
+        caller's other retry doubles max_tokens when reasoning eats the answer,
+        which is right for that failure and exactly wrong for this one -- a
+        window that was already too small does not get better by reserving more
+        of it for output. Those two retries pulling in opposite directions is
+        why a session could fail, retry, and fail again inside 20ms.
+
+        Halving is deliberately crude. The backend counts tokens with a
+        tokenizer this process does not have, so any precise estimate here
+        would be a guess with more arithmetic in it; halving converges in a
+        couple of steps and stops at a floor rather than looping.
+        """
         # ~64 tok/s locally, and the budget is mostly reasoning: a full
         # 4000-token generation is a minute-plus, the retry twice that.
-        resp = self.llm.chat(messages, tools=None,
-                             max_tokens=max_tokens, timeout=300)
-        return (resp.get("choices") or [{}])[0]
+        attempt = list(messages)
+        for shrink in range(SUMMARY_SHRINK_TRIES + 1):
+            try:
+                resp = self.llm.chat(attempt, tools=None,
+                                     max_tokens=max_tokens, timeout=300)
+                return (resp.get("choices") or [{}])[0]
+            except LMStudioError as e:
+                if not e.overflow or shrink == SUMMARY_SHRINK_TRIES:
+                    raise
+                attempt = _halve_transcript_message(attempt)
+                if attempt is None:
+                    raise
+                sized = (f" ({e.n_prompt} tokens into {e.n_ctx})"
+                         if e.n_prompt and e.n_ctx else "")
+                log.warning("  summary did not fit%s -- retrying on half the transcript",
+                            sized)
+        raise RuntimeError("unreachable")     # loop always returns or raises
 
     def _close_session(self, session_id):
         """
@@ -1237,16 +1513,37 @@ class IdleLoop:
         try:
             messages = [{"role": "system", "content": system},
                         {"role": "user", "content": user}]
+            # Reserving output tokens takes them out of the same window the
+            # prompt has to fit in, so the reply budget cannot be chosen
+            # independently of the model actually loaded. 4000 is fine against
+            # a 176k window and is half of an 8k one -- and "local-model"
+            # resolves to whichever of those happens to be loaded first.
+            ctx    = self.llm.context_length()
             budget = SUMMARY_MAX_TOKENS
+            if ctx and budget > ctx // 3:
+                budget = max(512, ctx // 3)
+                log.info("  backend context is %d tokens -- summary budget %d",
+                         ctx, budget)
             choice = self._summary_call(messages, budget)
 
             # Ran out of room before saying anything: the reasoning ate the
             # budget. One retry at double, then we take what we can salvage.
+            #
+            # Capped against the same window. Doubling blind is how this retry
+            # used to turn a summary that merely ran long into a hard 400 --
+            # the reply budget grew until the prompt no longer fit beside it.
             if (choice.get("finish_reason") == "length"
                     and not _message_text(choice.get("message")).strip()):
-                log.warning("  summary hit the %d-token budget before answering -- retrying at %d",
-                            budget, budget * 2)
-                choice = self._summary_call(messages, budget * 2)
+                retry_budget = budget * 2
+                if ctx:
+                    retry_budget = min(retry_budget, max(512, ctx // 2))
+                if retry_budget > budget:
+                    log.warning("  summary hit the %d-token budget before answering -- retrying at %d",
+                                budget, retry_budget)
+                    choice = self._summary_call(messages, retry_budget)
+                else:
+                    log.warning("  summary hit the %d-token budget and the context "
+                                "(%s) leaves no room to retry larger", budget, ctx)
 
             message = choice.get("message")
             raw = _message_text(message)
@@ -1279,6 +1576,18 @@ class IdleLoop:
             if prose:
                 summary_text = prose[:1000]
                 log.warning("  session summary was not JSON (%s) -- keeping the prose reply", e)
+            elif isinstance(e, LMStudioError) and e.overflow:
+                # Say what to change. This is a config problem, not a fault:
+                # the transcript was shrunk as far as it is allowed to go and
+                # still did not fit, which means the loaded window is too
+                # small for the job rather than that anything went wrong.
+                log.warning("  session summary did not fit the model's context "
+                            "even trimmed (%s). Load a model with a larger "
+                            "context, or lower MMU_SESSION_SUMMARY_MAX_TOKENS / "
+                            "the transcript size. Using placeholder.", e.message)
+            elif isinstance(e, LMStudioError):
+                log.warning("  session summary generation failed (HTTP %s): %s. "
+                            "Using placeholder.", e.status, e.message)
             else:
                 log.warning("  session summary generation failed, using placeholder: %s", e)
 
@@ -1415,6 +1724,21 @@ def main():
 
     log.info("MMU idle daemon | mmu=%s | lmstudio=%s | model=%s",
              MMU_BASE, LMSTUDIO_BASE, IDLE_MODEL)
+
+    # Say the window out loud at startup. Everything that went wrong here was
+    # invisible precisely because nothing ever reported which model the
+    # placeholder name resolved to or how much room it had.
+    _ctx = llm.context_length()
+    if _ctx:
+        log.info("Backend context: %d tokens | prompt budget %s chars",
+                 _ctx, _prompt_char_budget(llm))
+        if IDLE_MODEL == "local-model":
+            log.info("MMU_IDLE_MODEL is the 'local-model' placeholder, so the "
+                     "backend picks the model. Set it to a real id to stop the "
+                     "window changing under you when more than one is loaded.")
+    else:
+        log.info("Backend does not report a context length -- using the "
+                 "%d-char prompt default.", IDLE_MAX_CHARS)
 
     # Fail fast and clearly if the MMU server is not up.
     try:
