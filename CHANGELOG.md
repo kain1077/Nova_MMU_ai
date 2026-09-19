@@ -12,6 +12,48 @@ hottest path, and the removal of code that could not run.
 
 ### Added
 
+- **The session bundle stops growing with the artifact backlog.**
+  `/creative_outputs/mark_seen` had no caller anywhere in the system. Every artifact
+  an idle pass ever wrote stayed `presented_to_user=false` forever, so `/session_bundle`
+  re-served the same growing backlog to every conversation, and the ones past its
+  `limit=10` were never surfaced at all. On the graph this was found on: 19 artifacts
+  queued, 0 ever marked, and an artifact block of 14,681 characters inside a 17,441
+  character bundle -- 84% of everything the model read before the first user word, and
+  the only part of it without a bound.
+
+  Two halves, and both were needed. Someone has to ring the bell: both bridges now mark
+  artifacts seen when `get_session_context` is *called*, not when the bundle is
+  prefetched. An `initialize` handshake fires when LM Studio spawns the process, which
+  is not the same event as a human reading anything, so a health probe or a window
+  opened and closed must not consume the queue. `/session_bundle` returns `surfaced_ids`
+  so the caller marks exactly what was rendered -- marking "all unseen" instead would
+  burn the artifacts still waiting behind the cap, taking them from unread to
+  never-shown-and-flagged-read.
+
+  And the block has to be a digest: three artifacts, title and opening line, capped by
+  `MMU_BUNDLE_ARTIFACT_MAX` and `MMU_BUNDLE_ARTIFACT_CHARS`. The crystallization block
+  directly below it already caps itself at three on the reasoning that a wall trains the
+  reader to scroll past the whole thing; that reasoning always applied here too.
+
+  Measured after the change on a seeded instance: a 950-character bundle where the same
+  content produced thousands, with the queue behind the cap intact and drained three at
+  a time per conversation.
+
+- **`GET /creative_outputs/{output_id}` and a `read_artifact` MCP tool.** The recovery
+  path that makes the digest honest -- cutting the block to openers is only a compression
+  if the rest is still reachable, otherwise it is data loss in a nicer shape. Resolves the
+  8-character id prefix the bundle prints. An ambiguous prefix returns 404 rather than an
+  arbitrary winner, because handing back the wrong artifact silently is worse than
+  saying the id was no good.
+
+### Fixed
+
+- **A direct question is no longer buried under reflections.** `get_creative_outputs()`
+  sorts `question_for_user` ahead of everything else precisely so that cannot happen, and
+  the bundle's `reversed(unseen)` then put it back at the bottom. The two halves of that
+  intent were written in different files and cancelled out.
+
+
 - **Skills can grow.** `POST /skills/{id}/members` adds memories to an existing
   skill; `POST /skills/{id}/members/remove` takes them back out and restores their
   pre-skill colour. Crystallization could create a skill and delete one and nothing
