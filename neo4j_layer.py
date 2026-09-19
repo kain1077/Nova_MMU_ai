@@ -4501,6 +4501,51 @@ def mark_outputs_presented(output_ids=None) -> int:
         return 0
 
 
+def get_creative_output(output_id: str):
+    """
+    Phase 7 (revised): fetch one artifact in full.
+
+    Accepts a PREFIX, because the session bundle digest prints only the first
+    eight characters of the id and a model can only ask for what it was shown.
+    An ambiguous prefix returns None rather than an arbitrary winner -- handing
+    back the wrong artifact silently is worse than saying the id was no good.
+    """
+    driver = get_driver()
+    if driver is None or not output_id:
+        return None
+    try:
+        with driver.session() as s:
+            rows = s.run("""
+                MATCH (co:CreativeOutput)
+                WHERE co.output_id = $exact OR co.output_id STARTS WITH $prefix
+                OPTIONAL MATCH (co)-[:INSPIRED_BY]->(m:Memory)
+                WITH co, collect(m.address) AS inspired_by
+                RETURN co.output_id         AS output_id,
+                       co.title             AS title,
+                       co.content           AS content,
+                       co.artifact_type     AS artifact_type,
+                       co.cognition_depth   AS cognition_depth,
+                       co.created_at        AS created_at,
+                       co.presented_to_user AS presented_to_user,
+                       inspired_by
+                LIMIT 2
+            """, exact=output_id, prefix=output_id)
+            hits = [dict(r) for r in rows]
+
+        # An exact hit wins outright even if other ids share it as a prefix.
+        for h in hits:
+            if h["output_id"] == output_id:
+                return h
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            log.warning("get_creative_output: prefix %r is ambiguous", output_id)
+        return None
+    except Exception as e:
+        log.warning("get_creative_output failed: %s", e)
+        return None
+
+
 def get_idle_context(depth: str = "light") -> dict:
     """
     Phase 7: Gather the raw material an idle cognition pass reasons over.
