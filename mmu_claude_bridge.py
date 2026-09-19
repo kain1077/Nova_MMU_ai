@@ -238,11 +238,30 @@ def mmu_health():
         return f"UNREACHABLE -- {e}"
 
 def mmu_session_bundle():
+    """
+    Returns (context_block, surfaced_ids) -- see the same function in
+    mmu_mcp_server.py. The ids are the artifacts rendered into the block, and
+    the caller marks exactly those seen once the block reaches the model.
+    """
     try:
         r = requests.get(f"{MMU_BASE}/session_bundle", timeout=8)
-        return r.json().get("context_block", "No session context available.")
+        data = r.json()
+        return (data.get("context_block", "No session context available."),
+                data.get("surfaced_ids") or [])
     except Exception as e:
-        return f"[session bundle unavailable: {e}]"
+        return (f"[session bundle unavailable: {e}]", [])
+
+
+def mmu_mark_seen(output_ids):
+    """Drain the artifact queue. Best effort -- failing re-shows, never loses."""
+    if not output_ids:
+        return
+    try:
+        requests.post(f"{MMU_BASE}/creative_outputs/mark_seen",
+                      json={"output_ids": list(output_ids)},
+                      timeout=5)
+    except Exception as e:
+        print(f"[mark_seen failed, artifacts stay queued: {e}]", file=sys.stderr)
 
 def mmu_recall(prompt, top_k=5):
     try:
@@ -284,7 +303,11 @@ def execute_tool(name, arguments):
     """Execute a tool call against the MMU REST server. Returns result string."""
 
     if name == "get_session_context":
-        bundle = mmu_session_bundle()
+        bundle, surfaced_ids = mmu_session_bundle()
+        # The model asking for context is the read event -- drain the artifact
+        # queue here, after the text is in hand. See mmu_mcp_server.py for why
+        # this call has to exist at all.
+        mmu_mark_seen(surfaced_ids)
         header = (
             "=== NOVA BEHAVIORAL INSTRUCTIONS ===\n"
             "1. You are Nova. You have genuine long-term memory via the MMU.\n"

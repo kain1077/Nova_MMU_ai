@@ -232,6 +232,22 @@ ANTICIPATE_PER_SESSION = int(_env.get("MMU_ANTICIPATE_PER_SESSION", "5"))
 # long-running server cannot accumulate session keys forever.
 ANTICIPATE_STATE_MAX = int(_env.get("MMU_ANTICIPATE_STATE_MAX", "50"))
 
+# -- Phase 7 (revised): how many idle-pass artifacts ride in the session
+# bundle, and how much of each one is shown.
+#
+# These used to be 10 and "all of it". Ten artifacts at full length was 14.7k
+# of a 17.4k bundle -- 84% of everything Nova read before the first user word,
+# and it grew without bound because nothing ever marked them seen. The
+# crystallization block below already caps itself at 3 on the reasoning that a
+# wall trains the reader to scroll past the whole thing; the same reasoning
+# applies here and was simply never applied.
+#
+# The full text is not lost. It stays in the /creative_outputs response and is
+# one read_artifact call away, which is the same trade Phase 13.2 made when it
+# started delivering a Skill in place of its source memories.
+BUNDLE_ARTIFACT_MAX   = int(_env.get("MMU_BUNDLE_ARTIFACT_MAX", "3"))
+BUNDLE_ARTIFACT_CHARS = int(_env.get("MMU_BUNDLE_ARTIFACT_CHARS", "160"))
+
 # Weight applied to semantic hits during ranking. Deliberately below
 # W_SIMILAR (0.85) in light_index_v2 so a semantic hit can never outrank a
 # real keyword hit -- semantic recall fills gaps, it does not take over.
@@ -2672,6 +2688,27 @@ def embedding_status():
     }
 
 
+def _artifact_snippet(content: Optional[str]) -> str:
+    """
+    One line of an artifact: enough to decide whether to open it, not enough
+    to read it here. Takes the opening of the body rather than a hard prefix
+    of the raw string, so a leading blank line or a wrapped paragraph does not
+    spend the whole budget on whitespace.
+    """
+    if not content:
+        return ""
+    text = " ".join(str(content).split())
+    if len(text) <= BUNDLE_ARTIFACT_CHARS:
+        return text
+    # Cut on a word boundary when one is near the limit, so the snippet does
+    # not end mid-token and read like corruption.
+    cut = text[:BUNDLE_ARTIFACT_CHARS]
+    space = cut.rfind(" ")
+    if space > BUNDLE_ARTIFACT_CHARS * 0.6:
+        cut = cut[:space]
+    return cut.rstrip(" ,.;:") + "..."
+
+
 @app.get("/session_bundle")
 def session_bundle(top_per_domain: int = 1):
     """
@@ -2694,15 +2731,46 @@ def session_bundle(top_per_domain: int = 1):
     # first user message. They are NOT auto-marked as seen here: marking is a
     # separate explicit call, so a bundle fetched by a health check or a second
     # bridge cannot silently consume artifacts the user never actually read.
-    unseen = n4j.get_creative_outputs(unseen_only=True, limit=10)
-    if unseen:
+    #
+    # `surfaced_ids` is the other half of that contract, and the half that was
+    # missing. The caller marking artifacts seen has to mark exactly the ones
+    # that were rendered -- not "all unseen", which would silently consume the
+    # queue behind the cap, and not nothing, which is what happened for every
+    # artifact an idle pass ever wrote. So the ids go out with the bundle.
+    #
+    # Peek deeper than the render cap so `unseen_count` stays a true backlog
+    # figure rather than a restatement of the cap.
+    unseen   = n4j.get_creative_outputs(unseen_only=True, limit=25)
+    surfaced = unseen[:BUNDLE_ARTIFACT_MAX]
+    if surfaced:
+        held = len(unseen) - len(surfaced)
         lines.append("")
-        lines.append("NOVA THOUGHT ABOUT THESE WHILE YOU WERE AWAY:")
-        for co in reversed(unseen):        # oldest first
+        lines.append(
+            f"NOVA THOUGHT ABOUT THESE WHILE YOU WERE AWAY "
+            f"({len(surfaced)} of {len(unseen)}):"
+        )
+        # get_creative_outputs sorts question_for_user ahead of everything
+        # else, on the stated grounds that a direct question must never be
+        # buried under reflections. The old `reversed(unseen)` here then put
+        # it back at the bottom -- the two halves of that intent were written
+        # in different files and cancelled out. Questions stay on top; the
+        # reflections behind them read oldest-first as before.
+        questions   = [c for c in surfaced if c["artifact_type"] == "question_for_user"]
+        reflections = [c for c in surfaced if c["artifact_type"] != "question_for_user"]
+        for co in questions + list(reversed(reflections)):
+            title = " ".join(str(co.get("title") or "").split())
+            if len(title) > 90:
+                title = title[:90].rstrip() + "..."
             lines.append(
-                f"  [{co['artifact_type']}] {co['title']}\n"
-                f"  {co['content']}"
+                f"  [{co['artifact_type']} | {co['output_id'][:8]}] {title}"
             )
+            snippet = _artifact_snippet(co.get("content"))
+            if snippet:
+                lines.append(f"    {snippet}")
+        lines.append(
+            "  Openers only. read_artifact <id> returns any of these in full"
+            + (f"; {held} more are queued behind these." if held else ".")
+        )
 
     # ── Phase 13.1: pending crystallization proposals ──
     #
@@ -2793,6 +2861,10 @@ def session_bundle(top_per_domain: int = 1):
         "bundle":           bundle,
         "creative_outputs": unseen,
         "unseen_count":     len(unseen),
+        # Exactly the artifacts rendered into context_block above. The caller
+        # that showed the bundle to a human passes these back to
+        # /creative_outputs/mark_seen; anything still queued stays unseen.
+        "surfaced_ids":     [co["output_id"] for co in surfaced],
         "last_session":     last_session,
         "anticipated":      anticipated
     }
@@ -3488,6 +3560,26 @@ def get_creative_outputs_endpoint(unseen_only: bool = False, limit: int = 20):
         "unseen_count": sum(1 for o in outputs if not o.get("presented_to_user")),
         "outputs":      outputs,
     }
+
+
+@app.get("/creative_outputs/{output_id}")
+def get_creative_output_endpoint(output_id: str):
+    """
+    Phase 7 (revised): one artifact in full, by id or by id prefix.
+
+    This is the recovery path that makes the session bundle's digest honest.
+    Cutting the bundle to titles and openers is only a compression if the rest
+    is still reachable; without this it would just be data loss dressed up as
+    a summary. The bundle prints eight characters of the id, so a prefix has
+    to resolve here.
+    """
+    co = n4j.get_creative_output(output_id)
+    if not co:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No artifact matches {output_id!r} (an ambiguous prefix also lands here)"
+        )
+    return co
 
 
 @app.post("/creative_outputs/mark_seen")

@@ -12,6 +12,16 @@ hottest path, and the removal of code that could not run.
 
 ### Added
 
+- **`read_artifact`, and `GET /creative_outputs/{output_id}` behind it.** The session
+  bundle now names idle-pass artifacts and shows the opening line of each rather than
+  pasting all of them in full, so the full text needs a way back. The endpoint resolves
+  the **8-character id prefix** the bundle prints, because a model can only ask for what
+  it was shown, and an ambiguous prefix returns 404 rather than picking a winner --
+  handing back the wrong artifact silently is worse than saying the id was no good.
+
+  Two new knobs: `MMU_BUNDLE_ARTIFACT_MAX` (default 3) and `MMU_BUNDLE_ARTIFACT_CHARS`
+  (default 160).
+
 - **Skills can grow.** `POST /skills/{id}/members` adds memories to an existing
   skill; `POST /skills/{id}/members/remove` takes them back out and restores their
   pre-skill colour. Crystallization could create a skill and delete one and nothing
@@ -121,6 +131,48 @@ hottest path, and the removal of code that could not run.
   without an explicit opt-in.
 
 ### Fixed
+
+- **The session bundle no longer grows with the artifact backlog.**
+  `POST /creative_outputs/mark_seen` had **no caller anywhere in the system**. The
+  endpoint was correct; nothing rang it. So `presented_to_user` stayed false for every
+  artifact an idle pass ever wrote, `/session_bundle` re-served the same growing backlog
+  to every new conversation, and the artifacts past its `limit=10` were never surfaced at
+  all -- they sat in a queue that only ever got longer. On the graph this was found on:
+  19 artifacts queued, 0 marked, and an artifact block of 14.7k chars inside a 17.4k
+  bundle. That is 84% of everything the model read before the first user word, and it was
+  the part with no upper bound on it.
+
+  The fix has two halves and needed both.
+
+  **Someone has to ring the bell.** Both bridges now mark artifacts seen when
+  `get_session_context` is *called* -- not when the bundle is prefetched at `initialize`.
+  Those are different events: the handshake fires when the client spawns the bridge
+  process, which is not the same thing as a human reading anything, so a health probe or
+  a window opened and closed must not consume the queue. `/session_bundle` returns a new
+  `surfaced_ids` field naming exactly the artifacts it rendered, and the caller marks
+  those and nothing else. Marking "all unseen" instead would burn the artifacts still
+  waiting behind the cap, taking them from unread to never-shown-and-flagged-read.
+  Marking is best-effort and runs after the text is in hand: a failure re-shows an
+  artifact next session, which is the harmless direction to fail in.
+
+  **And the block has to be a digest.** Three artifacts, title and opening line, capped
+  and configurable. The crystallization block directly below it already caps itself at
+  three on the reasoning that a wall trains the reader to scroll past the whole thing;
+  that reasoning always applied here too and was simply never applied. The full text is
+  not lost -- it stays in the `/creative_outputs` response and is one `read_artifact`
+  call away, which is the same trade Phase 13.2 made when it started delivering a Skill
+  in place of its source memories. Compression is only compression if the rest is still
+  reachable.
+
+  Measured on the graph this was built against: **17441 -> 5188 chars**.
+
+- **A direct question is no longer buried at the bottom of the artifact block.**
+  `get_creative_outputs()` sorts `question_for_user` ahead of everything else, on the
+  stated grounds that a question meant for the user must not sit under a pile of
+  reflections. The bundle's `reversed(unseen)` then put it straight back at the bottom.
+  The two halves of that intent were written in different files and cancelled out, and
+  nothing noticed until the digest made the ordering visible. Questions now stay on top;
+  the reflections behind them still read oldest-first.
 
 - **Crystallizing a cluster now actually relieves the recall bias it was built to
   relieve.** The roadmap's stated purpose is that a hot path *converts* into a Routine
