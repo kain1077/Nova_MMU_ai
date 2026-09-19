@@ -1808,21 +1808,53 @@ def crystallize_skill(member_addresses, trigger, procedure, confidence=0.0):
                 # be the moment either is undone -- which is exactly how this
                 # was found: a stale proposal was confirmed twice, and undoing
                 # the second restored a member the first still owned.
-                taken = [r["a"] for r in tx.run("""
+                owners = [dict(r) for r in tx.run("""
                     MATCH (m:Memory)-[:PROCEDURALIZED_FROM]->(sk:Skill)
                     WHERE m.address IN $addrs AND sk.status <> 'deprecated'
-                    RETURN DISTINCT m.address AS a
+                    RETURN sk.skill_id AS skill_id,
+                           sk.trigger  AS trigger,
+                           collect(DISTINCT m.address) AS addrs
                 """, addrs=list(member_addresses))]
-                if taken:
-                    raise ValueError(
-                        f"{len(taken)} member(s) already belong to an active "
-                        f"skill: {', '.join(taken)}. This will fail identically "
-                        "every time until that changes -- retrying is not a "
-                        "path forward. Either uncrystallize the skill that owns "
-                        "them, or pick a different proposal; the review queue "
-                        "marks which proposals are blocked and lists the "
-                        "unblocked ones first."
+                if owners:
+                    # Name the owner, and do not suggest uncrystallizing.
+                    #
+                    # The old wording said "either uncrystallize the skill that
+                    # owns them, or pick a different proposal" without naming
+                    # which skill -- so the reader had to guess an id, and the
+                    # advice itself was the trap. Overlapping proposals are
+                    # alternatives: freeing the members lets exactly one of them
+                    # ever be crystallized, not both. A model told to
+                    # uncrystallize does so, re-crystallizes the other, hits the
+                    # same refusal from the opposite side, and loops -- which is
+                    # precisely what happened, for as long as the message
+                    # recommended it.
+                    taken = sorted({a for o in owners for a in o["addrs"]})
+                    lines = [
+                        f"{len(taken)} of these memories already belong to an "
+                        f"active skill, so this proposal cannot be crystallized "
+                        f"as it stands. Retrying it will fail identically."
+                    ]
+                    for o in owners:
+                        trig = (o.get("trigger") or "").strip()
+                        lines.append(
+                            f"  skill {o['skill_id']}"
+                            + (f" ({trig[:60]})" if trig else "")
+                            + f" owns: {', '.join(sorted(o['addrs']))}"
+                        )
+                    lines.append(
+                        "Do NOT uncrystallize to free them. Two proposals over "
+                        "the same memories are alternatives, not a queue: "
+                        "whichever you crystallize, the other stays impossible, "
+                        "so undoing and retrying only swaps which one refuses. "
+                        "To put these memories under a broader skill, crystallize "
+                        "a different proposal with `extends` set to the owning "
+                        "skill id, or link the owning skill under a parent. A "
+                        "human can also add the free members to the owning skill "
+                        "directly with POST /skills/{id}/members. The review "
+                        "queue marks which proposals are blocked, and which "
+                        "exclude each other."
                     )
+                    raise ValueError(chr(10).join(lines))
 
                 tx.run("""
                     CREATE (sk:Skill {
@@ -2814,6 +2846,263 @@ def _created_for_addresses(session, member_addresses):
 # wait for room.
 MAX_PENDING_PROPOSALS = 25
 
+# Semantic floor a MERGED cluster has to clear to be offered as one proposal.
+#
+# find_skill_candidates is a triangle query -- MATCH (a)-(b)-(c) -- so every
+# candidate it can produce has exactly three members. Clusters larger than that
+# were not rejected by the design; they were unreachable by it. Merging the
+# overlapping triples back together is what gets past three without rewriting
+# the traversal.
+#
+# Merging is also what makes the queue reviewable at all. Overlapping proposals
+# are alternatives: crystallizing one makes every proposal sharing a member
+# permanently impossible. Offered as 26 separate items, 24 of which shared
+# members with another, the queue read as a list of tasks and behaved as a
+# minefield.
+#
+# 0.45 because measured merges on a real graph landed between 0.64 and 0.86 and
+# cost only 0.03-0.07 against the fragments they replaced -- the union of
+# overlapping triples stays about as coherent as the triples themselves, which
+# is what "they share members" was evidence of in the first place. The floor is
+# here to catch the case where it does not.
+MERGE_COHERENCE_FLOOR = float(os.environ.get("MMU_MERGE_COHERENCE_FLOOR", "0.45"))
+
+# An absolute floor alone does not hold, because a growing cluster ratchets
+# through it. Each admission moves a mean taken over every pair, so the larger
+# the cluster the less any single member can shift it -- 35 triples merged into
+# one 18-member cluster spanning six domains, and no individual step ever
+# dropped below 0.45. The floor was never crossed; it was outrun.
+#
+# So growth is bounded three ways, and a merge has to satisfy all of them:
+#   FLOOR  the union is coherent in absolute terms (above)
+#   DROP   the union is not much worse than the seed it grew from, which is
+#          what actually stops the ratchet -- the comparison is against where
+#          the cluster started rather than against a constant
+#   MAX    a hard ceiling on members, because a skill is a procedure someone
+#          reads, and there is a size past which that stops being true no
+#          matter how well it scores
+MERGE_COHERENCE_DROP = float(os.environ.get("MMU_MERGE_COHERENCE_DROP", "0.08"))
+MERGE_MAX_MEMBERS    = int(os.environ.get("MMU_MERGE_MAX_MEMBERS", "8"))
+
+
+def retire_unconfirmable_proposals(session, exclude_key=None):
+    """
+    Mark pending proposals that no skill leaves any room for.
+
+    A proposal whose members were crystallized into some OTHER cluster cannot
+    be confirmed: colour is single-valued, so a memory belongs to one skill.
+    Nothing retired those, so they stayed pending and unconfirmable -- 22 of 26
+    on the graph where this was found, 14 of them with no route at all. A
+    reviewer works through that queue hitting refusal after refusal, which is
+    how the crystallize/uncrystallize loop started.
+
+    "No room" means fewer than two unclaimed members, since a skill needs two
+    sources. A proposal with two or more free members is deliberately left
+    pending: it can still be crystallized UNDER the owning skill via `extends`,
+    and that is a live option the queue should keep offering.
+
+    Returns how many were retired.
+    """
+    rec = session.run("""
+        MATCH (p:SkillProposal {status: 'pending'})
+        WHERE size(p.member_created) > 0
+          AND ($key IS NULL OR p.member_key <> $key)
+        OPTIONAL MATCH (m:Memory)-[:PROCEDURALIZED_FROM]->(sk:Skill)
+        WHERE m.created_at IN p.member_created AND sk.status <> 'deprecated'
+        WITH p, count(DISTINCT m) AS claimed
+        WHERE claimed > 0 AND size(p.member_created) - claimed < 2
+        SET p.status      = 'superseded',
+            p.updated_at  = $now,
+            p.review_note = 'Members were crystallized into another skill'
+        RETURN count(p) AS n
+    """, key=exclude_key, now=datetime.now().isoformat()).single()
+    return rec["n"] if rec else 0
+
+
+def cluster_metrics(session, member_created, ref_weight=None):
+    """
+    Score an arbitrary-size cluster the way find_skill_candidates scores a
+    triple. Returns a dict of the same quantities, or None if the members
+    cannot be resolved.
+
+    The triangle query hardcodes three of everything -- three cosines over
+    three pairs, and a CASE with one arm per way three domains can agree. None
+    of that generalises, so the same quantities are computed here for N:
+
+      semantic      mean pairwise cosine over all N*(N-1)/2 pairs, rescaled off
+                    Neo4j's 0.5-is-orthogonal convention exactly as the sweep
+                    does. Null when any member lacks an embedding -- reported,
+                    not silently treated as zero.
+      grp_coherence share of members in the cluster's most common GRP domain,
+                    which for a triple is max(domain count)/3 and is what the
+                    hardcoded CASE was computing all along.
+      avg_weight    mean CO_RECALLED weight over the edges that exist between
+                    members. Absent edges are not counted as zero: a merged
+                    cluster is not required to be a clique, and scoring it as
+                    though it should be would penalise exactly the large
+                    clusters this function exists to make possible.
+    """
+    rows = list(session.run("""
+        MATCH (m:Memory) WHERE m.created_at IN $created
+        RETURN m.address AS address, m.payload AS payload, m.color AS color,
+               m.created_at AS created_at, m.src_type AS src_type,
+               toInteger(split(m.address, '.')[2]) AS grp,
+               m.embedding IS NOT NULL AS has_emb
+        ORDER BY m.created_at
+    """, created=list(member_created)))
+    if len(rows) < 2:
+        return None
+
+    addrs = [r["address"] for r in rows]
+    grps  = [r["grp"] for r in rows if r["grp"] is not None]
+    domains = [g // 100 for g in grps]
+    grp_coh = (max((domains.count(d) for d in set(domains)), default=0) / len(domains)
+               if domains else 0.0)
+
+    sem = None
+    if all(r["has_emb"] for r in rows):
+        rec = session.run("""
+            MATCH (m:Memory) WHERE m.created_at IN $created
+            WITH collect(m) AS ms
+            UNWIND range(0, size(ms) - 2) AS i
+            UNWIND range(i + 1, size(ms) - 1) AS j
+            RETURN avg(vector.similarity.cosine(ms[i].embedding,
+                                                ms[j].embedding)) AS raw
+        """, created=list(member_created)).single()
+        raw = rec["raw"] if rec else None
+        if raw is not None:
+            sem = max(0.0, min(1.0, (float(raw) - 0.5) * 2))
+
+    rec = session.run("""
+        MATCH (a:Memory)-[r:CO_RECALLED]-(b:Memory)
+        WHERE a.created_at IN $created AND b.created_at IN $created
+          AND a.address < b.address
+        RETURN avg(r.weight) AS w
+    """, created=list(member_created)).single()
+    avg_w = float(rec["w"]) if rec and rec["w"] is not None else 0.0
+
+    src_mix = {}
+    for r in rows:
+        if r["src_type"] is None:
+            continue
+        label = SOURCE_LABELS.get(r["src_type"], f"Type-{r['src_type']}")
+        src_mix[label] = src_mix.get(label, 0) + 1
+
+    return {
+        "members":            addrs,
+        "member_created":     [r["created_at"] for r in rows],
+        "previews":           [(r["payload"] or "")[:90] for r in rows],
+        "grps":               grps,
+        "colors":             [r["color"] for r in rows],
+        "src_mix":            src_mix,
+        "avg_weight":         round(avg_w, 3),
+        "grp_coherence":      round(grp_coh, 3),
+        "semantic_coherence": (round(sem, 3) if sem is not None else None),
+    }
+
+
+def merge_overlapping_candidates(session, candidates, ref_weight,
+                                 floor=MERGE_COHERENCE_FLOOR):
+    """
+    Fold candidates that share a member into larger candidates, and return a
+    set of clusters no two of which share a memory.
+
+    Two triples sharing a memory are not two pieces of work. Only one of them
+    can ever be crystallized -- colour is single-valued, so the first to claim
+    a member locks every other cluster containing it out permanently. Offered
+    separately they produce a queue whose items silently cancel each other, and
+    a reader working through it hits a refusal that looks repairable and is not.
+
+    Disjointness is the contract, not a side effect. A cluster is grown,
+    emitted, and then every remaining candidate that still touches it is
+    DROPPED rather than offered -- because once that cluster is crystallized
+    those candidates are unconfirmable, and listing them would recreate the
+    problem this exists to remove.
+
+    Growth is greedy from the strongest remaining candidate and bounded by
+    MERGE_COHERENCE_FLOOR, MERGE_COHERENCE_DROP and MERGE_MAX_MEMBERS together;
+    see those constants for why one bound is not enough. Greedy and not optimal
+    on purpose: components here are small, and choosing between partitions that
+    score within noise of each other is not worth the machinery.
+
+    Safe on a candidate list with no overlaps at all -- each comes back
+    unchanged.
+    """
+    if not candidates:
+        return []
+
+    stamps = [set(str(t) for t in (c.get("member_created") or [])) for c in candidates]
+    order  = sorted(range(len(candidates)),
+                    key=lambda i: -float(candidates[i].get("skill_score", 0.0)))
+    remaining = list(order)
+    out, merges, dropped = [], 0, 0
+
+    while remaining:
+        seed = remaining[0]
+        current = set(stamps[seed])
+        absorbed = 1
+
+        seed_m   = cluster_metrics(session, sorted(current), ref_weight)
+        seed_sem = (seed_m or {}).get("semantic_coherence")
+
+        # Re-sweep after each admission: a candidate that did not touch the
+        # seed may touch what the cluster has since grown into.
+        changed = True
+        while changed and len(current) < MERGE_MAX_MEMBERS:
+            changed = False
+            for i in remaining[1:]:
+                if not (stamps[i] & current):
+                    continue                      # keep the cluster connected
+                trial = current | stamps[i]
+                if trial == current:
+                    absorbed += 1                 # wholly contained
+                    continue
+                if len(trial) > MERGE_MAX_MEMBERS:
+                    continue
+                m = cluster_metrics(session, sorted(trial), ref_weight)
+                if m is None:
+                    continue
+                sem = m["semantic_coherence"]
+                # An unembedded member cannot be judged, so it is not admitted.
+                # Refusing to grow is recoverable; a merge nothing measured is
+                # not.
+                if sem is None or sem < floor:
+                    continue
+                if seed_sem is not None and sem < seed_sem - MERGE_COHERENCE_DROP:
+                    continue
+                current, absorbed, changed = trial, absorbed + 1, True
+
+        m = cluster_metrics(session, sorted(current), ref_weight)
+        if m is not None and len(m["members"]) >= 2:
+            avg_norm = min(1.0, m["avg_weight"] / ref_weight) if ref_weight else 0.0
+            sem = m["semantic_coherence"]
+            score = ((avg_norm * 0.5) + (m["grp_coherence"] * 0.5) if sem is None
+                     else (avg_norm * 0.4) + (m["grp_coherence"] * 0.3) + (sem * 0.3))
+            domains = [g // 100 for g in m["grps"]]
+            m.update({
+                "skill_score":     round(float(score), 4),
+                "avg_weight_norm": round(avg_norm, 4),
+                "scored_without_embeddings": sem is None,
+                "domain":          (max(set(domains), key=domains.count) if domains else None),
+                "merged_from":     absorbed,
+            })
+            out.append(m)
+            if absorbed > 1:
+                merges += 1
+                log.info("Merged %d candidate(s) into a %d-member cluster (meaning %s, domain %s)",
+                         absorbed, len(m["members"]),
+                         f"{sem:.3f}" if sem is not None else "n/a", m["grp_coherence"])
+
+        # Drop the seed and everything still touching the emitted cluster.
+        before = len(remaining)
+        remaining = [i for i in remaining[1:] if not (stamps[i] & current)]
+        dropped += before - 1 - len(remaining)
+
+    if merges or dropped:
+        log.info("Candidate merge: %d -> %d disjoint cluster(s) (%d absorbed or excluded)",
+                 len(candidates), len(out), dropped)
+    return out
+
 
 def queue_skill_proposals(candidates=None, min_score=0.70, limit=10,
                           max_pending=MAX_PENDING_PROPOSALS):
@@ -2838,17 +3127,35 @@ def queue_skill_proposals(candidates=None, min_score=0.70, limit=10,
     driver = get_driver()
     if driver is None:
         return {"created": 0, "refreshed": 0, "skipped_rejected": 0,
-                "deferred": 0, "pending": 0}
+                "deferred": 0, "superseded": 0, "pending": 0}
 
     if candidates is None:
         candidates = find_skill_candidates(limit=limit)
 
     ranked = [c for c in candidates if float(c.get("skill_score", 0)) >= float(min_score)]
-    created = refreshed = skipped = deferred = 0
+    created = refreshed = skipped = deferred = superseded = 0
     now = datetime.now().isoformat()
 
     try:
         with driver.session() as s:
+            # Fold overlapping candidates together BEFORE the score filter is
+            # applied to the result, so a merged cluster is judged as the thing
+            # that will actually be offered rather than as its best fragment.
+            _, ref_w, _ = skill_weight_floor()
+            ranked = merge_overlapping_candidates(s, ranked, ref_w)
+            ranked = [c for c in ranked
+                      if float(c.get("skill_score", 0)) >= float(min_score)]
+            ranked.sort(key=lambda c: -float(c.get("skill_score", 0.0)))
+
+            # Retire the unconfirmable before counting room. The ceiling is a
+            # bound on unreviewed WORK, and a proposal no skill leaves space for
+            # is not work -- counting it holds the queue shut against the very
+            # clusters that would clear it.
+            retired = retire_unconfirmable_proposals(s)
+            if retired:
+                log.info("Retired %d unconfirmable proposal(s) before sweeping", retired)
+            superseded += retired
+
             pending_now = s.run("""
                 MATCH (p:SkillProposal {status: 'pending'}) RETURN count(p) AS n
             """).single()["n"]
@@ -2860,7 +3167,28 @@ def queue_skill_proposals(candidates=None, min_score=0.70, limit=10,
                     known = s.run("""
                         MATCH (p:SkillProposal {member_key: $key}) RETURN count(p) AS n
                     """, key=_member_key(c["member_created"])).single()["n"]
+                    # A cluster that absorbs what is already queued does not
+                    # add unreviewed work, it consolidates it -- so the ceiling
+                    # must not block it. Otherwise merging deadlocks exactly
+                    # when it is most needed: a queue full of fragments has no
+                    # room for the merged proposal that would supersede them,
+                    # so the sweep defers every one and the fragments stay
+                    # forever. Observed as created=0, deferred=4, pending=26
+                    # against a ceiling of 25, with nothing able to change.
+                    #
+                    # The ceiling was always documented as a bound on
+                    # unreviewed work rather than on the graph; this is that
+                    # sentence applied to a case it did not anticipate.
+                    absorbs = 0
                     if not known:
+                        rec = s.run("""
+                            MATCH (p:SkillProposal {status: 'pending'})
+                            WHERE size(p.member_created) > 0
+                              AND all(t IN p.member_created WHERE t IN $created)
+                            RETURN count(p) AS n
+                        """, created=list(c["member_created"])).single()
+                        absorbs = rec["n"] if rec else 0
+                    if not known and absorbs < 1:
                         deferred += 1
                         continue
                 key = _member_key(c["member_created"])
@@ -2881,7 +3209,10 @@ def queue_skill_proposals(candidates=None, min_score=0.70, limit=10,
                                   p.semantic_coherence = $sem,
                                   p.grps          = $grps,
                                   p.previews      = $previews,
-                                  p.src_mix       = $srcmix
+                                  p.src_mix       = $srcmix,
+                                  // How many overlapping triples this cluster
+                                  // absorbed. 1 means the sweep found it whole.
+                                  p.merged_from   = $mergedfrom
                     // Refresh scores on a still-pending proposal so the queue
                     // reflects the graph now. Never touch status: a rejected
                     // proposal that is still dense must stay rejected.
@@ -2902,7 +3233,9 @@ def queue_skill_proposals(candidates=None, min_score=0.70, limit=10,
                                   p.previews      = CASE WHEN p.status = 'pending'
                                                         THEN $previews ELSE p.previews END,
                                   p.src_mix       = CASE WHEN p.status = 'pending'
-                                                        THEN $srcmix ELSE p.src_mix END
+                                                        THEN $srcmix ELSE p.src_mix END,
+                                  p.merged_from   = CASE WHEN p.status = 'pending'
+                                                        THEN $mergedfrom ELSE p.merged_from END
                     RETURN p.status AS status, p.created_at = $now AS is_new
                 """,
                     key=key, pid=str(uuid.uuid4()), members=list(c["members"]),
@@ -2917,6 +3250,7 @@ def queue_skill_proposals(candidates=None, min_score=0.70, limit=10,
                     # Neo4j stores no maps on properties; JSON keeps the mix
                     # readable without inventing a node per source class.
                     srcmix=json.dumps(c.get("src_mix") or {}),
+                    mergedfrom=int(c.get("merged_from", 1) or 1),
                 ).single()
 
                 if rec and rec["is_new"]:
@@ -2926,6 +3260,36 @@ def queue_skill_proposals(candidates=None, min_score=0.70, limit=10,
                     refreshed += 1
                 else:
                     skipped += 1
+
+                # Retire the fragments this cluster now contains.
+                #
+                # Without this the merge makes the queue worse rather than
+                # better: the merged proposal is added, the triples it was
+                # built from stay pending beside it, and now they conflict with
+                # their own union as well as with each other. A proposal whose
+                # members are all inside a larger pending one is not a second
+                # opinion, it is the same finding at lower resolution.
+                #
+                # Superseded rather than rejected. Rejected means a reviewer
+                # said no and the sweep must never re-offer it; this is
+                # bookkeeping, and stamping it as a human judgement would make
+                # the two indistinguishable later.
+                if rec and rec["status"] == "pending" and len(c["member_created"]) > 3:
+                    gone = s.run("""
+                        MATCH (p:SkillProposal {status: 'pending'})
+                        WHERE p.member_key <> $key
+                          AND size(p.member_created) > 0
+                          AND all(t IN p.member_created WHERE t IN $created)
+                        SET p.status        = 'superseded',
+                            p.updated_at    = $now,
+                            p.superseded_by = $key,
+                            p.review_note   = 'Absorbed into a larger cluster'
+                        RETURN count(p) AS n
+                    """, key=key, created=list(c["member_created"]), now=now).single()
+                    n = gone["n"] if gone else 0
+                    if n:
+                        superseded += n
+                        pending_now = max(0, pending_now - n)
 
             pending = s.run("""
                 MATCH (p:SkillProposal {status: 'pending'}) RETURN count(p) AS n
@@ -2939,11 +3303,12 @@ def queue_skill_proposals(candidates=None, min_score=0.70, limit=10,
                      deferred, pending, max_pending)
         return {"created": created, "refreshed": refreshed,
                 "skipped_rejected": skipped, "deferred": deferred,
+                "superseded": superseded,
                 "pending": pending}
     except Exception as e:
         log.warning(f"queue_skill_proposals failed: {e}")
         return {"created": 0, "refreshed": 0, "skipped_rejected": 0,
-                "deferred": 0, "pending": 0}
+                "deferred": 0, "superseded": 0, "pending": 0}
 
 
 def get_skill_proposals(status="pending", limit=50):
@@ -2991,11 +3356,39 @@ def get_skill_proposals(status="pending", limit=50):
                 // MATCH that finds nothing still collects one all-null map, so
                 // size(blockers) was 1 for every proposal and the ordering
                 // below silently did nothing.
+                //
+                // Carries the owned member's own timestamp now, so the caller
+                // can work out which members are still free. A cluster that
+                // overlaps an existing skill is not necessarily dead -- its
+                // unclaimed members can still be crystallized UNDER that skill,
+                // which is how the tree grows instead of stalling.
                 WITH p, live,
                      [b IN collect(DISTINCT {{skill_id: bsk.skill_id,
-                                             trigger:  bsk.trigger}})
+                                             trigger:  bsk.trigger,
+                                             taken:    bm.created_at}})
                       WHERE b.skill_id IS NOT NULL] AS blockers
+                // Proposals that claim a member of this one. They are
+                // ALTERNATIVES, not queue entries: crystallizing this makes
+                // every one of them permanently impossible. Nothing said so,
+                // so a reader worked through the queue item by item, hit the
+                // ownership refusal, and read it as something to repair.
+                //
+                // Matched on member_created, not address: addresses are
+                // rewritten in place on recall, and the proposal stores the
+                // timestamps for exactly that reason.
+                //
+                // Always against pending, whatever `status` this call asked
+                // for -- a confirmed or superseded proposal is not an
+                // alternative to anything.
+                OPTIONAL MATCH (q:SkillProposal)
+                WHERE q.status = 'pending'
+                  AND q.proposal_id <> p.proposal_id
+                  AND any(t IN q.member_created WHERE t IN p.member_created)
+                WITH p, live, blockers,
+                     [x IN collect(DISTINCT q.proposal_id)
+                      WHERE x IS NOT NULL] AS excludes
                 RETURN blockers         AS blockers,
+                       excludes         AS excludes,
                        p.proposal_id    AS proposal_id,
                        p.member_key     AS member_key,
                        p.member_created AS member_created,
@@ -3006,6 +3399,7 @@ def get_skill_proposals(status="pending", limit=50):
                        p.grp_coherence  AS grp_coherence,
                        p.semantic_coherence AS semantic_coherence,
                        p.src_mix        AS src_mix,
+                       coalesce(p.merged_from, 1) AS merged_from,
                        p.created_at     AS created_at,
                        p.updated_at     AS updated_at,
                        p.reviewed_at    AS reviewed_at,
@@ -3036,10 +3430,43 @@ def get_skill_proposals(status="pending", limit=50):
                 d["colors"]          = [m.get("color") for m in live]
                 d["members_missing"] = len(stamps) - len(live)
 
-                blockers = [b for b in (d.pop("blockers", None) or [])
-                            if b.get("skill_id")]
+                raw_blockers = [b for b in (d.pop("blockers", None) or [])
+                                if b.get("skill_id")]
+
+                # Collapse to one entry per owning skill, keeping which member
+                # timestamps each one took.
+                by_skill = {}
+                for b in raw_blockers:
+                    e = by_skill.setdefault(b["skill_id"],
+                                            {"skill_id": b["skill_id"],
+                                             "trigger":  b.get("trigger"),
+                                             "taken":    []})
+                    if b.get("taken") is not None:
+                        e["taken"].append(b["taken"])
+                blockers = list(by_skill.values())
+                for b in blockers:
+                    b["taken_count"] = len(b["taken"])
+
                 d["blocked_by"] = blockers
                 d["blocked"]    = bool(blockers)
+                d["excludes"]   = list(d.get("excludes") or [])
+
+                # The members no active skill has claimed, and where they could
+                # hang if some of them are claimed.
+                #
+                # A blocked proposal used to be a dead end that read like a
+                # repairable one. It is not dead: crystallizing the free
+                # members with `extends` set to the owning skill puts them in
+                # the tree underneath it, which is the outcome the overlap was
+                # evidence for in the first place. Two members is the floor
+                # because a skill needs two sources.
+                taken_stamps = {t for b in blockers for t in b["taken"]}
+                free = [m for m in live if m.get("created_at") not in taken_stamps]
+                d["free_members"] = [m["address"] for m in free]
+                d["suggested_parent"] = (
+                    max(blockers, key=lambda b: b["taken_count"])["skill_id"]
+                    if blockers and len(free) >= 2 else None
+                )
 
                 try:
                     d["src_mix"] = json.loads(d.get("src_mix") or "{}")
@@ -3089,15 +3516,46 @@ def reject_skill_proposal(proposal_id, note=""):
             if rec["status"] == "crystallized":
                 return False, "that proposal already became a skill"
 
+            now = datetime.now().isoformat()
             s.run("""
                 MATCH (p:SkillProposal {proposal_id: $pid})
                 SET p.status      = 'rejected',
                     p.reviewed_at = $now,
                     p.review_note = $note,
                     p.updated_at  = $now
-            """, pid=proposal_id, now=datetime.now().isoformat(),
-                 note=(note or ""))
-        return True, "rejected"
+            """, pid=proposal_id, now=now, note=(note or ""))
+
+            # Give back the fragments this cluster absorbed.
+            #
+            # Merging retires the smaller clusters a large one contains, which
+            # is right while the large one is live: they are the same finding
+            # at lower resolution, and offering both makes the queue conflict
+            # with itself. It stops being right the moment the large one is
+            # rejected. Without this, saying no to an 8-member cluster silently
+            # says no to the 3-member clusters inside it as well -- and those
+            # were never reviewed, so the rejection asserts a judgement nobody
+            # made. Worse, the sweep will not rebuild them: superseded is not
+            # pending, so ON MATCH leaves it alone forever.
+            #
+            # Only the ones THIS proposal superseded, and only if they are
+            # still superseded -- a fragment that has since been rejected on
+            # its own merits keeps that rejection.
+            back = s.run("""
+                MATCH (p:SkillProposal {proposal_id: $pid})
+                MATCH (f:SkillProposal {status: 'superseded',
+                                        superseded_by: p.member_key})
+                SET f.status        = 'pending',
+                    f.superseded_by = null,
+                    f.updated_at    = $now,
+                    f.review_note   = 'Released when the larger cluster was rejected'
+                RETURN count(f) AS n
+            """, pid=proposal_id, now=now).single()
+            released = back["n"] if back else 0
+            if released:
+                log.info("Rejected %s; released %d absorbed fragment(s) back to pending",
+                         proposal_id[:8], released)
+        return True, ("rejected" if not released
+                      else f"rejected; {released} absorbed proposal(s) returned to the queue")
     except Exception as e:
         log.warning(f"reject_skill_proposal failed: {e}")
         return False, str(e)
@@ -3167,6 +3625,21 @@ def close_proposal_for_members(member_addresses, skill_id):
                 RETURN p.proposal_id AS pid
             """, key=_member_key(created), sid=skill_id,
                  now=datetime.now().isoformat()).single()
+
+            # Retire every OTHER pending proposal this skill just made
+            # impossible.
+            #
+            # Only the exactly-matching proposal was ever closed, so a cluster
+            # that merely overlapped the new skill stayed pending forever while
+            # being unconfirmable -- its members belong to a skill now, and a
+            # memory cannot be compressed into two. On the graph where this was
+            # found, 22 of 26 pending proposals were blocked that way and 14
+            # could never be confirmed by any route. That queue is what a
+            # reviewer works through, hitting refusal after refusal.
+            n = retire_unconfirmable_proposals(s, exclude_key=_member_key(created))
+            if n:
+                log.info("Retired %d pending proposal(s) made unconfirmable by skill %s",
+                         n, skill_id[:8])
         return bool(res)
     except Exception as e:
         log.warning(f"close_proposal_for_members failed (skill was created): {e}")

@@ -80,6 +80,44 @@ hottest path, and the removal of code that could not run.
   so counting it as a chat candidate collapsed the budget to its floor at every depth:
   a deep pass assembling 2043 characters and calling it context.
 
+- **Overlapping skill proposals are merged instead of offered side by side.**
+  Two proposals over the same memory are not two pieces of work. Colour is
+  single-valued, so the first to claim a member locks every other cluster containing
+  it out permanently. The queue never said so: 26 pending proposals, 24 of which
+  shared members with another, presented as a numbered list of things to do.
+
+  Working through that list the way it reads is a loop, and the refusal message
+  closed it -- see *Fixed* below.
+
+  `find_skill_candidates` is `MATCH (a)-(b)-(c)`, so every candidate has exactly
+  three members; clusters larger than that were not rejected by the design, they were
+  unreachable by it. Overlapping triples are now folded back together before they are
+  queued, which both gets past three and makes the output disjoint: a cluster is
+  grown, emitted, and every remaining candidate still touching it is dropped rather
+  than offered, because once that cluster exists those candidates are unconfirmable.
+
+  Growth is bounded three ways because one bound does not hold. An absolute coherence
+  floor gets outrun: each admission moves a mean over every pair, so a growing cluster
+  ratchets through it without any single step crossing it -- a first attempt merged 35
+  triples into one 18-member cluster spanning six domains, never once dropping below
+  0.45. The bounds that work are relative to the seed (`MMU_MERGE_COHERENCE_DROP`) plus
+  a hard size ceiling (`MMU_MERGE_MAX_MEMBERS`), alongside the floor
+  (`MMU_MERGE_COHERENCE_FLOOR`).
+
+  Measured on a seeded graph: 14 raw candidates with 51 overlapping pairs became 2
+  disjoint proposals of 5 and 4 members, with zero overlap remaining and the two
+  topics kept apart rather than merged into one blob.
+
+- **Proposals report what they exclude.** `excludes` names the other pending proposals
+  sharing a member. Only proposal-vs-skill blocking was ever reported, so after an
+  uncrystallize both conflicting proposals showed as unblocked, both were attempted,
+  and the loop closed.
+
+- **A blocked proposal offers the tree instead of a dead end.** It now names the owning
+  routine, lists the members no routine has claimed (`free_members`), and suggests
+  crystallizing those with `extends` set to the owner (`suggested_parent`) -- which is
+  the outcome the overlap was evidence for.
+
 ### Fixed
 
 - **A direct question is no longer buried under reflections.** `get_creative_outputs()`
@@ -102,6 +140,38 @@ hottest path, and the removal of code that could not run.
   Verified against a real backend: a 10,371-token prompt into an 8,192-token window now
   completes after shrinking, where it previously produced a placebo summary reading
   "A conversation took place."
+
+- **The crystallization refusal no longer recommends the one move that cannot work.**
+  It said "either uncrystallize the skill that owns them, or pick a different proposal"
+  without naming which skill, so the reader had to guess an id -- and the advice itself
+  was the trap. Freeing the members lets exactly one of the overlapping proposals
+  succeed, so undoing and retrying only swaps which one refuses. A transcript of the
+  resulting loop: crystallize, blocked, notice two proposals share members, conclude
+  "uncrystallizing one should free them up for both", uncrystallize, still blocked,
+  pick another routine to undo. That reasoning is correct given what it was told.
+
+  The refusal now names the owning routine and its trigger, states plainly that
+  overlapping proposals are alternatives, and points at `extends` instead.
+
+- **Proposals a new skill makes impossible are retired.** Only the exactly-matching
+  proposal was ever closed on crystallize, so a cluster that merely OVERLAPPED the new
+  skill stayed pending forever while being unconfirmable. 22 of 26 pending proposals
+  were blocked that way, and 14 had no route at all. That is the queue a reviewer works
+  through, hitting refusal after refusal. Retirement now runs on crystallize and again
+  on every sweep. A proposal with two or more unclaimed members is deliberately kept --
+  it can still be crystallized under the owning routine.
+
+- **The pending-proposal ceiling no longer deadlocks the merge.** It counts pending
+  proposals, so a queue full of fragments had no room for the merged cluster that would
+  supersede them: the sweep deferred every one and nothing could change
+  (`created=0, deferred=4, pending=26` against a ceiling of 25). The ceiling was always
+  documented as a bound on unreviewed work rather than on the graph, so a cluster that
+  absorbs what is already queued is let through.
+
+- **Rejecting a merged cluster returns the fragments it absorbed.** Otherwise saying no
+  to an 8-member cluster silently says no to the 3-member clusters inside it, which
+  nobody reviewed -- and nothing would undo it, since `superseded` is not `pending` and
+  the sweep's `ON MATCH` leaves those rows alone forever.
 
 
 - **Skills can grow.** `POST /skills/{id}/members` adds memories to an existing

@@ -1036,16 +1036,40 @@ def test_no_memory_crowds_the_queue():
     Four overlapping triangles drawn from the same handful of hot memories
     filled 40% of a real queue, which a reviewer reads as the same finding
     four times. Breadth is the point of a review list.
+
+    Retargeted from /skill_candidates to /skill_proposals. /skill_candidates is
+    the raw triangle output, and since the merge it is an INPUT rather than
+    something anyone reviews -- overlap there is not a defect, it is the signal
+    merge_overlapping_candidates consumes to build a larger cluster. The queue
+    is what a reviewer reads.
+
+    The assertion is that overlap is DECLARED, not that it is absent. A sweep's
+    own output is disjoint, but a live queue also holds proposals from earlier
+    sweeps, and those can legitimately overlap a newer cluster without being
+    contained by it -- they are real alternatives, and discarding them would
+    throw away groupings a reviewer might prefer. They are retired
+    automatically once one of them is crystallized.
+
+    What must never happen again is overlap that nothing says out loud. That is
+    what turned the queue into a minefield: the reviewer worked through it as a
+    task list, hit an ownership refusal, read it as repairable, and looped.
     """
-    _, d = _call("GET", "/skill_candidates?limit=10")
-    if d["count"] < 4:
-        pytest.skip("too few candidates to crowd anything")
-    seen = {}
-    for c in d["candidates"]:
-        for m in c["members"]:
-            seen[m] = seen.get(m, 0) + 1
-    worst = max(seen.values())
-    assert worst <= 2, f"one memory appears in {worst} proposals; cap is 2"
+    _, d = _call("GET", "/skill_proposals?limit=50")
+    props = [p for p in d.get("proposals", []) if p.get("status") == "pending"]
+    if len(props) < 4:
+        pytest.skip("too few proposals to crowd anything")
+
+    by_id = {p["proposal_id"]: set(p["members"]) for p in props}
+    for p in props:
+        declared = set(p.get("excludes") or [])
+        for other in props:
+            if other["proposal_id"] == p["proposal_id"]:
+                continue
+            if by_id[p["proposal_id"]] & by_id[other["proposal_id"]]:
+                assert other["proposal_id"] in declared, (
+                    f"{p['proposal_id'][:8]} shares a member with "
+                    f"{other['proposal_id'][:8]} and does not say so"
+                )
 
 
 @live
@@ -2028,3 +2052,210 @@ def test_prompt_budget_reserves_room_for_tools_and_the_reply():
     assert big == d.IDLE_MAX_CHARS, "a large window is capped by the char ceiling"
     assert d._prompt_char_budget(Fake(None)) is None, "unknown context keeps the default"
     assert d._prompt_char_budget(Fake(512)) == 2000, "an unusable window still returns a floor"
+
+
+# ═════════════════════════════════════════════════════════════
+#  Overlapping proposals are merged, not offered as a queue
+# ═════════════════════════════════════════════════════════════
+
+def _n4j():
+    """A live Neo4j driver, or None, with credentials loaded from .env."""
+    import io
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = os.path.join(root, ".env")
+    if os.path.exists(env):
+        for line in io.open(env, encoding="utf-8"):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+    os.environ.setdefault("NEO4J_URI", "bolt://127.0.0.1:7687")
+    os.environ.setdefault("NEO4J_USER", "neo4j")
+    os.environ.setdefault("NEO4J_ENABLED", "true")
+    try:
+        import neo4j_layer as n4j
+        return n4j, n4j.get_driver()
+    except Exception:
+        return None, None
+
+
+def test_merge_returns_disjoint_clusters():
+    """
+    The contract, and the whole reason this exists.
+
+    Two clusters sharing a memory are alternatives: colour is single-valued, so
+    crystallizing either makes the other permanently unconfirmable. A queue of
+    26 proposals, 24 of which shared members with another, read as a list of
+    tasks and behaved as a minefield -- the reviewer hit an ownership refusal,
+    read it as repairable, uncrystallized to free the members, and looped.
+    """
+    n4j, drv = _n4j()
+    if drv is None:
+        pytest.skip("no Neo4j")
+    cands = n4j.find_skill_candidates(limit=40)
+    if len(cands) < 2:
+        pytest.skip("not enough candidates on this graph")
+    _, ref_w, _ = n4j.skill_weight_floor()
+    with drv.session() as s:
+        merged = n4j.merge_overlapping_candidates(s, cands, ref_w)
+    seen = set()
+    for c in merged:
+        stamps = set(str(t) for t in c["member_created"])
+        assert not (stamps & seen), "merged clusters must not share a member"
+        seen |= stamps
+
+
+def test_merge_respects_every_bound():
+    """
+    An absolute coherence floor alone does not hold. Each admission moves a
+    mean over every pair, so a growing cluster ratchets through the floor
+    without any single step crossing it -- 35 triples became one 18-member
+    cluster across six domains that way, and nothing ever dropped below 0.45.
+    """
+    n4j, drv = _n4j()
+    if drv is None:
+        pytest.skip("no Neo4j")
+    cands = n4j.find_skill_candidates(limit=40)
+    if len(cands) < 2:
+        pytest.skip("not enough candidates on this graph")
+    _, ref_w, _ = n4j.skill_weight_floor()
+    with drv.session() as s:
+        merged = n4j.merge_overlapping_candidates(s, cands, ref_w)
+    for c in merged:
+        assert len(c["members"]) <= n4j.MERGE_MAX_MEMBERS, "size bound"
+        sem = c.get("semantic_coherence")
+        if sem is not None and c.get("merged_from", 1) > 1:
+            assert sem >= n4j.MERGE_COHERENCE_FLOOR, "coherence floor"
+
+
+def test_merge_can_exceed_three_members():
+    """
+    find_skill_candidates is MATCH (a)-(b)-(c): every candidate it can produce
+    has exactly three members. Clusters larger than that were not rejected by
+    the design, they were unreachable by it. Merging is the route past three
+    without rewriting the traversal.
+    """
+    n4j, drv = _n4j()
+    if drv is None:
+        pytest.skip("no Neo4j")
+    cands = n4j.find_skill_candidates(limit=40)
+    if len(cands) < 4:
+        pytest.skip("not enough candidates on this graph")
+    assert {len(c["members"]) for c in cands} == {3}, "the raw query is a triangle"
+    _, ref_w, _ = n4j.skill_weight_floor()
+    with drv.session() as s:
+        merged = n4j.merge_overlapping_candidates(s, cands, ref_w)
+    if not any(c.get("merged_from", 1) > 1 for c in merged):
+        pytest.skip("no overlapping candidates on this graph to merge")
+    assert max(len(c["members"]) for c in merged) > 3
+
+
+def test_merge_is_a_noop_without_overlap():
+    """A candidate that touches nothing must come back unchanged."""
+    n4j, drv = _n4j()
+    if drv is None:
+        pytest.skip("no Neo4j")
+    cands = n4j.find_skill_candidates(limit=40)
+    if not cands:
+        pytest.skip("no candidates on this graph")
+    _, ref_w, _ = n4j.skill_weight_floor()
+    with drv.session() as s:
+        one = n4j.merge_overlapping_candidates(s, [cands[0]], ref_w)
+    assert len(one) == 1
+    assert set(one[0]["member_created"]) == set(cands[0]["member_created"])
+
+
+@live
+def test_proposals_declare_what_they_exclude():
+    """
+    Overlap between PENDING proposals was never reported -- only overlap with
+    an existing skill. So after uncrystallizing, both conflicting proposals
+    showed as unblocked, both were attempted, and the loop closed.
+    """
+    _, d = _call("GET", "/skill_proposals?limit=50")
+    props = d.get("proposals", [])
+    if len(props) < 2:
+        pytest.skip("need at least two proposals")
+    for p in props:
+        assert "excludes" in p, "a proposal must say which others it rules out"
+    by_id = {p["proposal_id"]: set(p.get("members", [])) for p in props}
+    for p in props:
+        for other in p["excludes"]:
+            if other in by_id:
+                assert by_id[other] & by_id[p["proposal_id"]], \
+                    "excludes must name only proposals that really share a member"
+
+
+@live
+def test_blocked_proposal_offers_the_tree_instead_of_a_dead_end():
+    """
+    A blocked proposal used to read as repairable by uncrystallizing, which is
+    the advice that produced the loop. Its unclaimed members can still be
+    crystallized UNDER the owning skill, so the queue has to say so.
+    """
+    _, d = _call("GET", "/skill_proposals?limit=50")
+    blocked = [p for p in d.get("proposals", []) if p.get("blocked")]
+    if not blocked:
+        pytest.skip("nothing blocked on this graph")
+    for p in blocked:
+        assert "free_members" in p
+        for b in p["blocked_by"]:
+            assert b.get("skill_id"), "the owning skill must be named, not implied"
+        if len(p["free_members"]) >= 2:
+            assert p.get("suggested_parent"), \
+                "with enough free members the queue must offer a parent to extend"
+
+
+def test_rejecting_a_merged_cluster_releases_its_fragments():
+    """
+    Merging retires the smaller clusters a large one contains. That is right
+    while the large one is live and wrong the moment it is rejected: saying no
+    to an 8-member cluster would otherwise silently say no to the 3-member
+    clusters inside it, which nobody reviewed.
+
+    And the sweep cannot repair it -- superseded is not pending, so the
+    upsert's ON MATCH leaves those rows alone forever. Nothing would ever offer
+    them again.
+
+    Runs on synthetic proposals it creates and deletes, so it never touches a
+    real review queue.
+    """
+    n4j, drv = _n4j()
+    if drv is None:
+        pytest.skip("no Neo4j")
+
+    big, frag, other = "test-big-key", "test-frag-key", "test-other-key"
+    ids = {}
+    try:
+        with drv.session() as s:
+            for key, status, sup in ((big, "pending", None),
+                                     (frag, "superseded", big),
+                                     (other, "superseded", "someone-elses-key")):
+                pid = "test-" + key
+                ids[key] = pid
+                s.run("""
+                    CREATE (p:SkillProposal {proposal_id: $pid, member_key: $key,
+                                             status: $status, superseded_by: $sup,
+                                             member_created: [], skill_score: 0.9,
+                                             created_at: $now, updated_at: $now})
+                """, pid=pid, key=key, status=status, sup=sup,
+                     now=n4j.datetime.now().isoformat())
+
+        ok, msg = n4j.reject_skill_proposal(ids[big], note="test")
+        assert ok, msg
+
+        with drv.session() as s:
+            rows = {r["k"]: r["st"] for r in s.run("""
+                MATCH (p:SkillProposal) WHERE p.member_key IN $keys
+                RETURN p.member_key AS k, p.status AS st
+            """, keys=[big, frag, other])}
+
+        assert rows[big] == "rejected"
+        assert rows[frag] == "pending", \
+            "a fragment of the rejected cluster must return"
+        assert rows[other] == "superseded", \
+            "a fragment of a DIFFERENT cluster must not"
+    finally:
+        with drv.session() as s:
+            s.run("MATCH (p:SkillProposal) WHERE p.member_key IN $keys DETACH DELETE p",
+                  keys=[big, frag, other])

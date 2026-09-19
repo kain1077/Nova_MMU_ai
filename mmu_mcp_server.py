@@ -782,11 +782,52 @@ def mmu_skill_proposals(limit=10):
             )
             lines.append(f"    proposal_id: {p['proposal_id']}")
             if p.get("blocked"):
-                who = ", ".join(b["skill_id"][:8] for b in p.get("blocked_by", []))
+                # Names the owner and routes to `extends`. The old text said
+                # "uncrystallize that routine first", which is the advice that
+                # produced the loop: undoing a routine lets exactly one of the
+                # proposals over those memories succeed, so the reader undid,
+                # re-crystallized, hit the refusal from the other side, and
+                # went round again.
+                for b in p.get("blocked_by", []):
+                    trig = (b.get("trigger") or "").strip()
+                    lines.append(
+                        f"    OWNED: {b.get('taken_count', '?')} member(s) belong to "
+                        f"routine {b['skill_id']}"
+                        + (f" ({trig[:50]})" if trig else "")
+                    )
+                free = p.get("free_members") or []
+                parent = p.get("suggested_parent")
+                if parent and len(free) >= 2:
+                    lines.append(
+                        f"    -> This is not a dead end. Crystallize the {len(free)} "
+                        f"unclaimed member(s) with extends={parent} to hang them "
+                        f"under that routine in the tree. Do NOT uncrystallize: a "
+                        f"memory belongs to one routine, so undoing only moves "
+                        f"which proposal is impossible."
+                    )
+                    for a in free:
+                        lines.append(f"       free: {a}")
+                else:
+                    lines.append(
+                        "    -> Not crystallizable and not repairable: too few "
+                        "unclaimed members to form a routine under the owner. "
+                        "Leave it. Uncrystallizing the owner does not help -- it "
+                        "only swaps which proposal refuses."
+                    )
+            if p.get("excludes"):
+                # Alternatives, not a to-do list. Without this the queue reads
+                # as N independent items when it is a choice of one.
                 lines.append(
-                    f"    CANNOT CRYSTALLIZE: member(s) already belong to active "
-                    f"routine {who}. A memory cannot be compressed into two routines. "
-                    f"Uncrystallize that routine first, or leave this one."
+                    f"    EXCLUDES {len(p['excludes'])} other pending proposal(s): "
+                    f"{', '.join(x[:8] for x in p['excludes'][:6])}"
+                    + (" ..." if len(p["excludes"]) > 6 else "")
+                    + ". They share members with this one, so crystallizing this "
+                      "makes them permanently impossible. Choose one; do not work "
+                      "through them in turn."
+                )
+            if p.get("merged_from", 0) > 1:
+                lines.append(
+                    f"    (merged from {p['merged_from']} overlapping clusters)"
                 )
             if p.get("members_missing"):
                 lines.append(f"    WARNING: {p['members_missing']} member(s) no longer exist")
