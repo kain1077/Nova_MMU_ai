@@ -135,6 +135,21 @@ hottest path, and the removal of code that could not run.
   and is read-only, so the sentence overstated what the flag withholds -- the more
   worrying direction for a setting whose whole purpose is to withhold something.
 
+  And the reason given for the default was wrong about this codebase. **Letting a model
+  do it** justified `MMU_ALLOW_MODEL_CRYSTALLIZE=false` on the grounds that "a model that
+  drafts a proposal can then approve its own draft, and the review stops being a review."
+  A model cannot draft a proposal. Proposals are written only by the density sweep, which
+  is not exposed as a tool; `POST /skill_proposals/{id}/crystallize` ignores
+  `member_addresses` and resolves members from the proposal's immutable `created_at`
+  stamps; and the general `/crystallize`, which does take an arbitrary member list, is
+  never offered to the model. The self-approval loop the sentence warned about is not
+  reachable.
+
+  The section now says what the flag actually withholds -- confirming a proposal demotes
+  the source memories to Blue, which is a real write and worth an explicit opt-in -- and
+  what the model actually contributes, which is the trigger and procedure wording that a
+  density score cannot produce. The default is unchanged.
+
 - **Crystallizing a cluster now actually relieves the recall bias it was built to
   relieve.** The roadmap's stated purpose is that a hot path *converts* into a Routine
   "rather than accumulating recall-weight without bound forever," and the README says the

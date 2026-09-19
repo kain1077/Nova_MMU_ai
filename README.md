@@ -399,16 +399,34 @@ active child cannot be deleted out from under it.
 
 ### Letting a model do it
 
-`MMU_ALLOW_MODEL_CRYSTALLIZE=true` gives your model tools to create, branch and reverse
-routines itself. Reviewing is not part of that bargain and never was: `review_routines` is
-always registered, because reading the queue changes nothing.
+`MMU_ALLOW_MODEL_CRYSTALLIZE=true` lets your model confirm a queued proposal, branch one
+under another, and reverse either. Reviewing is not part of that bargain and never was:
+`review_routines` is always registered, because reading the queue changes nothing.
 
-**Off by default, and the default is the recommendation:** a model that drafts a proposal
-can then approve its own draft, and the review stops being a review. It is enforced
-server-side, not merely by hiding the tool.
+**What the model does and does not decide.** It does not choose which memories get
+compressed. Proposals are written only by the density sweep, which scores clusters on
+co-recall and semantic similarity; there is no path from a model to a new proposal, and
+the sweep is not exposed as a tool. `POST /skill_proposals/{id}/crystallize` ignores
+`member_addresses` outright and resolves the members from the proposal's immutable
+`created_at` stamps, and the general `/crystallize` endpoint — the one that does take an
+arbitrary member list — is not offered to the model at all.
 
-Useful for testing the whole loop, and the reason reversal is available to the model too.  
-Being able to create without being able to undo is the worse half to hand out.
+What the model supplies is the **trigger** and the **procedure**, plus the confidence and
+the parent to branch under. That division is the argument for turning this on rather than
+against it. The sweep can tell that a cluster is dense; it cannot tell you what the
+memories *mean*, and a trigger and a procedure are prose. Leaving that to a human who was
+not in the conversation means the model recommends wording and someone retypes it into
+`mmu_review.py` — a transcription step wearing a reviewer's hat.
+
+**Off by default anyway**, because confirming a proposal is a real write: the source
+memories are demoted to Blue, which changes how they are retrieved. That is worth an
+explicit opt-in even when the judgement behind it is sound. It is enforced server-side by
+`_guard_model_write()`, which refuses any request tagged `X-MMU-Source: model` while the
+flag is off, so the gate is not merely a hidden tool.
+
+Reversal is offered to the model for the same reason. Being able to create without being
+able to undo is the worse half to hand out, and `uncrystallize_routine` restores the
+members' original colours and returns the proposal to the queue.
 
 ---
 
@@ -473,7 +491,7 @@ worth knowing early:
 | `MMU_SEMANTIC_FLOOR` | `0.0` | Drop weak keyword hits. `0.0` = off. |
 | `MMU_ANTICIPATE_MAX` | `3` | Proactive suggestions per recall. `0` = off. |
 | `MMU_BIND` | `127.0.0.1` | Interface the ports bind to. `0.0.0.0` exposes to your LAN. |
-| `MMU_ALLOW_MODEL_CRYSTALLIZE` | `false` | Let a model create and reverse routines itself. See [Routines](#routines). |
+| `MMU_ALLOW_MODEL_CRYSTALLIZE` | `false` | Let a model confirm and reverse routine *proposals* itself. It never picks the members. See [Routines](#routines). |
 | `MMU_API_KEY` | *(unset)* | Shared secret. Required on every endpoint but `/health` when set. |
 | `MMU_CORS_ORIGINS` | *(empty)* | Browser origins allowed. Empty disables CORS. |
 
