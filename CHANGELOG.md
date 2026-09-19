@@ -12,6 +12,59 @@ hottest path, and the removal of code that could not run.
 
 ### Added
 
+- **Backend refusals carry the backend's own explanation.** `raise_for_status()`
+  reports `400 Client Error: Bad Request for url: .../chat/completions` and discards
+  the response body -- and the body is where the server says things like
+  `request (8810 tokens) exceeds the available context size (8192 tokens)`. Session
+  summaries were placeholders for days and whole cognition passes were dying, both
+  with that one uninformative line.
+
+  `LMStudioError` now keeps the status, the message and the token counts when the
+  server gives them. Reading them is fiddlier than it should be: llama.cpp-backed
+  servers nest a whole JSON document inside the message *string*, behind a prose
+  prefix, so the parser has to go looking for the braces rather than testing whether
+  the value starts with one.
+
+- **The cognition prompt is sized to the model that is actually loaded.**
+  `MMU_IDLE_MODEL` defaults to the placeholder `local-model`, which LM Studio resolves
+  to whichever model loaded first. With a 176k model and an 8k model both loaded,
+  identical config and an identical prompt would work one hour and fail instantly the
+  next -- which is what made these 400s look intermittent and unrelated to size.
+  `/idle_prompt`'s 24000-character default is roughly 6000 tokens: comfortable in 176k,
+  impossible in 8k once the tool schemas and the reply budget are counted beside it.
+
+  The daemon now asks LM Studio's `/api/v0/models` what is loaded and how much room it
+  has, assumes the smallest loaded window when the configured name is the placeholder,
+  reserves tokens for the tool schemas (`MMU_TOOL_SCHEMA_RESERVE`) and the reply, and
+  passes the result to `/idle_prompt` as `max_chars`. A backend that will not report a
+  context length keeps the old default, so nothing changes for one that never had the
+  problem. Startup logs the window and names the placeholder, because all of this was
+  invisible.
+
+  Models the backend types as embeddings are excluded. The embedding model is loaded
+  for most of the server's life -- every recall uses it -- and reports a 2048 window,
+  so counting it as a chat candidate collapsed the budget to its floor at every depth:
+  a deep pass assembling 2043 characters and calling it context.
+
+### Fixed
+
+- **The session summary's retry no longer makes an overflow worse.** It doubled
+  `max_tokens` when reasoning ate the answer, which is the right remedy for that failure
+  and exactly wrong for this one -- a window that was already too small does not improve
+  by reserving more of it for output. Two retries pulling in opposite directions is why
+  a session could fail, retry, and fail again inside 20ms.
+
+  An overflow now shrinks the transcript instead (`MMU_SESSION_SUMMARY_SHRINK_TRIES`),
+  keeping the head and the tail and dropping the middle the way `/idle_prompt` already
+  trims, and the doubling retry is capped against the real window. The system message is
+  never trimmed: it carries the JSON shape the reply has to match, and cutting it would
+  trade a prompt that does not fit for a reply that cannot be parsed.
+
+  Verified against a real backend: a 10,371-token prompt into an 8,192-token window now
+  completes after shrinking, where it previously produced a placebo summary reading
+  "A conversation took place."
+
+
 - **Skills can grow.** `POST /skills/{id}/members` adds memories to an existing
   skill; `POST /skills/{id}/members/remove` takes them back out and restores their
   pre-skill colour. Crystallization could create a skill and delete one and nothing
