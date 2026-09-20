@@ -4520,12 +4520,12 @@ def get_creative_output(output_id: str):
                 WHERE co.output_id = $exact OR co.output_id STARTS WITH $prefix
                 OPTIONAL MATCH (co)-[:INSPIRED_BY]->(m:Memory)
                 WITH co, collect(m.address) AS inspired_by
-                RETURN co.output_id         AS output_id,
-                       co.title             AS title,
-                       co.content           AS content,
-                       co.artifact_type     AS artifact_type,
-                       co.cognition_depth   AS cognition_depth,
-                       co.created_at        AS created_at,
+                RETURN co.output_id        AS output_id,
+                       co.title            AS title,
+                       co.content          AS content,
+                       co.artifact_type    AS artifact_type,
+                       co.cognition_depth  AS cognition_depth,
+                       co.created_at       AS created_at,
                        co.presented_to_user AS presented_to_user,
                        inspired_by
                 LIMIT 2

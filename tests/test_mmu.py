@@ -1727,6 +1727,33 @@ def test_aging_survives_an_unreachable_graph(monkeypatch, tmp_path):
 #  PHASE 7 (revised) -- the session bundle stays bounded
 # ═════════════════════════════════════════════════════════════
 
+def _artifact_driver():
+    """
+    A Neo4j driver for the one test that has to undo what it did.
+
+    Kept local rather than promoted to a shared helper: this is the only test
+    in the file that needs write access to the graph, and a module-level
+    fixture would invite others to.
+    """
+    import io
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = os.path.join(root, ".env")
+    if os.path.exists(env):
+        for line in io.open(env, encoding="utf-8"):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+    os.environ.setdefault("NEO4J_URI", "bolt://127.0.0.1:7687")
+    os.environ.setdefault("NEO4J_USER", "neo4j")
+    os.environ.setdefault("NEO4J_ENABLED", "true")
+    try:
+        import neo4j_layer as n4j
+        return n4j.get_driver()
+    except Exception:
+        return None
+
+
 @live
 def test_session_bundle_does_not_dump_whole_artifacts():
     """
@@ -1748,8 +1775,7 @@ def test_session_bundle_does_not_dump_whole_artifacts():
     for oid in surfaced:
         body = full.get(oid) or ""
         if len(body) > 400:
-            assert body not in block, \
-                f"artifact {oid[:8]} was pasted into the bundle in full"
+            assert body not in block,                 f"artifact {oid[:8]} was pasted into the bundle in full"
 
 
 @live
@@ -1762,8 +1788,7 @@ def test_session_bundle_surfaces_at_most_the_cap():
     _, d = _call("GET", "/session_bundle")
     surfaced = d.get("surfaced_ids") or []
     assert len(surfaced) <= 3, "the artifact block must stay capped"
-    assert len(surfaced) <= d["unseen_count"], \
-        "cannot surface more than exist"
+    assert len(surfaced) <= d["unseen_count"], "cannot surface more than exist"
 
 
 @live
@@ -1779,8 +1804,7 @@ def test_bundle_names_the_artifacts_it_surfaced():
     if not surfaced:
         pytest.skip("no unseen artifacts on this graph")
     for oid in surfaced:
-        assert oid[:8] in d["context_block"], \
-            f"{oid[:8]} is reported as surfaced but is not in the block"
+        assert oid[:8] in d["context_block"],             f"{oid[:8]} is reported as surfaced but is not in the block"
 
 
 @live
@@ -1826,10 +1850,181 @@ def test_mark_seen_drains_only_what_was_named():
         pytest.skip("need at least two unseen artifacts")
 
     target = before["outputs"][0]["output_id"]
-    st, res = _call("POST", "/creative_outputs/mark_seen", {"output_ids": [target]})
-    assert st == 200 and res["count"] == 1
+    try:
+        st, res = _call("POST", "/creative_outputs/mark_seen", {"output_ids": [target]})
+        assert st == 200 and res["count"] == 1
 
-    _, after = _call("GET", "/creative_outputs?unseen_only=true&limit=50")
-    assert after["count"] == before["count"] - 1, \
-        "marking one artifact must not consume the queue behind it"
-    assert target not in [o["output_id"] for o in after["outputs"]]
+        _, after = _call("GET", "/creative_outputs?unseen_only=true&limit=50")
+        assert after["count"] == before["count"] - 1,             "marking one artifact must not consume the queue behind it"
+        assert target not in [o["output_id"] for o in after["outputs"]]
+    finally:
+        # Put it back. Marking an artifact seen is the one assertion here that
+        # cannot be made without doing the thing for real, and the thing is
+        # irreversible through the API -- so it is reversed directly. Without
+        # this the suite eats one real artifact from the queue on every run.
+        drv = _artifact_driver()
+        if drv is not None:
+            with drv.session() as s:
+                s.run("""
+                    MATCH (co:CreativeOutput {output_id: $oid})
+                    SET co.presented_to_user = false
+                    REMOVE co.presented_at
+                """, oid=target)
+#  Backend refusals say what the backend said
+# ═════════════════════════════════════════════════════════════
+
+def test_backend_error_reads_the_nested_llama_cpp_body():
+    """
+    Session summaries were placeholders for days because raise_for_status()
+    reports "400 Client Error: Bad Request for url: ..." and drops the body --
+    and the body is the only place the token counts appear.
+
+    The awkward part is the shape: llama.cpp-backed servers return a JSON
+    document nested inside a string, behind a prose prefix, so the parser
+    cannot test whether the value starts with a brace.
+    """
+    import json as _json
+    import mmu_idle_daemon as d
+    inner = _json.dumps({"error": {
+        "code": 400,
+        "message": "request (8810 tokens) exceeds the available context size "
+                   "(8192 tokens), try increasing it",
+        "type": "exceed_context_size_error",
+        "n_prompt_tokens": 8810,
+        "n_ctx": 8192}})
+    body = _json.dumps({"error": "Engine protocol predict request returned 400: " + inner})
+
+    e = d._backend_error(400, body)
+    assert e.overflow is True
+    assert e.n_prompt == 8810 and e.n_ctx == 8192
+    assert "8810 tokens" in e.message
+    assert "Engine protocol" not in e.message, "the inner message is the specific one"
+
+
+def test_backend_error_distinguishes_overflow_from_other_faults():
+    """
+    Overflow is the one a caller can act on by sending less. A missing model or
+    a dead server does not get better when retried smaller, so mislabelling one
+    as the other buys a pointless retry loop.
+    """
+    import json as _json
+    import mmu_idle_daemon as d
+    body = _json.dumps({"error": {"message": 'Invalid model identifier "".',
+                                  "code": "model_not_found"}})
+    e = d._backend_error(400, body)
+    assert e.overflow is False
+    assert "Invalid model identifier" in e.message
+
+
+@pytest.mark.parametrize("body", ["", "Internal Server Error", "{not json",
+                                  '{"detail":[{"msg":"bad"}]}'])
+def test_backend_error_never_raises_on_a_body_it_cannot_read(body):
+    """An unparseable body is still a body worth reporting."""
+    import mmu_idle_daemon as d
+    e = d._backend_error(500, body)
+    assert e.status == 500
+    assert isinstance(e.message, str)
+
+
+def test_context_length_ignores_the_embedding_model():
+    """
+    The embedding model is loaded for most of the server's life -- every recall
+    uses it -- and reports a 2048 window. Counting it as a chat candidate
+    collapsed the prompt budget to the floor at every depth: a deep pass
+    assembled 2043 characters and called it context.
+
+    "Assume the smallest loaded window" is the right rule. It just has to be
+    the smallest window something could actually reason in.
+    """
+    import mmu_idle_daemon as d
+
+    class FakeResp:
+        status_code = 200
+        @staticmethod
+        def json():
+            return {"data": [
+                {"id": "chat-big",  "state": "loaded",     "type": "vlm",
+                 "loaded_context_length": 176640},
+                {"id": "embedder",  "state": "loaded",     "type": "embeddings",
+                 "loaded_context_length": 2048},
+                {"id": "chat-idle", "state": "not-loaded", "type": "llm",
+                 "loaded_context_length": 131072},
+            ]}
+
+    llm = d.LMStudioClient(base="http://127.0.0.1:1/v1", model="local-model")
+    real = d.requests.get
+    d.requests.get = lambda *a, **k: FakeResp()
+    try:
+        assert llm.context_length() == 176640, "the embedder must not set the budget"
+    finally:
+        d.requests.get = real
+
+
+def test_context_length_keeps_every_loaded_model_when_types_are_absent():
+    """
+    Only backends that say what a model IS get filtered. One that reports no
+    type keeps the old behaviour rather than having a guess applied to it.
+    """
+    import mmu_idle_daemon as d
+
+    class FakeResp:
+        status_code = 200
+        @staticmethod
+        def json():
+            return {"data": [
+                {"id": "a", "state": "loaded", "loaded_context_length": 8192},
+                {"id": "b", "state": "loaded", "loaded_context_length": 32768},
+            ]}
+
+    llm = d.LMStudioClient(base="http://127.0.0.1:1/v1", model="local-model")
+    real = d.requests.get
+    d.requests.get = lambda *a, **k: FakeResp()
+    try:
+        assert llm.context_length() == 8192, "smallest loaded, as before"
+    finally:
+        d.requests.get = real
+
+
+def test_halving_a_transcript_leaves_the_system_message_alone():
+    """
+    The system message carries the JSON shape the reply has to match. Trimming
+    it would trade a prompt that does not fit for a reply that cannot parse.
+    """
+    import mmu_idle_daemon as d
+    system = {"role": "system", "content": "Reply with ONLY JSON: {...}"}
+    user   = {"role": "user", "content": "turn text. " * 500}
+    out = d._halve_transcript_message([system, user])
+    assert out[0] == system
+    assert len(out[1]["content"]) < len(user["content"])
+    assert "trimmed to fit" in out[1]["content"]
+
+
+def test_halving_reports_nothing_left_to_cut():
+    """
+    The shrink loop has to terminate. A message already small enough returns
+    None so the caller re-raises instead of retrying an identical request.
+    """
+    import mmu_idle_daemon as d
+    assert d._halve_transcript_message([{"role": "user", "content": "hi"}]) is None
+    assert d._halve_transcript_message([{"role": "system", "content": "x" * 5000}]) is None
+
+
+def test_prompt_budget_reserves_room_for_tools_and_the_reply():
+    """
+    The window covers the prompt, the tool schemas sent beside it, and the
+    tokens reserved for the reply. Budgeting only the first is what let a
+    prompt that "fit" get rejected on arrival.
+    """
+    import mmu_idle_daemon as d
+
+    class Fake:
+        def __init__(self, n): self.n = n
+        def context_length(self): return self.n
+
+    small = d._prompt_char_budget(Fake(8192))
+    big   = d._prompt_char_budget(Fake(176640))
+    assert small < big
+    assert small <= (8192 - d.MAX_TOKENS - d.TOOL_SCHEMA_RESERVE) * d.CHARS_PER_TOKEN
+    assert big == d.IDLE_MAX_CHARS, "a large window is capped by the char ceiling"
+    assert d._prompt_char_budget(Fake(None)) is None, "unknown context keeps the default"
+    assert d._prompt_char_budget(Fake(512)) == 2000, "an unusable window still returns a floor"

@@ -235,18 +235,27 @@ ANTICIPATE_STATE_MAX = int(_env.get("MMU_ANTICIPATE_STATE_MAX", "50"))
 # -- Phase 7 (revised): how many idle-pass artifacts ride in the session
 # bundle, and how much of each one is shown.
 #
-# These used to be 10 and "all of it". Ten artifacts at full length was 14.7k
-# of a 17.4k bundle -- 84% of everything Nova read before the first user word,
-# and it grew without bound because nothing ever marked them seen. The
-# crystallization block below already caps itself at 3 on the reasoning that a
-# wall trains the reader to scroll past the whole thing; the same reasoning
-# applies here and was simply never applied.
+# These used to be 10 and "all of it", and nothing ever marked an artifact
+# seen, so the block grew with the backlog rather than with what was worth
+# saying. On a real graph that was 19 artifacts queued, 0 ever marked, and an
+# artifact block of 14.7k characters inside a 17.4k bundle -- 84% of everything
+# the model read before the first user word.
+#
+# The crystallization block below caps itself at three on the reasoning that a
+# wall trains the reader to scroll past the whole thing. The same reasoning
+# always applied here; it was simply never applied.
 #
 # The full text is not lost. It stays in the /creative_outputs response and is
 # one read_artifact call away, which is the same trade Phase 13.2 made when it
 # started delivering a Skill in place of its source memories.
 BUNDLE_ARTIFACT_MAX   = int(_env.get("MMU_BUNDLE_ARTIFACT_MAX", "3"))
 BUNDLE_ARTIFACT_CHARS = int(_env.get("MMU_BUNDLE_ARTIFACT_CHARS", "160"))
+
+# Artifact types that are a direct question rather than a reflection. Named
+# here because two places have to agree on it: get_creative_outputs() sorts
+# them first so a question is never buried, and the bundle has to keep them
+# there when it re-orders the rest oldest-first.
+_QUESTION_TYPES = ("question_for_user",)
 
 # Weight applied to semantic hits during ranking. Deliberately below
 # W_SIMILAR (0.85) in light_index_v2 so a semantic hit can never outrank a
@@ -2731,12 +2740,11 @@ def session_bundle(top_per_domain: int = 1):
     # first user message. They are NOT auto-marked as seen here: marking is a
     # separate explicit call, so a bundle fetched by a health check or a second
     # bridge cannot silently consume artifacts the user never actually read.
-    #
     # `surfaced_ids` is the other half of that contract, and the half that was
     # missing. The caller marking artifacts seen has to mark exactly the ones
     # that were rendered -- not "all unseen", which would silently consume the
     # queue behind the cap, and not nothing, which is what happened for every
-    # artifact an idle pass ever wrote. So the ids go out with the bundle.
+    # artifact ever written. So the ids go out with the bundle.
     #
     # Peek deeper than the render cap so `unseen_count` stays a true backlog
     # figure rather than a restatement of the cap.
@@ -2755,8 +2763,8 @@ def session_bundle(top_per_domain: int = 1):
         # it back at the bottom -- the two halves of that intent were written
         # in different files and cancelled out. Questions stay on top; the
         # reflections behind them read oldest-first as before.
-        questions   = [c for c in surfaced if c["artifact_type"] == "question_for_user"]
-        reflections = [c for c in surfaced if c["artifact_type"] != "question_for_user"]
+        questions   = [c for c in surfaced if c["artifact_type"] in _QUESTION_TYPES]
+        reflections = [c for c in surfaced if c["artifact_type"] not in _QUESTION_TYPES]
         for co in questions + list(reversed(reflections)):
             title = " ".join(str(co.get("title") or "").split())
             if len(title) > 90:

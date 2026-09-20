@@ -185,27 +185,6 @@ TOOLS = [
         }
     },
     {
-        "name": "read_artifact",
-        "description": (
-            "Open, in full, one of the things you thought about while the user was away. "
-            "The session context names these but shows only the opening line of each, "
-            "with an 8-character id in brackets like [reflection | 3f9a21bc]. Pass that "
-            "id here to read the whole piece. Use it when an opener is worth following "
-            "-- when the user asks about one, or when it bears on what is being "
-            "discussed. Do not open all of them out of completeness."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "artifact_id": {
-                    "type": "string",
-                    "description": "The id from the session context, e.g. '3f9a21bc'."
-                }
-            },
-            "required": ["artifact_id"]
-        }
-    },
-    {
         "name": "recall_memory",
         "description": (
             "Search long-term memory for context relevant to a specific topic. "
@@ -227,6 +206,28 @@ TOOLS = [
                 }
             },
             "required": ["prompt"]
+        }
+    },
+    {
+        "name": "read_artifact",
+        "description": (
+            "Open, in full, one of the things you thought about while the user "
+            "was away. The session context names these but shows only the "
+            "opening line of each, with an 8-character id in brackets like "
+            "[reflection | 3f9a21bc]. Pass that id here to read the whole piece. "
+            "Use it when an opener is worth following -- when the user asks "
+            "about one, or when it bears on what is being discussed. Do not "
+            "open all of them out of completeness."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "artifact_id": {
+                    "type": "string",
+                    "description": "The id from the session context, e.g. '3f9a21bc'."
+                }
+            },
+            "required": ["artifact_id"]
         }
     },
     {
@@ -968,8 +969,7 @@ def handle(msg):
         # Pre-fetch bundle so get_session_context returns instantly
         try:
             _session_bundle_cache, _pending_seen_ids = mmu_session_bundle()
-            print(f"MMU session bundle cached | {len(_pending_seen_ids)} artifact(s) pending",
-                  file=sys.stderr, flush=True)
+            print("MMU session bundle cached", file=sys.stderr, flush=True)
         except Exception as e:
             print(f"Session bundle prefetch failed: {e}", file=sys.stderr, flush=True)
             _session_bundle_cache = "[Session bundle unavailable at startup]"
