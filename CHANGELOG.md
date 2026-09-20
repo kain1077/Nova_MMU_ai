@@ -215,11 +215,12 @@ hottest path, and the removal of code that could not run.
 ### Fixed
 
 - **The README's list of MCP tools now matches the tools the bridge registers.** It
-  described "four tools" and named four. The bridge registers **five** unconditionally --
-  the fifth, `review_routines`, had gone unmentioned since it was added -- and **four
-  more** behind `MMU_ALLOW_MODEL_CRYSTALLIZE=true`, which the list did not distinguish
-  from the rest because it did not mention them at all. Anyone counting tools in their
-  client against the README came up two short in the default configuration.
+  described "four tools" and named four. The bridge registers **six** unconditionally --
+  `review_routines` had gone unmentioned since it was added, and `read_artifact` arrived
+  with the session-bundle digest -- and **four more** behind
+  `MMU_ALLOW_MODEL_CRYSTALLIZE=true`, which the list did not distinguish from the rest
+  because it did not mention them at all. Anyone counting tools in their client against
+  the README came up two short in the default configuration.
 
   The same audit caught a second claim pointing the other way: **Letting a model do it**
   said the flag "gives your model tools to review, create, branch and reverse routines."

@@ -186,9 +186,13 @@ MMU speaks [MCP](https://modelcontextprotocol.io). Point your client at
 }
 ```
 
-That gives the model five tools: `get_session_context` (call first, loads the bundle),
-`recall_memory`, `save_memory`, `rate_memory`, and `review_routines` — which is read-only,
-and reports what is sitting in the crystallization queue without being able to act on it.
+That gives the model six tools: `get_session_context` (call first, loads the bundle),
+`recall_memory`, `save_memory`, `rate_memory`, `read_artifact`, and `review_routines`.
+
+The last two are worth a word. `read_artifact` opens one of the idle-pass artifacts in
+full; the session bundle lists those by title and opening line only, so this is how the
+rest of one is reached. `review_routines` is read-only — it reports what is sitting in the
+crystallization queue and cannot act on it.
 
 Four more exist and are **not** registered by default: `crystallize_routine`,
 `link_routine`, `unlink_routine` and `uncrystallize_routine` appear only when
