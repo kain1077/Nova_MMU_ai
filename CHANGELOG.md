@@ -12,6 +12,56 @@ hottest path, and the removal of code that could not run.
 
 ### Added
 
+- **A blocked proposal has a route that exists.** `POST /skill_proposals/{id}/grow`
+  and a `grow_routine` MCP tool resolve a proposal whose members are already owned, by
+  growing the owning routine to absorb the unclaimed ones.
+
+  Every route the system named before this was unreachable, and a model following them
+  could only loop. `extends` does not relax the ownership check — that check runs inside
+  `crystallize_skill`'s write transaction and nothing influences it, while `_link_parent()`
+  runs only after crystallize has already committed and draws an `EXTENDS_SKILL` edge
+  between two Skill nodes. It never touches membership. `link_routine` is the same.
+
+  Worse, the advice named addresses the tool cannot accept. `review_routines` printed
+  *"Crystallize the 2 unclaimed member(s) with extends=&lt;owner&gt;"* and listed them — but
+  `crystallize_routine` takes a `proposal_id` with no member-subset parameter, so the only
+  call available sends the owned members too and refuses identically.
+
+  A proposal overlapping an existing routine is not an obstacle to route around; it is
+  evidence that routine should be bigger. Growth is that, and #15 already built the
+  machinery.
+
+  The tool takes a `proposal_id`, never addresses. Addresses are rewritten in place on
+  recall so any the caller holds may be stale, and a free-form address list would let a
+  model bury arbitrary memories in Blue — the server derives the free set from the
+  proposal itself. The target routine must already own part of that proposal, or the call
+  is refused; without that rail this degenerates into "put any memories into any routine".
+  Gated exactly like crystallization: `MMU_ALLOW_MODEL_CRYSTALLIZE`, `confirmed=true`, and
+  `_guard_model_write`, because the MCP gate is a client-side promise the server must not
+  depend on.
+
+### Changed
+
+- **`suggested_parent` is now `owner_skill_id`** on a proposal. The old name said
+  "parent", which is what pushed both the queue text and the reader toward `extends`;
+  the value is the routine that already owns the most of this proposal — the one to grow.
+  Pre-1.0, so renamed outright rather than dual-emitted.
+
+- **A proposal with a single free member is no longer retired.**
+  `retire_unconfirmable_proposals()` required two, justified in its own comment by
+  crystallizing the free members under the owner via `extends` — the route that never
+  existed. It was therefore discarding exactly the case growth handles best.
+
+### Fixed
+
+- **The crystallization refusal no longer recommends what cannot work.** It now names the
+  owning routine in full (the truncated ids in summaries match nothing), lists the owned
+  and the free addresses separately, points at `grow_routine`, and states plainly that
+  `extends` will not help — the old wording has been read many times and would otherwise
+  be reached for from memory. When no member is free it says the proposal is fully
+  absorbed and to leave it, rather than offering a repair.
+
+
 - **The session bundle stops growing with the artifact backlog.**
   `/creative_outputs/mark_seen` had no caller anywhere in the system. Every artifact
   an idle pass ever wrote stayed `presented_to_user=false` forever, so `/session_bundle`

@@ -1841,18 +1841,53 @@ def crystallize_skill(member_addresses, trigger, procedure, confidence=0.0):
                             + (f" ({trig[:60]})" if trig else "")
                             + f" owns: {', '.join(sorted(o['addrs']))}"
                         )
+                    # Name the route that EXISTS, and deny the two that do not.
+                    #
+                    # The previous text offered `extends` and link_skill, and
+                    # both are unreachable: the ownership check above runs
+                    # inside the write transaction and nothing relaxes it,
+                    # while _link_parent() runs after crystallize has already
+                    # committed and only draws an EXTENDS_SKILL edge between
+                    # two Skill nodes. Worse, the MCP tool takes a proposal_id
+                    # and has no member-subset parameter, so "crystallize just
+                    # the free ones" could not be expressed even if it worked.
+                    #
+                    # A model told to do the impossible does it, fails, and
+                    # tries the next impossible thing. The denial of `extends`
+                    # is explicit because the old wording has been read many
+                    # times and will be reached for from memory otherwise.
+                    free = [a for a in member_addresses if a not in set(taken)]
+                    if free:
+                        lines.append(f"  free (owned by nothing): {', '.join(free)}")
+                        lines.append(
+                            "The route that works is to GROW the owning skill: add "
+                            "the free member(s) to it rather than build a second "
+                            "skill over the same material. The overlap is the "
+                            "evidence that skill should be bigger."
+                        )
+                        lines.append(
+                            f"  tool: grow_routine(proposal_id=..., "
+                            f"skill_id=\"{owners[0]['skill_id']}\")"
+                        )
+                        lines.append(
+                            f"  HTTP: POST /skills/{owners[0]['skill_id']}/members "
+                            '{"member_addresses": [...], "confirmed": true}'
+                        )
+                    else:
+                        lines.append(
+                            "Every memory here already belongs to an active skill, "
+                            "so this proposal is fully absorbed and has nothing "
+                            "left to contribute. There is nothing to add and "
+                            "nothing to create. Leave it; the next sweep retires it."
+                        )
                     lines.append(
-                        "Do NOT uncrystallize to free them. Two proposals over "
-                        "the same memories are alternatives, not a queue: "
-                        "whichever you crystallize, the other stays impossible, "
-                        "so undoing and retrying only swaps which one refuses. "
-                        "To put these memories under a broader skill, crystallize "
-                        "a different proposal with `extends` set to the owning "
-                        "skill id, or link the owning skill under a parent. A "
-                        "human can also add the free members to the owning skill "
-                        "directly with POST /skills/{id}/members. The review "
-                        "queue marks which proposals are blocked, and which "
-                        "exclude each other."
+                        "Do NOT uncrystallize to free them. Two proposals over the "
+                        "same memories are alternatives, not a queue: whichever you "
+                        "crystallize, the other stays impossible, so undoing only "
+                        "swaps which one refuses. `extends` does NOT help either -- "
+                        "it draws a tree edge between two skills after the fact and "
+                        "never changes which skill owns a memory, so this same "
+                        "refusal fires with or without it."
                     )
                     raise ValueError(chr(10).join(lines))
 
@@ -3127,10 +3162,17 @@ def retire_unconfirmable_proposals(session, exclude_key=None):
     reviewer works through that queue hitting refusal after refusal, which is
     how the crystallize/uncrystallize loop started.
 
-    "No room" means fewer than two unclaimed members, since a skill needs two
-    sources. A proposal with two or more free members is deliberately left
-    pending: it can still be crystallized UNDER the owning skill via `extends`,
-    and that is a live option the queue should keep offering.
+    "No room" means NO unclaimed members at all. A proposal with even one free
+    member is left pending, because that member can be added to the owning
+    skill with add_skill_members() -- growth, not a second skill over the same
+    material.
+
+    This floor used to be two, justified by crystallizing the free members
+    under the owner via `extends`. That route never existed: `extends` only
+    draws an EXTENDS_SKILL edge between two Skill nodes after the fact and
+    never changes which skill owns a memory. The old floor therefore discarded
+    the single-free-member case, which is precisely the one growth handles
+    best.
 
     Returns how many were retired.
     """
@@ -3141,7 +3183,7 @@ def retire_unconfirmable_proposals(session, exclude_key=None):
         OPTIONAL MATCH (m:Memory)-[:PROCEDURALIZED_FROM]->(sk:Skill)
         WHERE m.created_at IN p.member_created AND sk.status <> 'deprecated'
         WITH p, count(DISTINCT m) AS claimed
-        WHERE claimed > 0 AND size(p.member_created) - claimed < 2
+        WHERE claimed > 0 AND size(p.member_created) - claimed < 1
         SET p.status      = 'superseded',
             p.updated_at  = $now,
             p.review_note = 'Members were crystallized into another skill'
@@ -3694,9 +3736,20 @@ def get_skill_proposals(status="pending", limit=50):
                 taken_stamps = {t for b in blockers for t in b["taken"]}
                 free = [m for m in live if m.get("created_at") not in taken_stamps]
                 d["free_members"] = [m["address"] for m in free]
-                d["suggested_parent"] = (
+                # The skill to GROW, not a parent to hang a new skill under.
+                #
+                # This was `suggested_parent`, and the name did real damage: it
+                # reads as "pass this to extends", which is what both the queue
+                # text and the refusal went on to say, and neither works. The
+                # value is the skill that already owns the most of this
+                # proposal -- the one whose overlap is evidence it should be
+                # bigger.
+                #
+                # No >= 2 floor any more. Growth works with a single free
+                # member; only crystallizing a NEW skill needed two sources.
+                d["owner_skill_id"] = (
                     max(blockers, key=lambda b: b["taken_count"])["skill_id"]
-                    if blockers and len(free) >= 2 else None
+                    if blockers and free else None
                 )
 
                 try:
@@ -3790,6 +3843,70 @@ def reject_skill_proposal(proposal_id, note=""):
     except Exception as e:
         log.warning(f"reject_skill_proposal failed: {e}")
         return False, str(e)
+
+
+def get_proposal_free_members(proposal_id):
+    """
+    Split a proposal's members into the ones no active skill owns and the ones
+    already claimed.
+
+    Returns (free, owners, all_members, error). `owners` is
+    [{skill_id, trigger, taken_count}], most-claimed first, so a caller can
+    pick the skill to grow without asking. `all_members` is every current
+    address, which matters because close_proposal_for_members() keys on the
+    WHOLE member set -- handing it only the free subset computes a different
+    member_key and closes nothing.
+
+    Resolved from member_created stamps, never from stored addresses: aging
+    rewrites an address in place, so a list read minutes ago can match nothing.
+
+    This exists so growth never takes addresses from its caller. A model naming
+    memories to demote is a far larger capability than resolving a blocked
+    proposal needs, and the free set is not a judgement -- it is a fact about
+    the graph.
+    """
+    driver = get_driver()
+    if driver is None:
+        return None, None, None, "no database connection"
+    try:
+        with driver.session() as s:
+            rec = s.run("""
+                MATCH (p:SkillProposal {proposal_id: $pid})
+                RETURN p.status AS status, p.member_created AS created
+            """, pid=proposal_id).single()
+            if not rec:
+                return None, None, None, "no such proposal"
+            if rec["status"] != "pending":
+                return None, None, None, (
+                    f"that proposal is {rec['status']}, not pending")
+
+            rows = [dict(r) for r in s.run("""
+                MATCH (m:Memory) WHERE m.created_at IN $created
+                OPTIONAL MATCH (m)-[:PROCEDURALIZED_FROM]->(sk:Skill)
+                WHERE sk.status <> 'deprecated'
+                RETURN m.address AS address,
+                       collect(DISTINCT {skill_id: sk.skill_id,
+                                         trigger:  sk.trigger}) AS owners
+            """, created=list(rec["created"] or []))]
+
+            free, all_members, tally = [], [], {}
+            for r in rows:
+                all_members.append(r["address"])
+                owned = [o for o in (r["owners"] or []) if o.get("skill_id")]
+                if not owned:
+                    free.append(r["address"])
+                for o in owned:
+                    e = tally.setdefault(o["skill_id"],
+                                         {"skill_id": o["skill_id"],
+                                          "trigger": o.get("trigger"),
+                                          "taken_count": 0})
+                    e["taken_count"] += 1
+
+        owners = sorted(tally.values(), key=lambda o: -o["taken_count"])
+        return sorted(free), owners, sorted(all_members), None
+    except Exception as e:
+        log.warning(f"get_proposal_free_members failed: {e}")
+        return None, None, None, str(e)
 
 
 def get_proposal_members(proposal_id):

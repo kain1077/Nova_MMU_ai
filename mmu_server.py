@@ -367,6 +367,14 @@ class CrystallizeIn(BaseModel):
     extends:          Optional[str] = None
 
 
+class GrowFromProposalIn(BaseModel):
+    # skill_id is optional: the server can pick the skill that already owns
+    # the most of this proposal. Naming one is allowed, but it is checked
+    # against the proposal's actual owners -- see the endpoint.
+    skill_id:  Optional[str] = None
+    confirmed: bool = False
+
+
 class SkillMembersIn(BaseModel):
     # Phase 13.3. Explicit addresses for the same reason CrystallizeIn takes
     # them: aging rewrites addresses in place, so anything resolved from a
@@ -2627,6 +2635,99 @@ def crystallize_proposal(proposal_id: str, body: CrystallizeIn,
     skill["associations"] = n4j.project_skill_associations(skill["skill_id"])
 
     return {"status": "crystallized", "proposal_id": proposal_id, **skill}
+
+
+@app.post("/skill_proposals/{proposal_id}/grow")
+def grow_from_proposal(proposal_id: str, body: GrowFromProposalIn,
+                       x_mmu_source: Optional[str] = Header(None)):
+    """
+    Resolve a BLOCKED proposal by growing the skill that already owns part of
+    it, instead of creating a second skill over the same material.
+
+    This endpoint exists because every other route out of a blocked proposal
+    was a dead end. A memory belongs to exactly one skill, so a proposal
+    overlapping an existing skill can never be crystallized as it stands --
+    and `extends` does not change that, because it only draws a tree edge
+    between two Skill nodes after the fact. The overlap is not an obstacle to
+    route around; it is evidence the existing skill should be bigger.
+
+    The free members are derived HERE, from the proposal, rather than taken
+    from the caller. A caller naming memories to demote is a far larger
+    capability than resolving a block needs, and the free set is not a
+    judgement -- it is a fact about the graph.
+
+    The target skill must already own part of this proposal. Without that
+    check this degenerates into "put any memories into any skill", which is
+    not what breaking the loop requires.
+    """
+    _guard_model_write(x_mmu_source)
+    if not body.confirmed:
+        raise HTTPException(
+            400,
+            "Refusing to grow without confirmed=true. This demotes the added "
+            "memories to Blue and is not something to trigger by accident."
+        )
+
+    free, owners, all_members, why = n4j.get_proposal_free_members(proposal_id)
+    if why:
+        raise HTTPException(404 if why == "no such proposal" else 409, why)
+    if not owners:
+        raise HTTPException(
+            409,
+            "Nothing owns any member of this proposal, so there is no skill to "
+            "grow. It is not blocked -- crystallize it normally."
+        )
+    if not free:
+        raise HTTPException(
+            409,
+            f"Every member of this proposal already belongs to skill "
+            f"{owners[0]['skill_id']}, so it is fully absorbed and there is "
+            "nothing to add. Leave it; the next sweep retires it."
+        )
+
+    target = body.skill_id or owners[0]["skill_id"]
+    resolved, resolve_why = n4j.resolve_skill_id(target)
+    if not resolved:
+        raise HTTPException(404, resolve_why)
+
+    # The safety rail. Growth may only merge a proposal into a skill the
+    # system itself reported as blocking that proposal.
+    if resolved not in {o["skill_id"] for o in owners}:
+        raise HTTPException(
+            409,
+            f"Skill {resolved} does not own any member of this proposal. "
+            "Growth can only merge a proposal into a skill it actually "
+            f"overlaps -- that is {', '.join(o['skill_id'] for o in owners)}."
+        )
+
+    info, why = n4j.add_skill_members(resolved, free)
+    if not info:
+        raise HTTPException(409, why)
+
+    mmu.v2_index.set_skill_member(info["added"], True)
+    for addr in info["added"]:
+        try:
+            mmu.v2_index.set_color(addr, "Blue")
+        except Exception as e:
+            log.warning("v2 index colour sync failed for %s: %s", addr, e)
+    mmu.v2_index.save()
+
+    # Closed with the WHOLE member set, not just the free ones.
+    # close_proposal_for_members() keys on the member_key of everything it is
+    # given, so the free subset would compute a different key and match
+    # nothing -- leaving the proposal pending and fully absorbed, which is
+    # precisely the state that sends a reader round again.
+    n4j.close_proposal_for_members(all_members, resolved)
+    info["associations"] = n4j.project_skill_associations(resolved)
+
+    return {
+        "status":      "grown",
+        "proposal_id": proposal_id,
+        **info,
+        "note": (f"Skill {resolved} now has {info['member_count']} members. Its id, "
+                 "invocation_count and tree position are unchanged. Undo just "
+                 f"this: POST /skills/{resolved}/members/remove"),
+    }
 
 
 @app.post("/skill_proposals/{proposal_id}/reject")
