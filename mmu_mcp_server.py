@@ -136,6 +136,15 @@ MMU_BASE = os.environ.get("MMU_BASE", "http://127.0.0.1:8765")
 # Session bundle cached on initialize — returned by get_session_context
 _session_bundle_cache = None
 
+# Artifact ids rendered into that cached bundle, waiting to be marked seen.
+# Held rather than marked at prefetch time: `initialize` fires when LM Studio
+# spawns this process, which is not the same event as a human reading the
+# bundle. A client that handshakes and then goes nowhere -- a health probe, a
+# config reload, a window opened and closed -- must not consume the queue.
+# Cleared once marked so a second get_session_context call in the same
+# conversation cannot double-mark.
+_pending_seen_ids = []
+
 # Phase 8: LM Studio spawns this bridge as a fresh stdio process for each
 # conversation, so the process's own lifetime already equals one
 # conversation. Mint the session id once here and send it as a header on
@@ -197,6 +206,28 @@ TOOLS = [
                 }
             },
             "required": ["prompt"]
+        }
+    },
+    {
+        "name": "read_artifact",
+        "description": (
+            "Open, in full, one of the things you thought about while the user "
+            "was away. The session context names these but shows only the "
+            "opening line of each, with an 8-character id in brackets like "
+            "[reflection | 3f9a21bc]. Pass that id here to read the whole piece. "
+            "Use it when an opener is worth following -- when the user asks "
+            "about one, or when it bears on what is being discussed. Do not "
+            "open all of them out of completeness."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "artifact_id": {
+                    "type": "string",
+                    "description": "The id from the session context, e.g. '3f9a21bc'."
+                }
+            },
+            "required": ["artifact_id"]
         }
     },
     {
@@ -521,13 +552,60 @@ if ALLOW_CRYSTALLIZE:
 # ── MMU REST calls ────────────────────────────────────
 
 def mmu_session_bundle():
-    """Fetch the session bundle from the server. Returns context block string."""
+    """
+    Fetch the session bundle from the server.
+
+    Returns (context_block, surfaced_ids). The ids are the artifacts the
+    server actually rendered into the block -- the caller marks exactly those
+    seen once the block reaches the model, and nothing else. Marking the whole
+    unseen set instead would quietly burn the artifacts still queued behind
+    the render cap.
+    """
     try:
         r = requests.get(f"{MMU_BASE}/session_bundle", timeout=8)
         data = r.json()
-        return data.get("context_block", "No session context available.")
+        return (data.get("context_block", "No session context available."),
+                data.get("surfaced_ids") or [])
     except Exception as e:
-        return f"[MMU session bundle unavailable: {e}]"
+        return (f"[MMU session bundle unavailable: {e}]", [])
+
+
+def mmu_mark_seen(output_ids):
+    """
+    Mark artifacts as read. Best effort by design: this runs after the bundle
+    text is already in hand, and a bundle that arrived is worth more than a
+    bookkeeping flag that did not. A failure here re-shows an artifact next
+    session, which is the harmless direction to fail in.
+    """
+    if not output_ids:
+        return
+    try:
+        requests.post(f"{MMU_BASE}/creative_outputs/mark_seen",
+                      json={"output_ids": list(output_ids)},
+                      headers=_SESSION_HEADERS,
+                      timeout=5)
+    except Exception as e:
+        print(f"MMU mark_seen failed (artifacts stay queued): {e}",
+              file=sys.stderr, flush=True)
+
+
+def mmu_read_artifact(output_id):
+    """Phase 7 (revised): open one artifact the bundle digest only named."""
+    try:
+        r = requests.get(f"{MMU_BASE}/creative_outputs/{output_id}", timeout=8)
+        if r.status_code == 404:
+            return (f"No artifact matches '{output_id}'. Use the 8-character id "
+                    f"shown in brackets in the session context.")
+        data = r.json()
+        inspired = data.get("inspired_by") or []
+        head = (f"[{data.get('artifact_type')}] {data.get('title')}\n"
+                f"written {data.get('created_at','?')[:19]}"
+                f" | depth={data.get('cognition_depth','?')}")
+        if inspired:
+            head += f" | from {len(inspired)} memory/memories: {', '.join(inspired[:5])}"
+        return f"{head}\n\n{data.get('content','')}"
+    except Exception as e:
+        return f"[MMU read_artifact error: {e}]"
 
 def mmu_recall(prompt, top_k=5):
     try:
@@ -876,7 +954,7 @@ def err(req_id, code, message):
 # ── MCP protocol handlers ─────────────────────────────
 
 def handle(msg):
-    global _session_bundle_cache
+    global _session_bundle_cache, _pending_seen_ids
     method = msg.get("method", "")
     req_id = msg.get("id")
     params = msg.get("params", {})
@@ -890,11 +968,12 @@ def handle(msg):
         })
         # Pre-fetch bundle so get_session_context returns instantly
         try:
-            _session_bundle_cache = mmu_session_bundle()
+            _session_bundle_cache, _pending_seen_ids = mmu_session_bundle()
             print("MMU session bundle cached", file=sys.stderr, flush=True)
         except Exception as e:
             print(f"Session bundle prefetch failed: {e}", file=sys.stderr, flush=True)
             _session_bundle_cache = "[Session bundle unavailable at startup]"
+            _pending_seen_ids     = []
 
     elif method == "notifications/initialized":
         pass   # No response needed
@@ -910,13 +989,33 @@ def handle(msg):
 
         if name == "get_session_context":
             # Return cached bundle — fetched at initialize, instant response
-            text = _session_bundle_cache or mmu_session_bundle()
+            if _session_bundle_cache:
+                text = _session_bundle_cache
+            else:
+                text, _pending_seen_ids = mmu_session_bundle()
+
+            # THIS is the read event. The model asking for context is the
+            # closest thing the bridge has to "the user is about to see this",
+            # so it is where the artifact queue drains. Marking happens after
+            # the text is in hand and never blocks returning it.
+            #
+            # Before this existed, /creative_outputs/mark_seen had no caller
+            # anywhere in the system: every artifact ever written stayed
+            # unseen forever, the bundle re-served the same backlog to every
+            # conversation, and the ones past the cap were never surfaced at
+            # all. The endpoint was correct; nothing rang it.
+            if _pending_seen_ids:
+                mmu_mark_seen(_pending_seen_ids)
+                _pending_seen_ids = []
 
         elif name == "recall_memory":
             text = mmu_recall(
                 prompt=arguments.get("prompt", ""),
                 top_k=arguments.get("top_k", 8)
             )
+
+        elif name == "read_artifact":
+            text = mmu_read_artifact(arguments.get("artifact_id", "").strip())
 
         elif name == "save_memory":
             text = mmu_save(
