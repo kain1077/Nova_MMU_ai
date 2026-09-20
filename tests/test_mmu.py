@@ -1721,3 +1721,152 @@ def test_aging_survives_an_unreachable_graph(monkeypatch, tmp_path):
 
     assert set(core.v2_index.shortcut_cache) == set(before), (
         "index moved despite the graph writing nothing")
+
+
+# ═════════════════════════════════════════════════════════════
+#  PHASE 7 (revised) -- the session bundle stays bounded
+# ═════════════════════════════════════════════════════════════
+
+def _artifact_driver():
+    """
+    A Neo4j driver for the one test that has to undo what it did.
+
+    Kept local rather than promoted to a shared helper: this is the only test
+    in the file that needs write access to the graph, and a module-level
+    fixture would invite others to.
+    """
+    import io
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = os.path.join(root, ".env")
+    if os.path.exists(env):
+        for line in io.open(env, encoding="utf-8"):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+    os.environ.setdefault("NEO4J_URI", "bolt://127.0.0.1:7687")
+    os.environ.setdefault("NEO4J_USER", "neo4j")
+    os.environ.setdefault("NEO4J_ENABLED", "true")
+    try:
+        import neo4j_layer as n4j
+        return n4j.get_driver()
+    except Exception:
+        return None
+
+
+@live
+def test_session_bundle_does_not_dump_whole_artifacts():
+    """
+    The artifact block was 14.7k of a 17.4k bundle -- 84% of everything the
+    model read before the first user word -- because it printed every unseen
+    artifact in full and nothing ever marked one seen. A bundle that grows
+    with the backlog is not context, it is a leak with a heading on it.
+
+    The check is on the block, not on the response: /creative_outputs still
+    carries the full text, and should.
+    """
+    _, d = _call("GET", "/session_bundle")
+    block = d["context_block"]
+    surfaced = d.get("surfaced_ids") or []
+    if not surfaced:
+        pytest.skip("no unseen artifacts on this graph")
+
+    full = {c["output_id"]: c["content"] for c in d["creative_outputs"] if c.get("content")}
+    for oid in surfaced:
+        body = full.get(oid) or ""
+        if len(body) > 400:
+            assert body not in block,                 f"artifact {oid[:8]} was pasted into the bundle in full"
+
+
+@live
+def test_session_bundle_surfaces_at_most_the_cap():
+    """
+    The crystallization block below this one caps itself at three, reasoning
+    that a wall trains the reader to scroll past the whole thing. The same
+    reasoning always applied here; it was simply never applied.
+    """
+    _, d = _call("GET", "/session_bundle")
+    surfaced = d.get("surfaced_ids") or []
+    assert len(surfaced) <= 3, "the artifact block must stay capped"
+    assert len(surfaced) <= d["unseen_count"], "cannot surface more than exist"
+
+
+@live
+def test_bundle_names_the_artifacts_it_surfaced():
+    """
+    surfaced_ids is the contract that lets a caller mark exactly what was
+    shown. Marking "all unseen" instead would burn the artifacts still queued
+    behind the cap -- they would go from waiting to read, to never shown and
+    flagged as read.
+    """
+    _, d = _call("GET", "/session_bundle")
+    surfaced = d.get("surfaced_ids") or []
+    if not surfaced:
+        pytest.skip("no unseen artifacts on this graph")
+    for oid in surfaced:
+        assert oid[:8] in d["context_block"],             f"{oid[:8]} is reported as surfaced but is not in the block"
+
+
+@live
+def test_artifact_opens_by_the_short_id_the_bundle_printed():
+    """
+    Cutting the block to openers is only a compression if the rest is still
+    reachable; otherwise it is data loss with a nicer shape. The bundle prints
+    eight characters of the id, so eight characters have to resolve.
+    """
+    _, d = _call("GET", "/session_bundle")
+    surfaced = d.get("surfaced_ids") or []
+    if not surfaced:
+        pytest.skip("no unseen artifacts on this graph")
+
+    oid = surfaced[0]
+    st, full = _call("GET", f"/creative_outputs/{oid[:8]}")
+    assert st == 200, "the id shown in the bundle must resolve"
+    assert full["output_id"] == oid
+    assert full.get("content"), "the recovery path must return the body"
+
+
+@live
+def test_unknown_artifact_id_is_a_404_not_a_guess():
+    """
+    Prefix lookup that picks an arbitrary winner hands back the wrong artifact
+    silently, which is worse than refusing.
+    """
+    st, _ = _call("GET", "/creative_outputs/zzzzzzzz-no-such-artifact")
+    assert st == 404
+
+
+@live
+def test_mark_seen_drains_only_what_was_named():
+    """
+    Regression guard on the bug this replaced: /creative_outputs/mark_seen
+    existed with no caller anywhere in the system, so presented_to_user was
+    false for every artifact ever written. Now that it is wired, the danger
+    flips -- a caller that marks the whole unseen set consumes the backlog
+    invisibly. It must mark what it was given and nothing else.
+    """
+    _, before = _call("GET", "/creative_outputs?unseen_only=true&limit=50")
+    if before["count"] < 2:
+        pytest.skip("need at least two unseen artifacts")
+
+    target = before["outputs"][0]["output_id"]
+    try:
+        st, res = _call("POST", "/creative_outputs/mark_seen", {"output_ids": [target]})
+        assert st == 200 and res["count"] == 1
+
+        _, after = _call("GET", "/creative_outputs?unseen_only=true&limit=50")
+        assert after["count"] == before["count"] - 1,             "marking one artifact must not consume the queue behind it"
+        assert target not in [o["output_id"] for o in after["outputs"]]
+    finally:
+        # Put it back. Marking an artifact seen is the one assertion here that
+        # cannot be made without doing the thing for real, and the thing is
+        # irreversible through the API -- so it is reversed directly. Without
+        # this the suite eats one real artifact from the queue on every run.
+        drv = _artifact_driver()
+        if drv is not None:
+            with drv.session() as s:
+                s.run("""
+                    MATCH (co:CreativeOutput {output_id: $oid})
+                    SET co.presented_to_user = false
+                    REMOVE co.presented_at
+                """, oid=target)
