@@ -46,6 +46,34 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Defaults to the second-instance port on purpose. See the module docstring.
+# Neo4j credentials have to be in the environment BEFORE neo4j_layer is
+# imported anywhere in this process. Its NEO4J_* names are module-level
+# constants read at import time, so whichever test imported it first froze in
+# whatever the environment held then -- and a helper loading .env afterwards
+# could not undo it. Every Neo4j-backed test then skipped itself with
+# "no Neo4j" while Neo4j was running the whole time, which is worse than
+# failing, because nothing reports it.
+#
+# Loaded ONLY from .env or an already-set environment. No default URI, on
+# purpose: bolt://127.0.0.1:7687 is where a developer's real graph lives, and
+# these tests write. Defaulting to it would aim them at production the moment
+# a checkout had no .env -- the same hazard MMU_TEST_ALLOW_PRODUCTION guards
+# on the HTTP side, which the Neo4j side had no equivalent for. Without
+# credentials the driver stays unconfigured and the tests skip, which is the
+# safe direction to fail in.
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_ENV = os.path.join(_ROOT, ".env")
+if os.path.exists(_ENV):
+    with open(_ENV, encoding="utf-8") as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _v = _line.split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip())
+if os.environ.get("NEO4J_PASS"):
+    os.environ.setdefault("NEO4J_USER", "neo4j")
+    os.environ.setdefault("NEO4J_ENABLED", "true")
+
 BASE = os.environ.get("MMU_TEST_BASE", "http://127.0.0.1:8766")
 
 # The port a normal MMU install listens on, and therefore the one the live tests
@@ -2259,3 +2287,131 @@ def test_rejecting_a_merged_cluster_releases_its_fragments():
         with drv.session() as s:
             s.run("MATCH (p:SkillProposal) WHERE p.member_key IN $keys DETACH DELETE p",
                   keys=[big, frag, other])
+
+
+# ═════════════════════════════════════════════════════════════
+#  A skill inherits its members' associations
+# ═════════════════════════════════════════════════════════════
+
+def test_association_score_ranks_beside_meaning_not_above_it():
+    """
+    Association weight has no ceiling, so a linear score lets one hot
+    neighbourhood outrank everything reached by meaning. A first cut used a
+    reference of 8 and effectively everything saturated -- a query scored 0.947
+    by association against semantic matches at 0.86.
+
+    Pure, because the curve is the decision and it should not need a graph in a
+    particular state to check. The reference is calibrated against a real
+    distribution: per-edge weights run median 3, p90 15, max 59, and a score
+    sums every edge from the memories one query matched.
+    """
+    import neo4j_layer as n4j
+    curve = lambda w: w / (w + n4j.ASSOC_REF)
+
+    assert curve(1) < curve(10) < curve(100), "monotonic in weight"
+    assert curve(10 ** 9) < 1.0, "saturating, never reaching 1"
+    assert curve(n4j.ASSOC_REF) == pytest.approx(0.5), "0.5 at the reference"
+    # A typical strong semantic match sits around 0.85. Association has to
+    # clear a real bar to get there, rather than arriving by accumulation.
+    assert curve(100) < 0.85, "a merely well-connected skill must not outrank meaning"
+
+
+def test_association_floor_keeps_weak_matches_out():
+    """
+    A matched skill WITHHOLDS its members from the delivered context, so a weak
+    match subtracts evidence rather than adding noise. That is the same reason
+    min_semantic is high, and it applies here too.
+    """
+    import neo4j_layer as n4j
+    curve = lambda w: w / (w + n4j.ASSOC_REF)
+    assert 0.0 < n4j.ASSOC_FLOOR < 0.75, "a floor that is neither absent nor a wall"
+    assert curve(5) < n4j.ASSOC_FLOOR, "an incidental association must not deliver a skill"
+
+
+@live
+def test_a_skill_is_never_associated_with_its_own_members():
+    """
+    A skill already contains its members. An edge back would make every
+    delivery register as growth, which is the one signal this edge exists to
+    provide honestly.
+    """
+    n4j, drv = _n4j()
+    if drv is None:
+        pytest.skip("no Neo4j")
+    with drv.session() as s:
+        rec = s.run("""
+            MATCH (o:Memory)-[:ASSOCIATED_WITH]->(sk:Skill)
+            WHERE (o)-[:PROCEDURALIZED_FROM]->(sk)
+            RETURN count(*) AS n
+        """).single()
+    assert rec["n"] == 0
+
+
+@live
+def test_backfilling_associations_twice_does_not_double_them():
+    """
+    The projection SETS the seed rather than adding to it, and carries forward
+    whatever has accumulated since. Re-running a repair must not inflate the
+    thing it repairs -- and this one also runs on every membership change, so
+    it gets re-run a lot.
+    """
+    n4j, drv = _n4j()
+    if drv is None:
+        pytest.skip("no Neo4j")
+
+    def total():
+        with drv.session() as s:
+            r = s.run("""MATCH (:Memory)-[a:ASSOCIATED_WITH]->(:Skill)
+                         RETURN sum(a.weight) AS w, count(a) AS n""").single()
+        return (r["w"] or 0, r["n"] or 0)
+
+    # Both readings must bracket backfills with nothing else in between.
+    # Recall writes CO_RECALLED edges, so a reading taken before some other
+    # test ran a query is not a baseline -- the projection is DERIVED from
+    # those edges and is supposed to move when they do.
+    _call("POST", "/skills/project_associations?apply=true")
+    once = total()
+    if once[1] == 0:
+        pytest.skip("nothing projected on this graph")
+    _call("POST", "/skills/project_associations?apply=true")
+    assert total() == once, "a second backfill over an unchanged graph must be a no-op"
+
+
+@live
+def test_growth_separates_the_seed_from_what_accumulated():
+    """
+    The reason the live edge is maintained: a memory repeatedly delivered
+    beside a skill is evidence the skill should grow to include it -- and since
+    add_skill_members() that is something the system can act on.
+
+    Only `grown` is new evidence. A high weight that is entirely seed is just
+    the cluster it already was.
+    """
+    st, d = _call("GET", "/skills/growth?limit=20&min_weight=1")
+    assert st == 200
+    if not d["count"]:
+        pytest.skip("no growth candidates on this graph")
+    for c in d["candidates"]:
+        assert c["weight"] >= 1
+        assert c["grown"] == c["weight"] - c["seeded"], \
+            "grown must be what accumulated after the projection, not the total"
+        assert c["seeded"] >= 0
+
+
+@live
+def test_uncrystallizing_drops_the_projection():
+    """
+    The edges describe a position in the graph that stops existing when the
+    skill does. Left behind they would point at a deleted node, and a
+    DETACH DELETE would remove them without anyone being told how many.
+    """
+    n4j, drv = _n4j()
+    if drv is None:
+        pytest.skip("no Neo4j")
+    with drv.session() as s:
+        rec = s.run("""
+            MATCH (:Memory)-[a:ASSOCIATED_WITH]->(sk:Skill)
+            WHERE sk.status = 'deprecated' OR sk.skill_id IS NULL
+            RETURN count(a) AS n
+        """).single()
+    assert rec["n"] == 0, "no association may survive the skill it pointed at"

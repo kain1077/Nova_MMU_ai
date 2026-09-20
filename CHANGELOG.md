@@ -118,6 +118,64 @@ hottest path, and the removal of code that could not run.
   crystallizing those with `extends` set to the owner (`suggested_parent`) -- which is
   the outcome the overlap was evidence for.
 
+- **A skill inherits the associations of the cluster it replaced.** Crystallizing
+  severed the pathway that identified the cluster. Those memories were grouped BECAUSE
+  they kept being recalled alongside things around them; compression then demoted them
+  to Blue and -- since crystallized members were excluded from co-recall pairing --
+  stopped them accumulating at all, while the Skill got no graph position of its own.
+  Its only edges were `HAS_KEYWORD`, `PROCEDURALIZED_FROM` and `EXTENDS_SKILL`. On the
+  graph this was found on, 356 co-recall edges worth 855 in total ran from crystallized
+  members out to 99 still-live memories, and not one of them could reach the skill
+  standing in for those members. Compressing a cluster made it *harder* to reach
+  associatively, which is the opposite of the point.
+
+  Each outside memory's summed co-recall weight to any member now becomes one
+  `ASSOCIATED_WITH` edge to the Skill -- summed rather than averaged, because a memory
+  tied to three members of a cluster is more strongly about it than one tied to a
+  single member, and averaging erases exactly that. The projection derives membership
+  from `PROCEDURALIZED_FROM` rather than taking it from the caller, so it is also
+  correct to re-run after `add_skill_members()` or `remove_skill_members()`: it SETS
+  the seed and carries forward whatever has accumulated since, and therefore cannot
+  inflate what it repairs.
+
+  `POST /skills/project_associations` backfills skills crystallized before this
+  existed. Dry-run by default, like `/index_repair`.
+
+- **The edge is live, and it is the only growth path left.** It cannot run through the
+  members -- they are Blue and excluded from pairing, deliberately, so a compressed
+  cluster stops thickening its own edges. What does still happen is that a skill is
+  DELIVERED in a recall, beside other memories, and that is the same evidence co-recall
+  captures between two memories, one level up.
+
+  `GET /skills/growth` reports memories accumulating association without being members,
+  with `seeded` separated from `grown`, because only the second is new evidence -- a
+  high weight that is entirely seed is just the cluster it already was. Those are
+  candidates for `POST /skills/{id}/members`, so the signal now has a mechanism behind
+  it rather than being an observation with nowhere to go.
+
+- **Recall can reach a skill through the graph, not only through wording.**
+  `match_skills()` takes the addresses the query already matched and asks which skills
+  they point at, ranked BESIDE the embedding and keyword paths rather than as a
+  tiebreak -- a skill reached because the conversation is demonstrably in its
+  neighbourhood is not weaker evidence than one reached by wording, and treating it as
+  a tiebreak would leave the co-recall graph decorative.
+
+  Scoring saturates (`w/(w+MMU_ASSOC_REF)`), because association weight has no ceiling
+  and dividing by a maximum would let one hot neighbourhood outrank everything reached
+  by meaning. A first cut used a reference of 8 and effectively everything saturated:
+  a query scored 0.947 by association against semantic matches at 0.86, which is not
+  ranking beside but ranking above. Per-edge weights run median 3, p90 15, max 59 on a
+  real graph, and a score sums every edge from the memories one query matched, so
+  per-query totals land in the tens to low hundreds; at a reference of 40 that same
+  query scores 0.78 and the semantic match leads it.
+
+  `MMU_ASSOC_FLOOR` keeps weak associations out for the same reason `min_semantic` is
+  high: a matched skill WITHHOLDS its members from the delivered context, so a loose
+  match subtracts evidence rather than adding noise.
+
+  Uncrystallizing drops the projection -- it describes a position in the graph that is
+  about to stop existing.
+
 ### Fixed
 
 - **A direct question is no longer buried under reflections.** `get_creative_outputs()`
@@ -172,6 +230,12 @@ hottest path, and the removal of code that could not run.
   to an 8-member cluster silently says no to the 3-member clusters inside it, which
   nobody reviewed -- and nothing would undo it, since `superseded` is not `pending` and
   the sweep's `ON MATCH` leaves those rows alone forever.
+
+- **Neo4j-backed tests no longer skip themselves while Neo4j is running.**
+  `neo4j_layer` reads its `NEO4J_*` names into module-level constants at import, so
+  whichever test imported it first froze in whatever the environment held then, and a
+  helper loading `.env` afterwards could not undo it. Credentials now load at module
+  scope, before anything can import it.
 
 
 - **Skills can grow.** `POST /skills/{id}/members` adds memories to an existing

@@ -2378,7 +2378,188 @@ def link_skill_keywords(skill_id, terms, replace=False):
         return 0
 
 
-def match_skills(query_vector=None, terms=None, limit=3, min_semantic=0.75):
+def project_skill_associations(skill_id):
+    """
+    Carry a skill's members' outward co-recall onto the skill itself, as
+    ASSOCIATED_WITH edges. Returns how many edges it wrote.
+
+    Crystallizing severed the associative pathway it was built from. The
+    cluster existed BECAUSE those memories were recalled together with things
+    around them; compression then demoted the members to Blue and -- since the
+    pairing exclusion -- stopped them accumulating at all, while the Skill got
+    no graph position of its own. Its only edges were HAS_KEYWORD,
+    PROCEDURALIZED_FROM and EXTENDS_SKILL. On the graph where this was found,
+    356 co-recall edges worth 855 in total ran from crystallized members out to
+    99 still-live memories, and none of them could reach the skill that
+    replaced them.
+
+    So the weight is projected: for each outside memory, the sum of its
+    co-recall weight to any member becomes one edge to the Skill. Summed rather
+    than averaged because a memory tied to three members of a cluster is more
+    strongly about it than one tied to a single member, and averaging would
+    erase exactly that.
+
+    Members are read from PROCEDURALIZED_FROM rather than passed in, because
+    that edge IS the membership -- threading addresses through the caller only
+    creates a second version of the truth that can disagree with the graph.
+    That also makes this safe to re-run after add_skill_members() or
+    remove_skill_members(): it SETS the seed rather than adding to it, and
+    carries forward whatever has accumulated since, so re-projecting a skill
+    cannot inflate it.
+    """
+    driver = get_driver()
+    if driver is None or not skill_id:
+        return 0
+    try:
+        with driver.session() as s:
+            rec = s.run("""
+                MATCH (m:Memory)-[:PROCEDURALIZED_FROM]->(sk:Skill {skill_id: $sid})
+                WITH sk, collect(m) AS members
+                UNWIND members AS mem
+                MATCH (o:Memory)-[c:CO_RECALLED]-(mem)
+                WHERE NOT o IN members
+                WITH sk, o, sum(c.weight) AS w
+                MERGE (o)-[a:ASSOCIATED_WITH]->(sk)
+                ON CREATE SET a.weight = w, a.seeded = w,
+                              a.created_at = $now, a.last_at = $now
+                ON MATCH  SET a.weight = w + (coalesce(a.weight, 0)
+                                              - coalesce(a.seeded, 0)),
+                              a.seeded = w, a.last_at = $now
+                RETURN count(*) AS n
+            """, sid=skill_id, now=datetime.now().isoformat()).single()
+            n = rec["n"] if rec else 0
+        if n:
+            log.info("Projected %d association(s) onto skill %s", n, skill_id[:8])
+        return n
+    except Exception as e:
+        log.warning(f"project_skill_associations failed: {e}")
+        return 0
+
+
+def project_all_skill_associations():
+    """
+    Backfill the projection across every active skill.
+
+    Returns {"skills": n, "edges": n} or None if the graph could not be read.
+    Idempotent for the same reason the single-skill version is.
+    """
+    driver = get_driver()
+    if driver is None:
+        return None
+    try:
+        with driver.session() as s:
+            ids = [r["sid"] for r in s.run("""
+                MATCH (sk:Skill) WHERE sk.status = 'active'
+                RETURN sk.skill_id AS sid
+            """)]
+        total = sum(project_skill_associations(sid) for sid in ids)
+        log.info("Projected %d association(s) across %d skill(s)", total, len(ids))
+        return {"skills": len(ids), "edges": total}
+    except Exception as e:
+        log.warning(f"project_all_skill_associations failed: {e}")
+        return None
+
+
+def bump_skill_associations(skill_ids, memory_addresses):
+    """
+    Strengthen ASSOCIATED_WITH for memories delivered alongside a skill.
+
+    This is the live half, and it is now the ONLY way the edge can grow.
+    Members cannot carry it: they are Blue after crystallization and, since the
+    pairing exclusion, are left out of co-recall entirely -- deliberately, so a
+    compressed cluster stops thickening its own edges. An association that only
+    grew when a member was recalled would therefore never grow at all.
+
+    What does still happen is that a skill is DELIVERED in a recall, beside
+    other memories -- and that is the same evidence co-recall captures between
+    two memories, one level up.
+
+    It is worth keeping because a memory that keeps arriving with a skill is a
+    candidate for belonging to it. The edge is not only a retrieval path, it is
+    the record of a cluster still growing after it was compressed.
+    """
+    driver = get_driver()
+    if driver is None or not skill_ids or not memory_addresses:
+        return 0
+    try:
+        with driver.session() as s:
+            rec = s.run("""
+                MATCH (sk:Skill) WHERE sk.skill_id IN $sids AND sk.status = 'active'
+                MATCH (o:Memory) WHERE o.address IN $addrs
+                // Never to its own members: a skill already contains them, and
+                // an edge back would make every delivery look like growth.
+                AND NOT (o)-[:PROCEDURALIZED_FROM]->(sk)
+                MERGE (o)-[a:ASSOCIATED_WITH]->(sk)
+                ON CREATE SET a.weight = 1, a.seeded = 0,
+                              a.created_at = $now, a.last_at = $now
+                ON MATCH  SET a.weight = coalesce(a.weight, 0) + 1, a.last_at = $now
+                RETURN count(*) AS n
+            """, sids=list(skill_ids), addrs=list(memory_addresses),
+                 now=datetime.now().isoformat()).single()
+            return rec["n"] if rec else 0
+    except Exception as e:
+        log.warning(f"bump_skill_associations failed: {e}")
+        return 0
+
+
+def clear_skill_associations(skill_id):
+    """Drop a skill's projected associations. Used when it is undone."""
+    driver = get_driver()
+    if driver is None:
+        return 0
+    try:
+        with driver.session() as s:
+            rec = s.run("""
+                MATCH (:Memory)-[a:ASSOCIATED_WITH]->(sk:Skill {skill_id: $sid})
+                DELETE a RETURN count(a) AS n
+            """, sid=skill_id).single()
+            return rec["n"] if rec else 0
+    except Exception as e:
+        log.warning(f"clear_skill_associations failed: {e}")
+        return 0
+
+
+def skill_growth_candidates(skill_id=None, limit=5, min_weight=3):
+    """
+    Memories strongly associated with a skill that are not part of it.
+
+    The reason the live edge is worth maintaining: a memory that keeps being
+    delivered alongside a skill is evidence the skill should grow to include
+    it -- and since #15 that is a thing the system can actually do, with
+    add_skill_members(). Without this the association is only a retrieval path;
+    with it, a compressed cluster can still be observed accumulating.
+
+    Read-only. Nothing here changes a skill -- it reports what a reviewer or a
+    sweep could act on.
+    """
+    driver = get_driver()
+    if driver is None:
+        return []
+    try:
+        with driver.session() as s:
+            return [dict(r) for r in s.run("""
+                MATCH (o:Memory)-[a:ASSOCIATED_WITH]->(sk:Skill)
+                WHERE sk.status = 'active'
+                  AND ($sid IS NULL OR sk.skill_id = $sid)
+                  AND a.weight >= $minw
+                  AND NOT (o)-[:PROCEDURALIZED_FROM]->(sk)
+                  AND o.color <> 'Blue'
+                RETURN sk.skill_id AS skill_id, sk.trigger AS trigger,
+                       o.address   AS address,
+                       substring(coalesce(o.payload, ''), 0, 90) AS preview,
+                       a.weight    AS weight,
+                       coalesce(a.seeded, 0) AS seeded,
+                       a.weight - coalesce(a.seeded, 0) AS grown
+                ORDER BY a.weight DESC
+                LIMIT $lim
+            """, sid=skill_id, minw=int(min_weight), lim=int(limit))]
+    except Exception as e:
+        log.warning(f"skill_growth_candidates failed: {e}")
+        return []
+
+
+def match_skills(query_vector=None, terms=None, limit=3, min_semantic=0.75,
+                 matched_addresses=None, assoc_ref=None):
     """
     Find active skills relevant to a query, by embedding and by keyword.
 
@@ -2433,6 +2614,35 @@ def match_skills(query_vector=None, terms=None, limit=3, min_semantic=0.75):
                     score = hits / float(len(terms))
                     if sid not in found or score > found[sid][0]:
                         found[sid] = (score, "keyword")
+
+            # Association: the skills the memories THIS query already matched
+            # point at. Kept on the same 0-1 scale as the other two so one
+            # ordering covers all three, and ranked BESIDE them rather than as
+            # a tiebreak -- a skill reached because the conversation is
+            # demonstrably in its neighbourhood is not weaker evidence than one
+            # reached by wording, and treating it as a tiebreak would leave the
+            # co-recall graph decorative.
+            if matched_addresses:
+                ref = float(assoc_ref) if assoc_ref else ASSOC_REF
+                for r in s.run("""
+                    MATCH (o:Memory)-[a:ASSOCIATED_WITH]->(sk:Skill)
+                    WHERE sk.status = 'active' AND o.address IN $addrs
+                    WITH sk, sum(a.weight) AS w
+                    RETURN sk.skill_id AS sid, w
+                    ORDER BY w DESC LIMIT $lim
+                """, addrs=list(matched_addresses), lim=max(int(limit) * 3, 10)):
+                    sid, w = r["sid"], float(r["w"] or 0)
+                    score = w / (w + ref) if w > 0 else 0.0
+                    # Floored for the same reason min_semantic is high: a
+                    # matched skill WITHHOLDS its members from the delivered
+                    # context, so a loose match does not merely add noise, it
+                    # removes evidence. Every memory in a hot neighbourhood
+                    # carries some association to some skill; only a strong one
+                    # should be allowed to substitute.
+                    if score < ASSOC_FLOOR:
+                        continue
+                    if sid not in found or score > found[sid][0]:
+                        found[sid] = (score, "association")
 
             if not found:
                 return []
@@ -2844,6 +3054,27 @@ def _created_for_addresses(session, member_addresses):
 # hundred proposals is functionally the same as the empty one this phase set
 # out to fix. Existing proposals still refresh at the ceiling; only new ones
 # wait for room.
+# Reference weight at which an association scores 0.5, via w/(w+ref).
+#
+# Saturating rather than linear because association weight has no ceiling: a
+# long-lived pair keeps accumulating, and dividing by a maximum would let one
+# hot neighbourhood outrank everything reached by meaning.
+#
+# 40 comes off the real distribution. Individual edges run median 3, p90 15,
+# max 59, but a score sums every edge from the memories one query matched, so
+# per-query totals land in the tens to low hundreds. A first cut used 8 and
+# effectively everything saturated -- a query scored 0.947 against semantic
+# matches at 0.86, which is not "ranks beside" but "ranks above everything".
+# At 40, that same query scores 0.78: competitive with a strong semantic match
+# without displacing it.
+ASSOC_REF = float(os.environ.get("MMU_ASSOC_REF", "40"))
+
+# Minimum association score that may deliver a skill. Present for the same
+# reason min_semantic is high: a matched skill WITHHOLDS its members from the
+# delivered context, so a weak match subtracts evidence rather than adding
+# noise. 0.35 is about a summed weight of 21 at the reference above.
+ASSOC_FLOOR = float(os.environ.get("MMU_ASSOC_FLOOR", "0.35"))
+
 MAX_PENDING_PROPOSALS = 25
 
 # Semantic floor a MERGED cluster has to clear to be offered as one proposal.
