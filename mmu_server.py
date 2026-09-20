@@ -1701,15 +1701,30 @@ def recall(body: RecallIn):
     skills, replaced = [], set()
     try:
         qvec = EMB.embed(body.prompt) if EMB.enabled else None
+        # Hand the addresses this query already matched to the association
+        # path, so a skill can surface because the conversation is demonstrably
+        # in its neighbourhood -- not only because the wording lined up.
+        matched_addrs = [r.get("address") for r in results if r.get("address")]
         skills = n4j.match_skills(
-            query_vector = qvec,
-            terms        = ingest.extract_keywords(body.prompt),
-            limit        = SKILL_RECALL_MAX,
+            query_vector      = qvec,
+            terms             = ingest.extract_keywords(body.prompt),
+            limit             = SKILL_RECALL_MAX,
+            matched_addresses = matched_addrs,
         )
         if skills:
             for sk in skills:
                 replaced.update(a for a in (sk.get("members") or []) if a)
             n4j.record_skill_invocation([sk["skill_id"] for sk in skills])
+            # The live half, and the only growth path left: members are
+            # excluded from co-recall pairing once compressed, so an edge that
+            # depended on them would never strengthen. A memory delivered
+            # beside a skill is the same evidence co-recall captures between
+            # two memories, one level up -- and one that keeps arriving with a
+            # skill is a candidate for belonging to it. Members are excluded
+            # inside the query: a skill already contains them.
+            n4j.bump_skill_associations(
+                [sk["skill_id"] for sk in skills],
+                [a for a in matched_addrs if a not in replaced])
     except Exception as e:
         log.warning("skill matching failed (recall unaffected): %s", e)
 
@@ -2063,7 +2078,69 @@ def crystallize(body: CrystallizeIn, x_mmu_source: Optional[str] = Header(None))
     skill["indexed"] = _index_skill(skill["skill_id"], body.trigger, body.procedure)
     skill["extends"] = _link_parent(skill["skill_id"], body.extends)
 
+    # Carry the members' co-recall onto the skill. Without this, compressing a
+    # cluster severs the associative pathway that identified it: the members go
+    # Blue, the pairing exclusion stops them accumulating at all, and the skill
+    # has no graph position of its own to inherit what they were connected to.
+    skill["associations"] = n4j.project_skill_associations(skill["skill_id"])
+
     return {"status": "crystallized", **skill}
+
+
+@app.post("/skills/project_associations")
+def project_associations(apply: bool = False):
+    """
+    Backfill ASSOCIATED_WITH for skills crystallized before the projection
+    existed.
+
+    Every skill created until now inherited nothing: its members went Blue,
+    stopped accumulating co-recall of their own, and the weight that identified
+    the cluster stayed attached to memories the skill could not reach.
+
+    Dry-run by default, like /index_repair -- it writes edges across the whole
+    graph and should be inspectable before it runs. Idempotent: the projection
+    SETS the seed and carries forward whatever has accumulated since, so
+    running it twice does not double anything.
+    """
+    skills = n4j.get_skills(status="active")
+    if not apply:
+        return {
+            "status": "dry-run",
+            "skills": len(skills),
+            "note": ("Nothing was written. Re-run with apply=true to project "
+                     "co-recall weight from each skill's members onto the skill."),
+        }
+
+    out = n4j.project_all_skill_associations()
+    if out is None:
+        raise HTTPException(503, "Could not reach Neo4j.")
+    return {
+        "status": "projected",
+        "skills": out["skills"],
+        "edges_written": out["edges"],
+        "note": f"Projected {out['edges']} association(s) across {out['skills']} skill(s).",
+    }
+
+
+@app.get("/skills/growth")
+def skill_growth(skill_id: Optional[str] = None, limit: int = 10,
+                 min_weight: int = 3):
+    """
+    Memories strongly associated with a skill but not part of it.
+
+    This is what the live association edge is FOR. A memory that keeps being
+    delivered alongside a skill is evidence the skill should grow to include
+    it -- and since add_skill_members() that is something the system can
+    actually do, rather than a suggestion with no mechanism behind it.
+
+    Reports `seeded` (what the projection put there at crystallization) beside
+    `grown` (what has accumulated since), because only the second is new
+    evidence -- a high weight that is entirely seed is just the cluster it
+    already was.
+    """
+    rows = n4j.skill_growth_candidates(skill_id=skill_id, limit=limit,
+                                       min_weight=min_weight)
+    return {"candidates": rows, "count": len(rows)}
 
 
 @app.get("/skills")
@@ -2159,6 +2236,11 @@ def uncrystallize(skill_id: str, confirm: str = ""):
     resolved, why = n4j.resolve_skill_id(skill_id)
     if not resolved:
         raise HTTPException(404, why)
+    # Drop the projected associations before the skill goes. They describe a
+    # position in the graph that is about to stop existing, and a DETACH DELETE
+    # would remove the edges without anyone being told how many.
+    dropped = n4j.clear_skill_associations(resolved)
+
     info, why = n4j.uncrystallize_skill(resolved)
     if info is None:
         raise HTTPException(404 if why == "no such skill" else 409, why)
@@ -2174,6 +2256,7 @@ def uncrystallize(skill_id: str, confirm: str = ""):
     mmu.v2_index.set_skill_member([m["address"] for m in info["restored"]], False)
     mmu.v2_index.save()
 
+    info["associations_dropped"] = dropped
     return {"status": "uncrystallized", **info}
 
 
@@ -2269,6 +2352,12 @@ def add_skill_members(skill_id: str, body: SkillMembersIn,
             reindexed = _index_skill(resolved, updated["trigger"],
                                      updated["procedure"], replace_keywords=True)
 
+    # Membership changed, so the projection is stale: the new members bring
+    # their own outward co-recall with them. Re-projecting SETS the seed and
+    # carries forward whatever growth has accumulated, so this cannot inflate
+    # the skill's associations.
+    info["associations"] = n4j.project_skill_associations(resolved)
+
     return {"status": "members_added", **info,
             **({"reindexed": reindexed} if reindexed else {}),
             "note": ("Skill id, invocation_count and tree edges are unchanged. "
@@ -2303,6 +2392,10 @@ def remove_skill_members(skill_id: str, body: SkillMemberRemoveIn):
     # another active skill and stay compressed, the same asymmetry this
     # endpoint already applies to colour.
     mmu.v2_index.set_skill_member([r["address"] for r in info["removed"]], False)
+
+    # A removed member's contribution has to come off the skill's seed, which
+    # re-projecting from the current membership does.
+    info["associations"] = n4j.project_skill_associations(resolved)
 
     return {"status": "members_removed", **info}
 
@@ -2531,6 +2624,8 @@ def crystallize_proposal(proposal_id: str, body: CrystallizeIn,
     n4j.close_proposal_for_members(addrs, skill["skill_id"])
     skill["indexed"] = _index_skill(skill["skill_id"], body.trigger, body.procedure)
     skill["extends"] = _link_parent(skill["skill_id"], body.extends)
+    skill["associations"] = n4j.project_skill_associations(skill["skill_id"])
+
     return {"status": "crystallized", "proposal_id": proposal_id, **skill}
 
 
