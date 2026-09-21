@@ -23,8 +23,10 @@ runs entirely on your own machine.
   searchable with page-level provenance. Reference material never ages.
 - **Proactive suggestions.** Recall can carry a small "you might also want" list drawn
   from connections across different domains.
-- **Routines.** Memories that cluster densely can be crystallized into a `Routine` node
-  with human confirmation, never automatically.
+- **Routines.** Memories that cluster densely can be crystallized into a `Routine` node.
+  By default that takes human confirmation and never happens on its own; one env var
+  hands the decision to your model instead. See
+  [Letting a model do it](#letting-a-model-do-it).
 
 Everything runs locally. See [Privacy](#privacy).
 
@@ -333,6 +335,13 @@ loop is what the un-biasing actually is without it, crystallizing changes what g
 and queues them as proposals; turning one into a Routine is a human decision, because it
 restructures memory rather than adding to it.
 
+That is the default, and the rest of this section describes it. It stops being true the
+moment you set `MMU_ALLOW_MODEL_CRYSTALLIZE=true`, which hands the same decision to your
+model -- including writing the trigger and procedure itself, and growing routines to
+absorb proposals they already overlap. That is a real change in who is deciding, not a
+convenience toggle, and [Letting a model do it](#letting-a-model-do-it) is where it is
+described.
+
 ```
 python mmu_review.py                    # what is waiting
 python mmu_review.py 1                  # inspect proposal 1 in full
@@ -342,7 +351,8 @@ python mmu_review.py --sweep            # look for new candidates now
 ```
 
 Confirming shows exactly which memories will be demoted and requires you to type
-`CRYSTALLIZE`. You write the trigger and the procedure. Nothing else does.
+`CRYSTALLIZE`. You write the trigger and the procedure -- unless you have handed that to
+your model, in which case it writes them and no typed confirmation is asked for.
 
 Everything is reversible:
 
@@ -392,13 +402,26 @@ active child cannot be deleted out from under it.
 
 ### Letting a model do it
 
-`MMU_ALLOW_MODEL_CRYSTALLIZE=true` gives your model tools to review, create, branch and
-reverse routines itself. **Off by default, and the default is the recommendation:** a model
+`MMU_ALLOW_MODEL_CRYSTALLIZE=true` gives your model tools to review, create, grow, branch
+and reverse routines itself. **Off by default, and the default is the recommendation:** a model
 that drafts a proposal can then approve its own draft, and the review stops being a
 review. It is enforced server-side, not merely by hiding the tool.
 
+Be clear about what it removes. With it on there is no confirmation step at all: the
+model picks the cluster, writes the trigger and the procedure, demotes the memories, and
+moves to the next one. A queue of nineteen proposals can be empty before you next look
+at it, and nothing warns you, because from the system's point of view nothing unusual
+happened.
+
+That is a reasonable thing to want -- it is fast, and it is what the tooling is for --
+but it is a different system from the one the rest of this README describes. The session
+context tells the model so, rather than repeating the human-gated wording at a model that
+can act.
+
 Useful for testing the whole loop, and the reason reversal is available to the model too.  
 Being able to create without being able to undo is the worse half to hand out.
+Everything stays reversible: `uncrystallize_routine` for a whole routine,
+`POST /skills/<id>/members/remove` for a single growth.
 
 ---
 
@@ -463,7 +486,7 @@ worth knowing early:
 | `MMU_SEMANTIC_FLOOR` | `0.0` | Drop weak keyword hits. `0.0` = off. |
 | `MMU_ANTICIPATE_MAX` | `3` | Proactive suggestions per recall. `0` = off. |
 | `MMU_BIND` | `127.0.0.1` | Interface the ports bind to. `0.0.0.0` exposes to your LAN. |
-| `MMU_ALLOW_MODEL_CRYSTALLIZE` | `false` | Let a model create and reverse routines itself. See [Routines](#routines). |
+| `MMU_ALLOW_MODEL_CRYSTALLIZE` | `false` | Let a model create, grow and reverse routines itself, with no confirmation step. See [Letting a model do it](#letting-a-model-do-it). |
 | `MMU_API_KEY` | *(unset)* | Shared secret. Required on every endpoint but `/health` when set. |
 | `MMU_CORS_ORIGINS` | *(empty)* | Browser origins allowed. Empty disables CORS. |
 

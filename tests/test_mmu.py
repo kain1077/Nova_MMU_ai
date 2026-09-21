@@ -2594,3 +2594,90 @@ def test_growing_requires_confirmation():
     st, _ = _call("POST", f"/skill_proposals/{blocked[0]['proposal_id']}/grow",
                   {"confirmed": False})
     assert st == 400
+
+
+# ═════════════════════════════════════════════════════════════
+#  The session context describes the session it is in
+# ═════════════════════════════════════════════════════════════
+
+def _proposal_block():
+    """
+    The emitted lines of the session bundle's crystallization block, with
+    comments stripped.
+
+    Comments in there quote the old wording in order to explain why it was
+    wrong, so a scan that includes them finds exactly the strings it is
+    checking are gone. What matters is what reaches the model.
+    """
+    src = _server_src()
+    blk = src[src.index("MEMORY CLUSTERS READY FOR REVIEW"):]
+    blk = blk[:blk.index("# Phase 8: blend in")]
+    blk = chr(10).join(l for l in blk.split(chr(10))
+                       if not l.strip().startswith("#"))
+    # Join adjacent string literals. The emitted sentences are wrapped across
+    # several of them, so a phrase the reader sees as one run is not
+    # contiguous in the source and a substring check would miss it.
+    return re.sub(r'"\s*\n\s*"', '', blk)
+
+
+def test_the_proposal_block_matches_what_the_model_can_do():
+    """
+    The crystallization block asserted flatly that this "cannot be done from
+    any tool you have". That holds only while MMU_ALLOW_MODEL_CRYSTALLIZE is
+    off. With it on the model has crystallize_routine and grow_routine, and
+    this text was contradicting its own tool list at the top of every single
+    conversation.
+
+    Read as source rather than rendered, because the wrong branch is the
+    failure and a test that only ever sees one of them would not notice.
+    """
+    blk = _proposal_block()
+
+    assert "if MODEL_MAY_CRYSTALLIZE:" in blk, \
+        "what the model is told must depend on what it can do"
+    permissive, gated = blk.split("else:", 1)
+    assert "You CAN do this yourself" in permissive
+    assert "cannot be done from any tool you have" in gated
+    assert "cannot be done from any tool you have" not in permissive, \
+        "the permissive branch must not repeat the human-gated claim"
+
+
+def test_the_proposal_block_names_a_tool_that_exists():
+    """
+    It said "Use review_skills". That is not a tool -- the Skill to Routine
+    rename covered the MCP surface and missed this string, so the one
+    actionable instruction in the block named something the model could not
+    call.
+    """
+    import inspect, mmu_mcp_server as mcp
+    blk = _proposal_block()
+
+    registered = set(re.findall(r'"name": "(\w+)"', inspect.getsource(mcp)))
+    for named in re.findall(r"\b(review_\w+|crystallize_\w+|grow_\w+|uncrystallize_\w+)\b", blk):
+        assert named in registered, \
+            f"the session context tells the model to use {named!r}, which is not a tool"
+
+
+def test_the_readme_does_not_promise_a_gate_the_flag_removes():
+    """
+    The README said "never automatically", "Nothing crystallizes on its own"
+    and "You write the trigger and the procedure. Nothing else does." All
+    three stop being true with MMU_ALLOW_MODEL_CRYSTALLIZE=true, and a reader
+    meets them three hundred lines before the section that explains the flag.
+
+    They are allowed to stay -- they describe the default -- but each has to
+    carry the qualification with it.
+    """
+    import pathlib
+    readme = (pathlib.Path(__file__).resolve().parents[1] / "README.md").read_text(
+        encoding="utf-8")
+
+    assert "never automatically." not in readme, \
+        "an unqualified 'never automatically' outlives the flag that breaks it"
+    assert "Nothing else does." not in readme, \
+        "'Nothing else does' is false whenever the model is the one doing it"
+
+    blk = readme[readme.index("**Nothing crystallizes on its own.**"):]
+    blk = blk[:blk.index("```")]
+    assert "MMU_ALLOW_MODEL_CRYSTALLIZE" in blk, \
+        "the claim and its exception must sit together, not 300 lines apart"

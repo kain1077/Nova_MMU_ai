@@ -3000,7 +3000,12 @@ def session_bundle(top_per_domain: int = 1):
 
     if pending:
         lines.append("")
-        lines.append("MEMORY CLUSTERS READY FOR REVIEW (needs the user's decision):")
+        # Whose decision it is depends on the flag, same as the body below.
+        lines.append(
+            "MEMORY CLUSTERS READY FOR REVIEW "
+            + ("(yours to decide in this session):" if MODEL_MAY_CRYSTALLIZE
+               else "(needs the user's decision):")
+        )
         for p in pending:
             sem = p.get("semantic_coherence")
             sem_s = f", meaning {sem:.2f}" if isinstance(sem, (int, float)) else ""
@@ -3009,14 +3014,45 @@ def session_bundle(top_per_domain: int = 1):
             )
             for prev in p.get("previews", []):
                 lines.append(f"    - {prev}")
-        lines.append(
-            "  Crystallizing one of these compresses its members into a Skill and "
-            "DEMOTES those memories to Blue. That is a change to how memory is "
-            "structured, so it is the user's call and cannot be done from any tool you "
-            "have. Use review_skills for the full list. If one looks right to you, "
-            "say which memories would be demoted and why the compression is worth "
-            "it -- do not ask for approval as though it were a formality."
-        )
+        # What this says depends on what the reader can actually do.
+        #
+        # It used to assert flatly that crystallizing "cannot be done from any
+        # tool you have". That is true only while MMU_ALLOW_MODEL_CRYSTALLIZE
+        # is off. With it on, the model has crystallize_routine and
+        # grow_routine, and this block was telling it otherwise at the top of
+        # every single conversation -- a standing claim contradicted by its own
+        # tool list.
+        #
+        # It also said "Use review_skills", which is not a tool. The Skill ->
+        # Routine rename covered the MCP surface and missed this string, so the
+        # one instruction here that was actionable named something the model
+        # could not call.
+        #
+        # Same failure both times as the blocked-proposal refusal: a message
+        # describing a world the reader is not in.
+        if MODEL_MAY_CRYSTALLIZE:
+            lines.append(
+                "  Crystallizing one of these compresses its members into a Routine "
+                "and DEMOTES those memories to Blue, the state the recall gate "
+                "treats as inactive. You CAN do this yourself in this session: "
+                "crystallize_routine for a proposal nothing else owns, grow_routine "
+                "for one marked OWNED. Use review_routines for the full list and "
+                "the detail. Because nobody else is checking, say which memories "
+                "you are demoting and why the compression earns it -- as a record "
+                "of the decision, not a request for permission. Everything here is "
+                "reversible: uncrystallize_routine undoes a whole routine, and "
+                "removing members undoes a growth."
+            )
+        else:
+            lines.append(
+                "  Crystallizing one of these compresses its members into a Routine "
+                "and DEMOTES those memories to Blue. That is a change to how memory "
+                "is structured, so it is the user's call and cannot be done from any "
+                "tool you have in this session. Use review_routines for the full "
+                "list. If one looks right to you, say which memories would be "
+                "demoted and why the compression is worth it -- do not ask for "
+                "approval as though it were a formality."
+            )
 
     # Phase 8: blend in the most recently closed session's summary, if one
     # exists, so a brand new conversation can open with continuity instead
