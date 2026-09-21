@@ -76,6 +76,14 @@ hottest path, and the removal of code that could not run.
 
 ### Fixed
 
+- **`/skill_proposals?status=superseded` answered 400.** `superseded` was added with the
+  merge and retirement work and never added to the endpoint's allowed list, so the one
+  status the sweep now produces in bulk was the one you could not ask for -- while the
+  same rows were plainly visible through `status=` (all). A graph with twenty-five
+  retired proposals could not list them.
+
+### Fixed
+
 - **The crystallization refusal no longer recommends what cannot work.** It now names the
   owning routine in full (the truncated ids in summaries match nothing), lists the owned
   and the free addresses separately, points at `grow_routine`, and states plainly that

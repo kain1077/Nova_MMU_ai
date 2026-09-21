@@ -2544,8 +2544,13 @@ def skill_proposals(status: Optional[str] = "pending", limit: int = 50):
     """
     if status == "":
         status = None
-    if status and status not in ("pending", "rejected", "crystallized"):
-        raise HTTPException(400, "status must be pending, rejected or crystallized")
+    # `superseded` was added with the merge and retirement work and never
+    # added here, so the one status the sweep now produces in bulk was the one
+    # you could not ask for -- the filter answered 400 for rows that plainly
+    # exist and are visible through status= (all).
+    if status and status not in ("pending", "rejected", "crystallized", "superseded"):
+        raise HTTPException(
+            400, "status must be pending, rejected, crystallized or superseded")
 
     props = n4j.get_skill_proposals(status=status, limit=limit)
     return {
