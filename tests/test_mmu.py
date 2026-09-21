@@ -2229,9 +2229,10 @@ def test_blocked_proposal_offers_the_tree_instead_of_a_dead_end():
         assert "free_members" in p
         for b in p["blocked_by"]:
             assert b.get("skill_id"), "the owning skill must be named, not implied"
-        if len(p["free_members"]) >= 2:
-            assert p.get("suggested_parent"), \
-                "with enough free members the queue must offer a parent to extend"
+        if p["free_members"]:
+            assert p.get("owner_skill_id"), \
+                "any free member at all makes this growable -- the queue " \
+                "must name the routine to grow"
 
 
 def test_rejecting_a_merged_cluster_releases_its_fragments():
@@ -2415,3 +2416,181 @@ def test_uncrystallizing_drops_the_projection():
             RETURN count(a) AS n
         """).single()
     assert rec["n"] == 0, "no association may survive the skill it pointed at"
+
+
+# ═════════════════════════════════════════════════════════════
+#  A blocked proposal has a route that exists
+# ═════════════════════════════════════════════════════════════
+
+def _server_src():
+    """mmu_server.py as text. Matches the read used elsewhere in this file."""
+    import pathlib
+    return (pathlib.Path(__file__).resolve().parents[1] / "mmu_server.py").read_text(
+        encoding="utf-8")
+
+
+def test_the_blocked_refusal_never_recommends_an_unreachable_route():
+    """
+    The regression guard for the loop itself.
+
+    The refusal used to say "crystallize a different proposal with `extends`
+    set to the owning skill id, or link the owning skill under a parent".
+    Both are unreachable. The ownership check runs inside the write
+    transaction and nothing relaxes it; _link_parent() runs after
+    crystallize_skill has already committed and only draws an EXTENDS_SKILL
+    edge between two Skill nodes. And crystallize takes a proposal_id with no
+    member-subset parameter, so "crystallize just the free ones" could not be
+    expressed even if it worked.
+
+    A model told to do the impossible does it, fails, and tries the next
+    impossible thing. That is the loop.
+    """
+    import inspect, neo4j_layer as n4j
+    src = inspect.getsource(n4j.crystallize_skill)
+    branch = src[src.index("if owners:"):]
+
+    assert "grow_routine" in branch, "the refusal must name the tool that works"
+    assert "/members" in branch, "and the HTTP route behind it"
+    assert "does NOT help" in branch, "and must explicitly deny extends"
+    for bad in ("with `extends` set", "extends set to the owning",
+                "link the owning skill under a parent"):
+        assert bad not in branch, f"refusal still recommends {bad!r}"
+
+
+def test_the_refusal_separates_free_members_from_owned_ones():
+    """
+    Naming the owned addresses alone leaves the reader to work out which of
+    its own members are still available -- and the complement is the part that
+    matters. Both lists, explicitly, and a distinct case when there are none.
+    """
+    import inspect, neo4j_layer as n4j
+    branch = inspect.getsource(n4j.crystallize_skill)
+    branch = branch[branch.index("if owners:"):]
+    assert "free = [a for a in member_addresses if a not in set(taken)]" in branch
+    assert "if free:" in branch and "else:" in branch
+
+
+def test_growth_is_gated_exactly_like_crystallization():
+    """
+    Growing demotes memories to Blue on a model's say-so, the same consequence
+    crystallizing has. Same three gates -- and the server must not rely on the
+    client keeping the MCP-side promise.
+    """
+    import inspect, mmu_mcp_server as mcp
+    body = _server_src()
+    body = body[body.index("def grow_from_proposal"):]
+    assert "_guard_model_write" in body, "the endpoint must be server-gated"
+    assert "confirmed" in body, "the endpoint must require confirmation"
+
+    gated = inspect.getsource(mcp)
+    gated = gated[gated.index("if ALLOW_CRYSTALLIZE:"):]
+    assert '"name": "grow_routine"' in gated, \
+        "grow_routine must only be registered behind ALLOW_CRYSTALLIZE"
+
+
+def test_growth_never_reaches_the_idle_daemon():
+    """
+    The idle sweep's safety property is that it writes SkillProposal nodes and
+    nothing else. Growth demotes real memories. Crystallize was deliberately
+    kept out of IDLE_TOOLS for this reason and growth belongs on the same side
+    of that line -- this is the kind of thing added later "for symmetry".
+    """
+    import inspect, mmu_idle_daemon as d
+    src = inspect.getsource(d)
+    tools = src[src.index("IDLE_TOOLS"):]
+    tools = tools[:tools.index(chr(10) + "def ")] if (chr(10) + "def ") in tools else tools
+    assert "grow" not in tools.lower(), "growth must stay out of IDLE_TOOLS"
+
+
+def test_growth_only_targets_a_skill_that_blocks_the_proposal():
+    """
+    The safety rail. Without it the tool is "put any memories into any skill",
+    which is far more capability than resolving a block requires. Growth may
+    only merge a proposal into a skill the system itself reported as blocking
+    that proposal.
+    """
+    body = _server_src()
+    body = body[body.index("def grow_from_proposal"):]
+    assert "does not own any member of this proposal" in body
+    assert 'resolved not in {o["skill_id"] for o in owners}' in body, \
+        "the target must be validated against the proposal's actual owners"
+
+
+def test_growth_closes_the_proposal_with_its_whole_member_set():
+    """
+    close_proposal_for_members() keys on the member_key of everything it is
+    given, so passing only the free subset computes a different key and
+    matches nothing -- leaving the proposal pending and fully absorbed, which
+    is exactly the state that sends a reader round again.
+    """
+    body = _server_src()
+    body = body[body.index("def grow_from_proposal"):]
+    assert "close_proposal_for_members(all_members" in body, \
+        "the whole member set closes the proposal, not just the free ones"
+
+
+def test_a_single_free_member_is_still_actionable():
+    """
+    The retirement floor was two, justified in its own comment by
+    crystallizing the free members under the owner via `extends` -- a route
+    that never existed. It therefore discarded the one-free-member case,
+    which is precisely the one growth handles best.
+    """
+    import inspect, neo4j_layer as n4j
+    src = inspect.getsource(n4j.retire_unconfirmable_proposals)
+    assert "- claimed < 1" in src, "one free member must not be retired"
+    assert "- claimed < 2" not in src
+
+
+@live
+def test_a_blocked_proposal_reports_the_routine_to_grow():
+    """
+    `suggested_parent` was named for a route that does not exist, and the name
+    is what pushed both the queue text and the model toward `extends`. The
+    value is the skill that already owns the most of this proposal.
+    """
+    _, d = _call("GET", "/skill_proposals?limit=50")
+    blocked = [p for p in d.get("proposals", []) if p.get("blocked")]
+    if not blocked:
+        pytest.skip("nothing blocked on this graph")
+    for p in blocked:
+        assert "owner_skill_id" in p, "the routine to grow must be named"
+        assert "suggested_parent" not in p, "the misleading name must be gone"
+        if p.get("free_members"):
+            assert p["owner_skill_id"], \
+                "any free member at all makes this growable -- no >= 2 floor"
+
+
+@live
+def test_growing_refuses_a_routine_that_owns_nothing_in_the_proposal():
+    """The safety rail, end to end."""
+    _, d = _call("GET", "/skill_proposals?limit=50")
+    blocked = [p for p in d.get("proposals", [])
+               if p.get("blocked") and p.get("free_members")]
+    _, sk = _call("GET", "/skills?status=active")
+    if not blocked or len(sk.get("skills", [])) < 2:
+        pytest.skip("need a blocked proposal and a second routine")
+
+    target = blocked[0]
+    stranger = next((s["skill_id"] for s in sk["skills"]
+                     if s["skill_id"] != target["owner_skill_id"]), None)
+    if not stranger:
+        pytest.skip("no non-owning routine to try")
+
+    st, body = _call("POST", f"/skill_proposals/{target['proposal_id']}/grow",
+                     {"skill_id": stranger, "confirmed": True})
+    assert st == 409, "growing into an unrelated routine must be refused"
+    assert "does not own any member" in body.get("detail", "")
+
+
+@live
+def test_growing_requires_confirmation():
+    """Same gate as crystallize: it buries memories in Blue."""
+    _, d = _call("GET", "/skill_proposals?limit=50")
+    blocked = [p for p in d.get("proposals", [])
+               if p.get("blocked") and p.get("free_members")]
+    if not blocked:
+        pytest.skip("nothing blocked on this graph")
+    st, _ = _call("POST", f"/skill_proposals/{blocked[0]['proposal_id']}/grow",
+                  {"confirmed": False})
+    assert st == 400
