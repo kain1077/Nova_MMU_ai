@@ -428,6 +428,37 @@ hottest path, and the removal of code that could not run.
 
 ### Fixed
 
+- **The README's list of MCP tools now matches the tools the bridge registers.** It
+  described "four tools" and named four. The bridge registers **six** unconditionally --
+  `review_routines` had gone unmentioned since it was added, and `read_artifact` arrived
+  with the session-bundle digest -- and **five more** behind
+  `MMU_ALLOW_MODEL_CRYSTALLIZE=true`, which the list did not distinguish from the rest
+  because it did not mention them at all. Anyone counting tools in their client against
+  the README came up two short in the default configuration.
+
+  The same audit caught a second claim pointing the other way: **Letting a model do it**
+  said the flag "gives your model tools to review, create, grow, branch and reverse
+  routines." Reviewing is not gated and never was. `review_routines` is registered
+  unconditionally and is read-only, so the sentence overstated what the flag withholds --
+  the more worrying direction for a setting whose whole purpose is to withhold something.
+
+  And the reason given for the default was wrong about this codebase. **Letting a model
+  do it** justified `MMU_ALLOW_MODEL_CRYSTALLIZE=false` on the grounds that "a model that
+  drafts a proposal can then approve its own draft, and the review stops being a review."
+  A model cannot draft a proposal. Proposals are written only by the density sweep, which
+  is not exposed as a tool; `POST /skill_proposals/{id}/crystallize` ignores
+  `member_addresses` and resolves members from the proposal's immutable `created_at`
+  stamps; and the general `/crystallize`, which does take an arbitrary member list, is
+  never offered to the model. The self-approval loop the sentence warned about is not
+  reachable.
+
+  The section now says what the flag actually withholds -- there is no confirmation step,
+  and confirming demotes the source memories to Blue -- and what the model actually
+  contributes, which is the trigger and procedure wording that a density score cannot
+  produce. The warning added alongside this, that a queue can be emptied before you next
+  look at it, is kept as written: it is about autonomy, which the flag really does hand
+  over, rather than about membership, which it does not. The default is unchanged.
+
 - **Crystallizing a cluster now actually relieves the recall bias it was built to
   relieve.** The roadmap's stated purpose is that a hot path *converts* into a Routine
   "rather than accumulating recall-weight without bound forever," and the README says the

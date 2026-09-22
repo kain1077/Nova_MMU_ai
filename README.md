@@ -188,8 +188,19 @@ MMU speaks [MCP](https://modelcontextprotocol.io). Point your client at
 }
 ```
 
-That gives the model four tools: `get_session_context` (call first, loads the
-bundle), `recall_memory`, `save_memory`, and `rate_memory`.
+That gives the model six tools: `get_session_context` (call first, loads the bundle),
+`recall_memory`, `save_memory`, `rate_memory`, `read_artifact`, and `review_routines`.
+
+The last two are worth a word. `read_artifact` opens one of the idle-pass artifacts in
+full; the session bundle lists those by title and opening line only, so this is how the
+rest of one is reached. `review_routines` is read-only — it reports what is sitting in the
+crystallization queue and cannot act on it.
+
+Five more exist and are **not** registered by default: `crystallize_routine`,
+`grow_routine`, `link_routine`, `unlink_routine` and `uncrystallize_routine` appear only
+when `MMU_ALLOW_MODEL_CRYSTALLIZE=true`. They restructure memory, so they are also refused
+server-side rather than merely hidden from the tool list — see
+[Letting a model do it](#letting-a-model-do-it).
 
 Use `python3` instead of `python` if that's what your system calls it. On most macOS and
 Linux installs, bare `python` either isn't on `PATH` or points at Python 2. Both `command`
@@ -402,25 +413,41 @@ active child cannot be deleted out from under it.
 
 ### Letting a model do it
 
-`MMU_ALLOW_MODEL_CRYSTALLIZE=true` gives your model tools to review, create, grow, branch
-and reverse routines itself. **Off by default, and the default is the recommendation:** a model
-that drafts a proposal can then approve its own draft, and the review stops being a
-review. It is enforced server-side, not merely by hiding the tool.
+`MMU_ALLOW_MODEL_CRYSTALLIZE=true` gives your model tools to confirm, grow, branch and
+reverse routines itself. Reviewing is not on that list and never was: `review_routines` is
+always registered, because reading the queue changes nothing.
 
-Be clear about what it removes. With it on there is no confirmation step at all: the
-model picks the cluster, writes the trigger and the procedure, demotes the memories, and
-moves to the next one. A queue of nineteen proposals can be empty before you next look
+Be clear about what it removes. With it on there is no confirmation step at all: the model
+picks which proposal to act on, writes the trigger and the procedure, demotes the memories,
+and moves to the next one. A queue of nineteen proposals can be empty before you next look
 at it, and nothing warns you, because from the system's point of view nothing unusual
 happened.
 
-That is a reasonable thing to want -- it is fast, and it is what the tooling is for --
-but it is a different system from the one the rest of this README describes. The session
+That is a reasonable thing to want -- it is fast, and it is what the tooling is for -- but
+it is a different system from the one the rest of this README describes. The session
 context tells the model so, rather than repeating the human-gated wording at a model that
 can act.
 
-Useful for testing the whole loop, and the reason reversal is available to the model too.  
-Being able to create without being able to undo is the worse half to hand out.
-Everything stays reversible: `uncrystallize_routine` for a whole routine,
+**What it does not hand over is the membership.** Proposals are written only by the density
+sweep, which scores clusters on co-recall and semantic similarity, and the sweep is not
+exposed as a tool. `POST /skill_proposals/{id}/crystallize` ignores `member_addresses`
+outright and resolves the members from the proposal's immutable `created_at` stamps, and
+the general `/crystallize` — the one that does take an arbitrary member list — is not
+offered to the model at all. So the model chooses which queued cluster to act on and what
+to call it. It cannot invent one, and it cannot draft the proposal it then confirms.
+
+What it does supply is the **trigger** and the **procedure**. That is the half a density
+score cannot produce: the sweep knows that a cluster is dense, not what its memories
+*mean*, and a trigger and a procedure are prose.
+
+**Off by default** for the plain reason rather than a subtle one: there is no confirmation
+step, and confirming demotes the source memories to Blue. It is enforced server-side by
+`_guard_model_write()`, which refuses any request tagged `X-MMU-Source: model` while the
+flag is off, so the gate is not merely a hidden tool.
+
+Useful for testing the whole loop, and the reason reversal is available to the model too.
+Being able to create without being able to undo is the worse half to hand out, so
+everything stays reversible: `uncrystallize_routine` for a whole routine,
 `POST /skills/<id>/members/remove` for a single growth.
 
 ---
@@ -486,7 +513,7 @@ worth knowing early:
 | `MMU_SEMANTIC_FLOOR` | `0.0` | Drop weak keyword hits. `0.0` = off. |
 | `MMU_ANTICIPATE_MAX` | `3` | Proactive suggestions per recall. `0` = off. |
 | `MMU_BIND` | `127.0.0.1` | Interface the ports bind to. `0.0.0.0` exposes to your LAN. |
-| `MMU_ALLOW_MODEL_CRYSTALLIZE` | `false` | Let a model create, grow and reverse routines itself, with no confirmation step. See [Letting a model do it](#letting-a-model-do-it). |
+| `MMU_ALLOW_MODEL_CRYSTALLIZE` | `false` | Let a model confirm, grow and reverse routine *proposals* itself, with no confirmation step. It never picks the members. See [Letting a model do it](#letting-a-model-do-it). |
 | `MMU_API_KEY` | *(unset)* | Shared secret. Required on every endpoint but `/health` when set. |
 | `MMU_CORS_ORIGINS` | *(empty)* | Browser origins allowed. Empty disables CORS. |
 
