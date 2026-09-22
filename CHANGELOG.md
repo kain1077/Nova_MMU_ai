@@ -10,7 +10,87 @@ Packaged installers for every platform, and an audit pass: two concurrency
 bugs with real data loss behind them, one write-amplification fix on the
 hottest path, and the removal of code that could not run.
 
+### Fixed
+
+- **The session context no longer tells the model it cannot do what it can do.** The
+  crystallization block asserted flatly that this "cannot be done from any tool you have".
+  That holds only while `MMU_ALLOW_MODEL_CRYSTALLIZE` is off. With it on the model has
+  `crystallize_routine` and `grow_routine`, and the block was contradicting its own tool
+  list at the top of every conversation. It now branches: unchanged when the gate is on,
+  and when it is off it says which tool fits which proposal, notes that nothing else is
+  checking, asks for a record of what is being demoted and why, and names both undos.
+
+- **The same block pointed at `review_skills`, which is not a tool.** The Skill to Routine
+  rename covered the MCP surface and missed this string, so the one actionable instruction
+  in it named something the model could not call.
+
+- **The README promised a gate that one env var removes.** "never automatically",
+  "Nothing crystallizes on its own" and "You write the trigger and the procedure. Nothing
+  else does." are all true by default and all false with `MMU_ALLOW_MODEL_CRYSTALLIZE=true`
+  -- and a reader met them three hundred lines before the section explaining the flag.
+  Each now carries its qualification, and the flag's own section says plainly what it
+  removes: no confirmation step at all, the model writing the trigger and procedure, and a
+  queue of nineteen proposals that can be empty before you next look at it.
+
 ### Added
+
+- **A blocked proposal has a route that exists.** `POST /skill_proposals/{id}/grow`
+  and a `grow_routine` MCP tool resolve a proposal whose members are already owned, by
+  growing the owning routine to absorb the unclaimed ones.
+
+  Every route the system named before this was unreachable, and a model following them
+  could only loop. `extends` does not relax the ownership check — that check runs inside
+  `crystallize_skill`'s write transaction and nothing influences it, while `_link_parent()`
+  runs only after crystallize has already committed and draws an `EXTENDS_SKILL` edge
+  between two Skill nodes. It never touches membership. `link_routine` is the same.
+
+  Worse, the advice named addresses the tool cannot accept. `review_routines` printed
+  *"Crystallize the 2 unclaimed member(s) with extends=&lt;owner&gt;"* and listed them — but
+  `crystallize_routine` takes a `proposal_id` with no member-subset parameter, so the only
+  call available sends the owned members too and refuses identically.
+
+  A proposal overlapping an existing routine is not an obstacle to route around; it is
+  evidence that routine should be bigger. Growth is that, and #15 already built the
+  machinery.
+
+  The tool takes a `proposal_id`, never addresses. Addresses are rewritten in place on
+  recall so any the caller holds may be stale, and a free-form address list would let a
+  model bury arbitrary memories in Blue — the server derives the free set from the
+  proposal itself. The target routine must already own part of that proposal, or the call
+  is refused; without that rail this degenerates into "put any memories into any routine".
+  Gated exactly like crystallization: `MMU_ALLOW_MODEL_CRYSTALLIZE`, `confirmed=true`, and
+  `_guard_model_write`, because the MCP gate is a client-side promise the server must not
+  depend on.
+
+### Changed
+
+- **`suggested_parent` is now `owner_skill_id`** on a proposal. The old name said
+  "parent", which is what pushed both the queue text and the reader toward `extends`;
+  the value is the routine that already owns the most of this proposal — the one to grow.
+  Pre-1.0, so renamed outright rather than dual-emitted.
+
+- **A proposal with a single free member is no longer retired.**
+  `retire_unconfirmable_proposals()` required two, justified in its own comment by
+  crystallizing the free members under the owner via `extends` — the route that never
+  existed. It was therefore discarding exactly the case growth handles best.
+
+### Fixed
+
+- **`/skill_proposals?status=superseded` answered 400.** `superseded` was added with the
+  merge and retirement work and never added to the endpoint's allowed list, so the one
+  status the sweep now produces in bulk was the one you could not ask for -- while the
+  same rows were plainly visible through `status=` (all). A graph with twenty-five
+  retired proposals could not list them.
+
+### Fixed
+
+- **The crystallization refusal no longer recommends what cannot work.** It now names the
+  owning routine in full (the truncated ids in summaries match nothing), lists the owned
+  and the free addresses separately, points at `grow_routine`, and states plainly that
+  `extends` will not help — the old wording has been read many times and would otherwise
+  be reached for from memory. When no member is free it says the proposal is fully
+  absorbed and to leave it, rather than offering a repair.
+
 
 - **The session bundle stops growing with the artifact backlog.**
   `/creative_outputs/mark_seen` had no caller anywhere in the system. Every artifact
@@ -80,6 +160,102 @@ hottest path, and the removal of code that could not run.
   so counting it as a chat candidate collapsed the budget to its floor at every depth:
   a deep pass assembling 2043 characters and calling it context.
 
+- **Overlapping skill proposals are merged instead of offered side by side.**
+  Two proposals over the same memory are not two pieces of work. Colour is
+  single-valued, so the first to claim a member locks every other cluster containing
+  it out permanently. The queue never said so: 26 pending proposals, 24 of which
+  shared members with another, presented as a numbered list of things to do.
+
+  Working through that list the way it reads is a loop, and the refusal message
+  closed it -- see *Fixed* below.
+
+  `find_skill_candidates` is `MATCH (a)-(b)-(c)`, so every candidate has exactly
+  three members; clusters larger than that were not rejected by the design, they were
+  unreachable by it. Overlapping triples are now folded back together before they are
+  queued, which both gets past three and makes the output disjoint: a cluster is
+  grown, emitted, and every remaining candidate still touching it is dropped rather
+  than offered, because once that cluster exists those candidates are unconfirmable.
+
+  Growth is bounded three ways because one bound does not hold. An absolute coherence
+  floor gets outrun: each admission moves a mean over every pair, so a growing cluster
+  ratchets through it without any single step crossing it -- a first attempt merged 35
+  triples into one 18-member cluster spanning six domains, never once dropping below
+  0.45. The bounds that work are relative to the seed (`MMU_MERGE_COHERENCE_DROP`) plus
+  a hard size ceiling (`MMU_MERGE_MAX_MEMBERS`), alongside the floor
+  (`MMU_MERGE_COHERENCE_FLOOR`).
+
+  Measured on a seeded graph: 14 raw candidates with 51 overlapping pairs became 2
+  disjoint proposals of 5 and 4 members, with zero overlap remaining and the two
+  topics kept apart rather than merged into one blob.
+
+- **Proposals report what they exclude.** `excludes` names the other pending proposals
+  sharing a member. Only proposal-vs-skill blocking was ever reported, so after an
+  uncrystallize both conflicting proposals showed as unblocked, both were attempted,
+  and the loop closed.
+
+- **A blocked proposal offers the tree instead of a dead end.** It now names the owning
+  routine, lists the members no routine has claimed (`free_members`), and suggests
+  crystallizing those with `extends` set to the owner (`suggested_parent`) -- which is
+  the outcome the overlap was evidence for.
+
+- **A skill inherits the associations of the cluster it replaced.** Crystallizing
+  severed the pathway that identified the cluster. Those memories were grouped BECAUSE
+  they kept being recalled alongside things around them; compression then demoted them
+  to Blue and -- since crystallized members were excluded from co-recall pairing --
+  stopped them accumulating at all, while the Skill got no graph position of its own.
+  Its only edges were `HAS_KEYWORD`, `PROCEDURALIZED_FROM` and `EXTENDS_SKILL`. On the
+  graph this was found on, 356 co-recall edges worth 855 in total ran from crystallized
+  members out to 99 still-live memories, and not one of them could reach the skill
+  standing in for those members. Compressing a cluster made it *harder* to reach
+  associatively, which is the opposite of the point.
+
+  Each outside memory's summed co-recall weight to any member now becomes one
+  `ASSOCIATED_WITH` edge to the Skill -- summed rather than averaged, because a memory
+  tied to three members of a cluster is more strongly about it than one tied to a
+  single member, and averaging erases exactly that. The projection derives membership
+  from `PROCEDURALIZED_FROM` rather than taking it from the caller, so it is also
+  correct to re-run after `add_skill_members()` or `remove_skill_members()`: it SETS
+  the seed and carries forward whatever has accumulated since, and therefore cannot
+  inflate what it repairs.
+
+  `POST /skills/project_associations` backfills skills crystallized before this
+  existed. Dry-run by default, like `/index_repair`.
+
+- **The edge is live, and it is the only growth path left.** It cannot run through the
+  members -- they are Blue and excluded from pairing, deliberately, so a compressed
+  cluster stops thickening its own edges. What does still happen is that a skill is
+  DELIVERED in a recall, beside other memories, and that is the same evidence co-recall
+  captures between two memories, one level up.
+
+  `GET /skills/growth` reports memories accumulating association without being members,
+  with `seeded` separated from `grown`, because only the second is new evidence -- a
+  high weight that is entirely seed is just the cluster it already was. Those are
+  candidates for `POST /skills/{id}/members`, so the signal now has a mechanism behind
+  it rather than being an observation with nowhere to go.
+
+- **Recall can reach a skill through the graph, not only through wording.**
+  `match_skills()` takes the addresses the query already matched and asks which skills
+  they point at, ranked BESIDE the embedding and keyword paths rather than as a
+  tiebreak -- a skill reached because the conversation is demonstrably in its
+  neighbourhood is not weaker evidence than one reached by wording, and treating it as
+  a tiebreak would leave the co-recall graph decorative.
+
+  Scoring saturates (`w/(w+MMU_ASSOC_REF)`), because association weight has no ceiling
+  and dividing by a maximum would let one hot neighbourhood outrank everything reached
+  by meaning. A first cut used a reference of 8 and effectively everything saturated:
+  a query scored 0.947 by association against semantic matches at 0.86, which is not
+  ranking beside but ranking above. Per-edge weights run median 3, p90 15, max 59 on a
+  real graph, and a score sums every edge from the memories one query matched, so
+  per-query totals land in the tens to low hundreds; at a reference of 40 that same
+  query scores 0.78 and the semantic match leads it.
+
+  `MMU_ASSOC_FLOOR` keeps weak associations out for the same reason `min_semantic` is
+  high: a matched skill WITHHOLDS its members from the delivered context, so a loose
+  match subtracts evidence rather than adding noise.
+
+  Uncrystallizing drops the projection -- it describes a position in the graph that is
+  about to stop existing.
+
 ### Fixed
 
 - **A direct question is no longer buried under reflections.** `get_creative_outputs()`
@@ -102,6 +278,44 @@ hottest path, and the removal of code that could not run.
   Verified against a real backend: a 10,371-token prompt into an 8,192-token window now
   completes after shrinking, where it previously produced a placebo summary reading
   "A conversation took place."
+
+- **The crystallization refusal no longer recommends the one move that cannot work.**
+  It said "either uncrystallize the skill that owns them, or pick a different proposal"
+  without naming which skill, so the reader had to guess an id -- and the advice itself
+  was the trap. Freeing the members lets exactly one of the overlapping proposals
+  succeed, so undoing and retrying only swaps which one refuses. A transcript of the
+  resulting loop: crystallize, blocked, notice two proposals share members, conclude
+  "uncrystallizing one should free them up for both", uncrystallize, still blocked,
+  pick another routine to undo. That reasoning is correct given what it was told.
+
+  The refusal now names the owning routine and its trigger, states plainly that
+  overlapping proposals are alternatives, and points at `extends` instead.
+
+- **Proposals a new skill makes impossible are retired.** Only the exactly-matching
+  proposal was ever closed on crystallize, so a cluster that merely OVERLAPPED the new
+  skill stayed pending forever while being unconfirmable. 22 of 26 pending proposals
+  were blocked that way, and 14 had no route at all. That is the queue a reviewer works
+  through, hitting refusal after refusal. Retirement now runs on crystallize and again
+  on every sweep. A proposal with two or more unclaimed members is deliberately kept --
+  it can still be crystallized under the owning routine.
+
+- **The pending-proposal ceiling no longer deadlocks the merge.** It counts pending
+  proposals, so a queue full of fragments had no room for the merged cluster that would
+  supersede them: the sweep deferred every one and nothing could change
+  (`created=0, deferred=4, pending=26` against a ceiling of 25). The ceiling was always
+  documented as a bound on unreviewed work rather than on the graph, so a cluster that
+  absorbs what is already queued is let through.
+
+- **Rejecting a merged cluster returns the fragments it absorbed.** Otherwise saying no
+  to an 8-member cluster silently says no to the 3-member clusters inside it, which
+  nobody reviewed -- and nothing would undo it, since `superseded` is not `pending` and
+  the sweep's `ON MATCH` leaves those rows alone forever.
+
+- **Neo4j-backed tests no longer skip themselves while Neo4j is running.**
+  `neo4j_layer` reads its `NEO4J_*` names into module-level constants at import, so
+  whichever test imported it first froze in whatever the environment held then, and a
+  helper loading `.env` afterwards could not undo it. Credentials now load at module
+  scope, before anything can import it.
 
 
 - **Skills can grow.** `POST /skills/{id}/members` adds memories to an existing
@@ -217,16 +431,16 @@ hottest path, and the removal of code that could not run.
 - **The README's list of MCP tools now matches the tools the bridge registers.** It
   described "four tools" and named four. The bridge registers **six** unconditionally --
   `review_routines` had gone unmentioned since it was added, and `read_artifact` arrived
-  with the session-bundle digest -- and **four more** behind
+  with the session-bundle digest -- and **five more** behind
   `MMU_ALLOW_MODEL_CRYSTALLIZE=true`, which the list did not distinguish from the rest
   because it did not mention them at all. Anyone counting tools in their client against
   the README came up two short in the default configuration.
 
   The same audit caught a second claim pointing the other way: **Letting a model do it**
-  said the flag "gives your model tools to review, create, branch and reverse routines."
-  Reviewing is not gated and never was. `review_routines` is registered unconditionally
-  and is read-only, so the sentence overstated what the flag withholds -- the more
-  worrying direction for a setting whose whole purpose is to withhold something.
+  said the flag "gives your model tools to review, create, grow, branch and reverse
+  routines." Reviewing is not gated and never was. `review_routines` is registered
+  unconditionally and is read-only, so the sentence overstated what the flag withholds --
+  the more worrying direction for a setting whose whole purpose is to withhold something.
 
   And the reason given for the default was wrong about this codebase. **Letting a model
   do it** justified `MMU_ALLOW_MODEL_CRYSTALLIZE=false` on the grounds that "a model that
@@ -238,10 +452,12 @@ hottest path, and the removal of code that could not run.
   never offered to the model. The self-approval loop the sentence warned about is not
   reachable.
 
-  The section now says what the flag actually withholds -- confirming a proposal demotes
-  the source memories to Blue, which is a real write and worth an explicit opt-in -- and
-  what the model actually contributes, which is the trigger and procedure wording that a
-  density score cannot produce. The default is unchanged.
+  The section now says what the flag actually withholds -- there is no confirmation step,
+  and confirming demotes the source memories to Blue -- and what the model actually
+  contributes, which is the trigger and procedure wording that a density score cannot
+  produce. The warning added alongside this, that a queue can be emptied before you next
+  look at it, is kept as written: it is about autonomy, which the flag really does hand
+  over, rather than about membership, which it does not. The default is unchanged.
 
 - **Crystallizing a cluster now actually relieves the recall bias it was built to
   relieve.** The roadmap's stated purpose is that a hot path *converts* into a Routine

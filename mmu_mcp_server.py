@@ -488,6 +488,40 @@ if ALLOW_CRYSTALLIZE:
         },
     })
     TOOLS.append({
+        "name": "grow_routine",
+        "description": (
+            "Resolve a BLOCKED routine proposal by GROWING the routine that "
+            "already owns part of it. Adds the proposal's unclaimed members to "
+            "that existing routine instead of creating a second routine over "
+            "the same material -- which is impossible, because a memory "
+            "belongs to exactly one routine. Use this whenever review_routines "
+            "marks a proposal OWNED. THIS IS A WRITE: the unclaimed members "
+            "are demoted to Blue, the state the recall gate treats as "
+            "inactive, exactly as crystallizing would. The routine keeps its "
+            "id, its invocation_count and its place in the tree. Say which "
+            "memories will be demoted before you call it. This does NOT work "
+            "through `extends` -- `extends` only draws a tree edge between two "
+            "routines and never changes which routine owns a memory."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "proposal_id": {"type": "string",
+                                "description": "proposal_id of a BLOCKED proposal, "
+                                               "from review_routines."},
+                "skill_id":    {"type": "string",
+                                "description": "Optional. The owning routine to "
+                                               "grow. Omit to use the routine that "
+                                               "already owns the most members of "
+                                               "this proposal. Must be a routine "
+                                               "review_routines listed as OWNING "
+                                               "part of this proposal -- any other "
+                                               "id is refused."},
+            },
+            "required": ["proposal_id"],
+        },
+    })
+    TOOLS.append({
         "name": "link_routine",
         "description": (
             "Make one existing routine a branch of another, building the routine "
@@ -671,7 +705,9 @@ def _tool_inventory():
     lines = ["Routine tools available in THIS session:"]
     for name, what in (
         ("review_routines",       "read the queue and the existing tree"),
-        ("crystallize_routine",   "create a routine (optionally under a parent, via extends)"),
+        ("crystallize_routine",   "create a NEW routine from a proposal nothing else owns"),
+        ("grow_routine",          "add a blocked proposal's free members to the "
+                                  "routine that owns the rest"),
         ("link_routine",          "branch an EXISTING routine under a parent, no rebuild"),
         ("unlink_routine",        "detach a routine from its parent, no rebuild"),
         ("uncrystallize_routine", "delete a routine and restore its memories"),
@@ -782,11 +818,70 @@ def mmu_skill_proposals(limit=10):
             )
             lines.append(f"    proposal_id: {p['proposal_id']}")
             if p.get("blocked"):
-                who = ", ".join(b["skill_id"][:8] for b in p.get("blocked_by", []))
+                # Names the owner and routes to `extends`. The old text said
+                # "uncrystallize that routine first", which is the advice that
+                # produced the loop: undoing a routine lets exactly one of the
+                # proposals over those memories succeed, so the reader undid,
+                # re-crystallized, hit the refusal from the other side, and
+                # went round again.
+                for b in p.get("blocked_by", []):
+                    trig = (b.get("trigger") or "").strip()
+                    lines.append(
+                        f"    OWNED: {b.get('taken_count', '?')} member(s) belong to "
+                        f"routine {b['skill_id']}"
+                        + (f" ({trig[:50]})" if trig else "")
+                    )
+                free = p.get("free_members") or []
+                owner = p.get("owner_skill_id")
+                if owner and free:
+                    # Names a tool that exists and can express this.
+                    #
+                    # The previous text said "crystallize the N unclaimed
+                    # members with extends=<owner>", which was unreachable
+                    # twice over: `extends` never relaxes the ownership check,
+                    # and crystallize_routine takes a proposal_id with no
+                    # member-subset parameter, so the only call available sent
+                    # the owned members too and refused identically. A model
+                    # following that advice can only fail and try the next
+                    # impossible thing.
+                    lines.append(
+                        f"    -> ACTIONABLE. {len(free)} member(s) are unclaimed. Add "
+                        f"them to the routine that owns the rest: "
+                        f'grow_routine(proposal_id="{p["proposal_id"]}", '
+                        f'skill_id="{owner}"). That grows the routine and closes '
+                        f"this proposal. The {len(free)} member(s) below are demoted "
+                        f"to Blue; the owned ones are already Blue and do not move."
+                    )
+                    for a in free:
+                        lines.append(f"       free (will be added): {a}")
+                    lines.append(
+                        "       Do NOT uncrystallize, and do NOT use extends: "
+                        "extends only draws a tree edge between two routines and "
+                        "never changes which routine owns a memory, so "
+                        "crystallizing refuses identically with it set."
+                    )
+                else:
+                    lines.append(
+                        "    -> Fully absorbed: every member already belongs to an "
+                        "active routine. Nothing to add and nothing to create. "
+                        "Leave it -- the next sweep retires it. Uncrystallizing "
+                        "the owner does not help -- it "
+                        "only swaps which proposal refuses."
+                    )
+            if p.get("excludes"):
+                # Alternatives, not a to-do list. Without this the queue reads
+                # as N independent items when it is a choice of one.
                 lines.append(
-                    f"    CANNOT CRYSTALLIZE: member(s) already belong to active "
-                    f"routine {who}. A memory cannot be compressed into two routines. "
-                    f"Uncrystallize that routine first, or leave this one."
+                    f"    EXCLUDES {len(p['excludes'])} other pending proposal(s): "
+                    f"{', '.join(x[:8] for x in p['excludes'][:6])}"
+                    + (" ..." if len(p["excludes"]) > 6 else "")
+                    + ". They share members with this one, so crystallizing this "
+                      "makes them permanently impossible. Choose one; do not work "
+                      "through them in turn."
+                )
+            if p.get("merged_from", 0) > 1:
+                lines.append(
+                    f"    (merged from {p['merged_from']} overlapping clusters)"
                 )
             if p.get("members_missing"):
                 lines.append(f"    WARNING: {p['members_missing']} member(s) no longer exist")
@@ -845,6 +940,41 @@ def mmu_crystallize(proposal_id, trigger, procedure, confidence=0.7, extends=Non
         )
     except Exception as e:
         return f"[MMU crystallize error: {e}]"
+
+
+def mmu_grow_routine(proposal_id, skill_id=None):
+    """
+    Grow the routine that blocks a proposal, absorbing that proposal's free
+    members.
+
+    Deliberately takes a proposal_id and not a list of addresses. Addresses
+    are rewritten in place on recall, so any the model is carrying may already
+    be stale; and a free-form address list would let it bury arbitrary
+    memories in Blue. The server derives the free set from the proposal.
+    """
+    try:
+        body = {"confirmed": True}
+        if skill_id:
+            body["skill_id"] = skill_id
+        r = requests.post(
+            f"{MMU_BASE}/skill_proposals/{proposal_id}/grow",
+            json=body,
+            headers={**_SESSION_HEADERS, "X-MMU-Source": "model"},
+            timeout=30,
+        )
+        data = r.json()
+        if r.status_code != 200:
+            return f"[MMU grow refused: {data.get('detail', r.status_code)}]"
+        added = data.get("added") or []
+        return (
+            f"Grew routine {data['skill_id']} to {data['member_count']} members." + chr(10) +
+            f"Added {len(added)}, now Blue: {', '.join(added)}" + chr(10) +
+            f"Trigger: {data.get('trigger')}" + chr(10) +
+            f"Proposal {proposal_id} is closed." + chr(10) +
+            f"Undo just this: POST /skills/{data['skill_id']}/members/remove"
+        )
+    except Exception as e:
+        return f"[MMU grow error: {e}]"
 
 
 def mmu_link_routine(skill_id, parent_id):
@@ -1042,6 +1172,17 @@ def handle(msg):
                     procedure   = arguments.get("procedure", ""),
                     confidence  = arguments.get("confidence", 0.7),
                     extends     = arguments.get("extends"),
+                )
+
+        elif name == "grow_routine":
+            if not ALLOW_CRYSTALLIZE:
+                text = ("Growing a routine is not enabled for tool use. It "
+                        "demotes the added memories, so it is confirmed by a "
+                        "human through mmu_review.py.")
+            else:
+                text = mmu_grow_routine(
+                    proposal_id = arguments.get("proposal_id", ""),
+                    skill_id    = arguments.get("skill_id"),
                 )
 
         elif name == "link_routine":

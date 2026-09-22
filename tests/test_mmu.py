@@ -46,6 +46,34 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Defaults to the second-instance port on purpose. See the module docstring.
+# Neo4j credentials have to be in the environment BEFORE neo4j_layer is
+# imported anywhere in this process. Its NEO4J_* names are module-level
+# constants read at import time, so whichever test imported it first froze in
+# whatever the environment held then -- and a helper loading .env afterwards
+# could not undo it. Every Neo4j-backed test then skipped itself with
+# "no Neo4j" while Neo4j was running the whole time, which is worse than
+# failing, because nothing reports it.
+#
+# Loaded ONLY from .env or an already-set environment. No default URI, on
+# purpose: bolt://127.0.0.1:7687 is where a developer's real graph lives, and
+# these tests write. Defaulting to it would aim them at production the moment
+# a checkout had no .env -- the same hazard MMU_TEST_ALLOW_PRODUCTION guards
+# on the HTTP side, which the Neo4j side had no equivalent for. Without
+# credentials the driver stays unconfigured and the tests skip, which is the
+# safe direction to fail in.
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_ENV = os.path.join(_ROOT, ".env")
+if os.path.exists(_ENV):
+    with open(_ENV, encoding="utf-8") as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _v = _line.split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip())
+if os.environ.get("NEO4J_PASS"):
+    os.environ.setdefault("NEO4J_USER", "neo4j")
+    os.environ.setdefault("NEO4J_ENABLED", "true")
+
 BASE = os.environ.get("MMU_TEST_BASE", "http://127.0.0.1:8766")
 
 # The port a normal MMU install listens on, and therefore the one the live tests
@@ -1036,16 +1064,40 @@ def test_no_memory_crowds_the_queue():
     Four overlapping triangles drawn from the same handful of hot memories
     filled 40% of a real queue, which a reviewer reads as the same finding
     four times. Breadth is the point of a review list.
+
+    Retargeted from /skill_candidates to /skill_proposals. /skill_candidates is
+    the raw triangle output, and since the merge it is an INPUT rather than
+    something anyone reviews -- overlap there is not a defect, it is the signal
+    merge_overlapping_candidates consumes to build a larger cluster. The queue
+    is what a reviewer reads.
+
+    The assertion is that overlap is DECLARED, not that it is absent. A sweep's
+    own output is disjoint, but a live queue also holds proposals from earlier
+    sweeps, and those can legitimately overlap a newer cluster without being
+    contained by it -- they are real alternatives, and discarding them would
+    throw away groupings a reviewer might prefer. They are retired
+    automatically once one of them is crystallized.
+
+    What must never happen again is overlap that nothing says out loud. That is
+    what turned the queue into a minefield: the reviewer worked through it as a
+    task list, hit an ownership refusal, read it as repairable, and looped.
     """
-    _, d = _call("GET", "/skill_candidates?limit=10")
-    if d["count"] < 4:
-        pytest.skip("too few candidates to crowd anything")
-    seen = {}
-    for c in d["candidates"]:
-        for m in c["members"]:
-            seen[m] = seen.get(m, 0) + 1
-    worst = max(seen.values())
-    assert worst <= 2, f"one memory appears in {worst} proposals; cap is 2"
+    _, d = _call("GET", "/skill_proposals?limit=50")
+    props = [p for p in d.get("proposals", []) if p.get("status") == "pending"]
+    if len(props) < 4:
+        pytest.skip("too few proposals to crowd anything")
+
+    by_id = {p["proposal_id"]: set(p["members"]) for p in props}
+    for p in props:
+        declared = set(p.get("excludes") or [])
+        for other in props:
+            if other["proposal_id"] == p["proposal_id"]:
+                continue
+            if by_id[p["proposal_id"]] & by_id[other["proposal_id"]]:
+                assert other["proposal_id"] in declared, (
+                    f"{p['proposal_id'][:8]} shares a member with "
+                    f"{other['proposal_id'][:8]} and does not say so"
+                )
 
 
 @live
@@ -2028,3 +2080,635 @@ def test_prompt_budget_reserves_room_for_tools_and_the_reply():
     assert big == d.IDLE_MAX_CHARS, "a large window is capped by the char ceiling"
     assert d._prompt_char_budget(Fake(None)) is None, "unknown context keeps the default"
     assert d._prompt_char_budget(Fake(512)) == 2000, "an unusable window still returns a floor"
+
+
+# ═════════════════════════════════════════════════════════════
+#  Overlapping proposals are merged, not offered as a queue
+# ═════════════════════════════════════════════════════════════
+
+def _n4j():
+    """A live Neo4j driver, or None, with credentials loaded from .env."""
+    import io
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = os.path.join(root, ".env")
+    if os.path.exists(env):
+        for line in io.open(env, encoding="utf-8"):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+    os.environ.setdefault("NEO4J_URI", "bolt://127.0.0.1:7687")
+    os.environ.setdefault("NEO4J_USER", "neo4j")
+    os.environ.setdefault("NEO4J_ENABLED", "true")
+    try:
+        import neo4j_layer as n4j
+        return n4j, n4j.get_driver()
+    except Exception:
+        return None, None
+
+
+def test_merge_returns_disjoint_clusters():
+    """
+    The contract, and the whole reason this exists.
+
+    Two clusters sharing a memory are alternatives: colour is single-valued, so
+    crystallizing either makes the other permanently unconfirmable. A queue of
+    26 proposals, 24 of which shared members with another, read as a list of
+    tasks and behaved as a minefield -- the reviewer hit an ownership refusal,
+    read it as repairable, uncrystallized to free the members, and looped.
+    """
+    n4j, drv = _n4j()
+    if drv is None:
+        pytest.skip("no Neo4j")
+    cands = n4j.find_skill_candidates(limit=40)
+    if len(cands) < 2:
+        pytest.skip("not enough candidates on this graph")
+    _, ref_w, _ = n4j.skill_weight_floor()
+    with drv.session() as s:
+        merged = n4j.merge_overlapping_candidates(s, cands, ref_w)
+    seen = set()
+    for c in merged:
+        stamps = set(str(t) for t in c["member_created"])
+        assert not (stamps & seen), "merged clusters must not share a member"
+        seen |= stamps
+
+
+def test_merge_respects_every_bound():
+    """
+    An absolute coherence floor alone does not hold. Each admission moves a
+    mean over every pair, so a growing cluster ratchets through the floor
+    without any single step crossing it -- 35 triples became one 18-member
+    cluster across six domains that way, and nothing ever dropped below 0.45.
+    """
+    n4j, drv = _n4j()
+    if drv is None:
+        pytest.skip("no Neo4j")
+    cands = n4j.find_skill_candidates(limit=40)
+    if len(cands) < 2:
+        pytest.skip("not enough candidates on this graph")
+    _, ref_w, _ = n4j.skill_weight_floor()
+    with drv.session() as s:
+        merged = n4j.merge_overlapping_candidates(s, cands, ref_w)
+    for c in merged:
+        assert len(c["members"]) <= n4j.MERGE_MAX_MEMBERS, "size bound"
+        sem = c.get("semantic_coherence")
+        if sem is not None and c.get("merged_from", 1) > 1:
+            assert sem >= n4j.MERGE_COHERENCE_FLOOR, "coherence floor"
+
+
+def test_merge_can_exceed_three_members():
+    """
+    find_skill_candidates is MATCH (a)-(b)-(c): every candidate it can produce
+    has exactly three members. Clusters larger than that were not rejected by
+    the design, they were unreachable by it. Merging is the route past three
+    without rewriting the traversal.
+    """
+    n4j, drv = _n4j()
+    if drv is None:
+        pytest.skip("no Neo4j")
+    cands = n4j.find_skill_candidates(limit=40)
+    if len(cands) < 4:
+        pytest.skip("not enough candidates on this graph")
+    assert {len(c["members"]) for c in cands} == {3}, "the raw query is a triangle"
+    _, ref_w, _ = n4j.skill_weight_floor()
+    with drv.session() as s:
+        merged = n4j.merge_overlapping_candidates(s, cands, ref_w)
+    if not any(c.get("merged_from", 1) > 1 for c in merged):
+        pytest.skip("no overlapping candidates on this graph to merge")
+    assert max(len(c["members"]) for c in merged) > 3
+
+
+def test_merge_is_a_noop_without_overlap():
+    """A candidate that touches nothing must come back unchanged."""
+    n4j, drv = _n4j()
+    if drv is None:
+        pytest.skip("no Neo4j")
+    cands = n4j.find_skill_candidates(limit=40)
+    if not cands:
+        pytest.skip("no candidates on this graph")
+    _, ref_w, _ = n4j.skill_weight_floor()
+    with drv.session() as s:
+        one = n4j.merge_overlapping_candidates(s, [cands[0]], ref_w)
+    assert len(one) == 1
+    assert set(one[0]["member_created"]) == set(cands[0]["member_created"])
+
+
+@live
+def test_proposals_declare_what_they_exclude():
+    """
+    Overlap between PENDING proposals was never reported -- only overlap with
+    an existing skill. So after uncrystallizing, both conflicting proposals
+    showed as unblocked, both were attempted, and the loop closed.
+    """
+    _, d = _call("GET", "/skill_proposals?limit=50")
+    props = d.get("proposals", [])
+    if len(props) < 2:
+        pytest.skip("need at least two proposals")
+    for p in props:
+        assert "excludes" in p, "a proposal must say which others it rules out"
+    by_id = {p["proposal_id"]: set(p.get("members", [])) for p in props}
+    for p in props:
+        for other in p["excludes"]:
+            if other in by_id:
+                assert by_id[other] & by_id[p["proposal_id"]], \
+                    "excludes must name only proposals that really share a member"
+
+
+@live
+def test_blocked_proposal_offers_the_tree_instead_of_a_dead_end():
+    """
+    A blocked proposal used to read as repairable by uncrystallizing, which is
+    the advice that produced the loop. Its unclaimed members can still be
+    crystallized UNDER the owning skill, so the queue has to say so.
+    """
+    _, d = _call("GET", "/skill_proposals?limit=50")
+    blocked = [p for p in d.get("proposals", []) if p.get("blocked")]
+    if not blocked:
+        pytest.skip("nothing blocked on this graph")
+    for p in blocked:
+        assert "free_members" in p
+        for b in p["blocked_by"]:
+            assert b.get("skill_id"), "the owning skill must be named, not implied"
+        if p["free_members"]:
+            assert p.get("owner_skill_id"), \
+                "any free member at all makes this growable -- the queue " \
+                "must name the routine to grow"
+
+
+def test_rejecting_a_merged_cluster_releases_its_fragments():
+    """
+    Merging retires the smaller clusters a large one contains. That is right
+    while the large one is live and wrong the moment it is rejected: saying no
+    to an 8-member cluster would otherwise silently say no to the 3-member
+    clusters inside it, which nobody reviewed.
+
+    And the sweep cannot repair it -- superseded is not pending, so the
+    upsert's ON MATCH leaves those rows alone forever. Nothing would ever offer
+    them again.
+
+    Runs on synthetic proposals it creates and deletes, so it never touches a
+    real review queue.
+    """
+    n4j, drv = _n4j()
+    if drv is None:
+        pytest.skip("no Neo4j")
+
+    big, frag, other = "test-big-key", "test-frag-key", "test-other-key"
+    ids = {}
+    try:
+        with drv.session() as s:
+            for key, status, sup in ((big, "pending", None),
+                                     (frag, "superseded", big),
+                                     (other, "superseded", "someone-elses-key")):
+                pid = "test-" + key
+                ids[key] = pid
+                s.run("""
+                    CREATE (p:SkillProposal {proposal_id: $pid, member_key: $key,
+                                             status: $status, superseded_by: $sup,
+                                             member_created: [], skill_score: 0.9,
+                                             created_at: $now, updated_at: $now})
+                """, pid=pid, key=key, status=status, sup=sup,
+                     now=n4j.datetime.now().isoformat())
+
+        ok, msg = n4j.reject_skill_proposal(ids[big], note="test")
+        assert ok, msg
+
+        with drv.session() as s:
+            rows = {r["k"]: r["st"] for r in s.run("""
+                MATCH (p:SkillProposal) WHERE p.member_key IN $keys
+                RETURN p.member_key AS k, p.status AS st
+            """, keys=[big, frag, other])}
+
+        assert rows[big] == "rejected"
+        assert rows[frag] == "pending", \
+            "a fragment of the rejected cluster must return"
+        assert rows[other] == "superseded", \
+            "a fragment of a DIFFERENT cluster must not"
+    finally:
+        with drv.session() as s:
+            s.run("MATCH (p:SkillProposal) WHERE p.member_key IN $keys DETACH DELETE p",
+                  keys=[big, frag, other])
+
+
+# ═════════════════════════════════════════════════════════════
+#  A skill inherits its members' associations
+# ═════════════════════════════════════════════════════════════
+
+def test_association_score_ranks_beside_meaning_not_above_it():
+    """
+    Association weight has no ceiling, so a linear score lets one hot
+    neighbourhood outrank everything reached by meaning. A first cut used a
+    reference of 8 and effectively everything saturated -- a query scored 0.947
+    by association against semantic matches at 0.86.
+
+    Pure, because the curve is the decision and it should not need a graph in a
+    particular state to check. The reference is calibrated against a real
+    distribution: per-edge weights run median 3, p90 15, max 59, and a score
+    sums every edge from the memories one query matched.
+    """
+    import neo4j_layer as n4j
+    curve = lambda w: w / (w + n4j.ASSOC_REF)
+
+    assert curve(1) < curve(10) < curve(100), "monotonic in weight"
+    assert curve(10 ** 9) < 1.0, "saturating, never reaching 1"
+    assert curve(n4j.ASSOC_REF) == pytest.approx(0.5), "0.5 at the reference"
+    # A typical strong semantic match sits around 0.85. Association has to
+    # clear a real bar to get there, rather than arriving by accumulation.
+    assert curve(100) < 0.85, "a merely well-connected skill must not outrank meaning"
+
+
+def test_association_floor_keeps_weak_matches_out():
+    """
+    A matched skill WITHHOLDS its members from the delivered context, so a weak
+    match subtracts evidence rather than adding noise. That is the same reason
+    min_semantic is high, and it applies here too.
+    """
+    import neo4j_layer as n4j
+    curve = lambda w: w / (w + n4j.ASSOC_REF)
+    assert 0.0 < n4j.ASSOC_FLOOR < 0.75, "a floor that is neither absent nor a wall"
+    assert curve(5) < n4j.ASSOC_FLOOR, "an incidental association must not deliver a skill"
+
+
+@live
+def test_a_skill_is_never_associated_with_its_own_members():
+    """
+    A skill already contains its members. An edge back would make every
+    delivery register as growth, which is the one signal this edge exists to
+    provide honestly.
+    """
+    n4j, drv = _n4j()
+    if drv is None:
+        pytest.skip("no Neo4j")
+    with drv.session() as s:
+        rec = s.run("""
+            MATCH (o:Memory)-[:ASSOCIATED_WITH]->(sk:Skill)
+            WHERE (o)-[:PROCEDURALIZED_FROM]->(sk)
+            RETURN count(*) AS n
+        """).single()
+    assert rec["n"] == 0
+
+
+@live
+def test_backfilling_associations_twice_does_not_double_them():
+    """
+    The projection SETS the seed rather than adding to it, and carries forward
+    whatever has accumulated since. Re-running a repair must not inflate the
+    thing it repairs -- and this one also runs on every membership change, so
+    it gets re-run a lot.
+    """
+    n4j, drv = _n4j()
+    if drv is None:
+        pytest.skip("no Neo4j")
+
+    def total():
+        with drv.session() as s:
+            r = s.run("""MATCH (:Memory)-[a:ASSOCIATED_WITH]->(:Skill)
+                         RETURN sum(a.weight) AS w, count(a) AS n""").single()
+        return (r["w"] or 0, r["n"] or 0)
+
+    # Both readings must bracket backfills with nothing else in between.
+    # Recall writes CO_RECALLED edges, so a reading taken before some other
+    # test ran a query is not a baseline -- the projection is DERIVED from
+    # those edges and is supposed to move when they do.
+    _call("POST", "/skills/project_associations?apply=true")
+    once = total()
+    if once[1] == 0:
+        pytest.skip("nothing projected on this graph")
+    _call("POST", "/skills/project_associations?apply=true")
+    assert total() == once, "a second backfill over an unchanged graph must be a no-op"
+
+
+@live
+def test_growth_separates_the_seed_from_what_accumulated():
+    """
+    The reason the live edge is maintained: a memory repeatedly delivered
+    beside a skill is evidence the skill should grow to include it -- and since
+    add_skill_members() that is something the system can act on.
+
+    Only `grown` is new evidence. A high weight that is entirely seed is just
+    the cluster it already was.
+    """
+    st, d = _call("GET", "/skills/growth?limit=20&min_weight=1")
+    assert st == 200
+    if not d["count"]:
+        pytest.skip("no growth candidates on this graph")
+    for c in d["candidates"]:
+        assert c["weight"] >= 1
+        assert c["grown"] == c["weight"] - c["seeded"], \
+            "grown must be what accumulated after the projection, not the total"
+        assert c["seeded"] >= 0
+
+
+@live
+def test_uncrystallizing_drops_the_projection():
+    """
+    The edges describe a position in the graph that stops existing when the
+    skill does. Left behind they would point at a deleted node, and a
+    DETACH DELETE would remove them without anyone being told how many.
+    """
+    n4j, drv = _n4j()
+    if drv is None:
+        pytest.skip("no Neo4j")
+    with drv.session() as s:
+        rec = s.run("""
+            MATCH (:Memory)-[a:ASSOCIATED_WITH]->(sk:Skill)
+            WHERE sk.status = 'deprecated' OR sk.skill_id IS NULL
+            RETURN count(a) AS n
+        """).single()
+    assert rec["n"] == 0, "no association may survive the skill it pointed at"
+
+
+# ═════════════════════════════════════════════════════════════
+#  A blocked proposal has a route that exists
+# ═════════════════════════════════════════════════════════════
+
+def _server_src():
+    """mmu_server.py as text. Matches the read used elsewhere in this file."""
+    import pathlib
+    return (pathlib.Path(__file__).resolve().parents[1] / "mmu_server.py").read_text(
+        encoding="utf-8")
+
+
+def test_the_blocked_refusal_never_recommends_an_unreachable_route():
+    """
+    The regression guard for the loop itself.
+
+    The refusal used to say "crystallize a different proposal with `extends`
+    set to the owning skill id, or link the owning skill under a parent".
+    Both are unreachable. The ownership check runs inside the write
+    transaction and nothing relaxes it; _link_parent() runs after
+    crystallize_skill has already committed and only draws an EXTENDS_SKILL
+    edge between two Skill nodes. And crystallize takes a proposal_id with no
+    member-subset parameter, so "crystallize just the free ones" could not be
+    expressed even if it worked.
+
+    A model told to do the impossible does it, fails, and tries the next
+    impossible thing. That is the loop.
+    """
+    import inspect, neo4j_layer as n4j
+    src = inspect.getsource(n4j.crystallize_skill)
+    branch = src[src.index("if owners:"):]
+
+    assert "grow_routine" in branch, "the refusal must name the tool that works"
+    assert "/members" in branch, "and the HTTP route behind it"
+    assert "does NOT help" in branch, "and must explicitly deny extends"
+    for bad in ("with `extends` set", "extends set to the owning",
+                "link the owning skill under a parent"):
+        assert bad not in branch, f"refusal still recommends {bad!r}"
+
+
+def test_the_refusal_separates_free_members_from_owned_ones():
+    """
+    Naming the owned addresses alone leaves the reader to work out which of
+    its own members are still available -- and the complement is the part that
+    matters. Both lists, explicitly, and a distinct case when there are none.
+    """
+    import inspect, neo4j_layer as n4j
+    branch = inspect.getsource(n4j.crystallize_skill)
+    branch = branch[branch.index("if owners:"):]
+    assert "free = [a for a in member_addresses if a not in set(taken)]" in branch
+    assert "if free:" in branch and "else:" in branch
+
+
+def test_growth_is_gated_exactly_like_crystallization():
+    """
+    Growing demotes memories to Blue on a model's say-so, the same consequence
+    crystallizing has. Same three gates -- and the server must not rely on the
+    client keeping the MCP-side promise.
+    """
+    import inspect, mmu_mcp_server as mcp
+    body = _server_src()
+    body = body[body.index("def grow_from_proposal"):]
+    assert "_guard_model_write" in body, "the endpoint must be server-gated"
+    assert "confirmed" in body, "the endpoint must require confirmation"
+
+    gated = inspect.getsource(mcp)
+    gated = gated[gated.index("if ALLOW_CRYSTALLIZE:"):]
+    assert '"name": "grow_routine"' in gated, \
+        "grow_routine must only be registered behind ALLOW_CRYSTALLIZE"
+
+
+def test_growth_never_reaches_the_idle_daemon():
+    """
+    The idle sweep's safety property is that it writes SkillProposal nodes and
+    nothing else. Growth demotes real memories. Crystallize was deliberately
+    kept out of IDLE_TOOLS for this reason and growth belongs on the same side
+    of that line -- this is the kind of thing added later "for symmetry".
+    """
+    import inspect, mmu_idle_daemon as d
+    src = inspect.getsource(d)
+    tools = src[src.index("IDLE_TOOLS"):]
+    tools = tools[:tools.index(chr(10) + "def ")] if (chr(10) + "def ") in tools else tools
+    assert "grow" not in tools.lower(), "growth must stay out of IDLE_TOOLS"
+
+
+def test_growth_only_targets_a_skill_that_blocks_the_proposal():
+    """
+    The safety rail. Without it the tool is "put any memories into any skill",
+    which is far more capability than resolving a block requires. Growth may
+    only merge a proposal into a skill the system itself reported as blocking
+    that proposal.
+    """
+    body = _server_src()
+    body = body[body.index("def grow_from_proposal"):]
+    assert "does not own any member of this proposal" in body
+    assert 'resolved not in {o["skill_id"] for o in owners}' in body, \
+        "the target must be validated against the proposal's actual owners"
+
+
+def test_growth_closes_the_proposal_with_its_whole_member_set():
+    """
+    close_proposal_for_members() keys on the member_key of everything it is
+    given, so passing only the free subset computes a different key and
+    matches nothing -- leaving the proposal pending and fully absorbed, which
+    is exactly the state that sends a reader round again.
+    """
+    body = _server_src()
+    body = body[body.index("def grow_from_proposal"):]
+    assert "close_proposal_for_members(all_members" in body, \
+        "the whole member set closes the proposal, not just the free ones"
+
+
+def test_a_single_free_member_is_still_actionable():
+    """
+    The retirement floor was two, justified in its own comment by
+    crystallizing the free members under the owner via `extends` -- a route
+    that never existed. It therefore discarded the one-free-member case,
+    which is precisely the one growth handles best.
+    """
+    import inspect, neo4j_layer as n4j
+    src = inspect.getsource(n4j.retire_unconfirmable_proposals)
+    assert "- claimed < 1" in src, "one free member must not be retired"
+    assert "- claimed < 2" not in src
+
+
+@live
+def test_a_blocked_proposal_reports_the_routine_to_grow():
+    """
+    `suggested_parent` was named for a route that does not exist, and the name
+    is what pushed both the queue text and the model toward `extends`. The
+    value is the skill that already owns the most of this proposal.
+    """
+    _, d = _call("GET", "/skill_proposals?limit=50")
+    blocked = [p for p in d.get("proposals", []) if p.get("blocked")]
+    if not blocked:
+        pytest.skip("nothing blocked on this graph")
+    for p in blocked:
+        assert "owner_skill_id" in p, "the routine to grow must be named"
+        assert "suggested_parent" not in p, "the misleading name must be gone"
+        if p.get("free_members"):
+            assert p["owner_skill_id"], \
+                "any free member at all makes this growable -- no >= 2 floor"
+
+
+@live
+def test_growing_refuses_a_routine_that_owns_nothing_in_the_proposal():
+    """The safety rail, end to end."""
+    _, d = _call("GET", "/skill_proposals?limit=50")
+    blocked = [p for p in d.get("proposals", [])
+               if p.get("blocked") and p.get("free_members")]
+    _, sk = _call("GET", "/skills?status=active")
+    if not blocked or len(sk.get("skills", [])) < 2:
+        pytest.skip("need a blocked proposal and a second routine")
+
+    target = blocked[0]
+    stranger = next((s["skill_id"] for s in sk["skills"]
+                     if s["skill_id"] != target["owner_skill_id"]), None)
+    if not stranger:
+        pytest.skip("no non-owning routine to try")
+
+    st, body = _call("POST", f"/skill_proposals/{target['proposal_id']}/grow",
+                     {"skill_id": stranger, "confirmed": True})
+    assert st == 409, "growing into an unrelated routine must be refused"
+    assert "does not own any member" in body.get("detail", "")
+
+
+@live
+def test_growing_requires_confirmation():
+    """Same gate as crystallize: it buries memories in Blue."""
+    _, d = _call("GET", "/skill_proposals?limit=50")
+    blocked = [p for p in d.get("proposals", [])
+               if p.get("blocked") and p.get("free_members")]
+    if not blocked:
+        pytest.skip("nothing blocked on this graph")
+    st, _ = _call("POST", f"/skill_proposals/{blocked[0]['proposal_id']}/grow",
+                  {"confirmed": False})
+    assert st == 400
+
+
+# ═════════════════════════════════════════════════════════════
+#  The session context describes the session it is in
+# ═════════════════════════════════════════════════════════════
+
+def _proposal_block():
+    """
+    The emitted lines of the session bundle's crystallization block, with
+    comments stripped.
+
+    Comments in there quote the old wording in order to explain why it was
+    wrong, so a scan that includes them finds exactly the strings it is
+    checking are gone. What matters is what reaches the model.
+    """
+    src = _server_src()
+    blk = src[src.index("MEMORY CLUSTERS READY FOR REVIEW"):]
+    blk = blk[:blk.index("# Phase 8: blend in")]
+    blk = chr(10).join(l for l in blk.split(chr(10))
+                       if not l.strip().startswith("#"))
+    # Join adjacent string literals. The emitted sentences are wrapped across
+    # several of them, so a phrase the reader sees as one run is not
+    # contiguous in the source and a substring check would miss it.
+    return re.sub(r'"\s*\n\s*"', '', blk)
+
+
+def test_the_proposal_block_matches_what_the_model_can_do():
+    """
+    The crystallization block asserted flatly that this "cannot be done from
+    any tool you have". That holds only while MMU_ALLOW_MODEL_CRYSTALLIZE is
+    off. With it on the model has crystallize_routine and grow_routine, and
+    this text was contradicting its own tool list at the top of every single
+    conversation.
+
+    Read as source rather than rendered, because the wrong branch is the
+    failure and a test that only ever sees one of them would not notice.
+    """
+    blk = _proposal_block()
+
+    assert "if MODEL_MAY_CRYSTALLIZE:" in blk, \
+        "what the model is told must depend on what it can do"
+    permissive, gated = blk.split("else:", 1)
+    assert "You CAN do this yourself" in permissive
+    assert "cannot be done from any tool you have" in gated
+    assert "cannot be done from any tool you have" not in permissive, \
+        "the permissive branch must not repeat the human-gated claim"
+
+
+def test_the_proposal_block_names_a_tool_that_exists():
+    """
+    It said "Use review_skills". That is not a tool -- the Skill to Routine
+    rename covered the MCP surface and missed this string, so the one
+    actionable instruction in the block named something the model could not
+    call.
+    """
+    import inspect, mmu_mcp_server as mcp
+    blk = _proposal_block()
+
+    registered = set(re.findall(r'"name": "(\w+)"', inspect.getsource(mcp)))
+    for named in re.findall(r"\b(review_\w+|crystallize_\w+|grow_\w+|uncrystallize_\w+)\b", blk):
+        assert named in registered, \
+            f"the session context tells the model to use {named!r}, which is not a tool"
+
+
+def test_the_readme_does_not_promise_a_gate_the_flag_removes():
+    """
+    The README said "never automatically", "Nothing crystallizes on its own"
+    and "You write the trigger and the procedure. Nothing else does." All
+    three stop being true with MMU_ALLOW_MODEL_CRYSTALLIZE=true, and a reader
+    meets them three hundred lines before the section that explains the flag.
+
+    They are allowed to stay -- they describe the default -- but each has to
+    carry the qualification with it.
+    """
+    import pathlib
+    readme = (pathlib.Path(__file__).resolve().parents[1] / "README.md").read_text(
+        encoding="utf-8")
+
+    assert "never automatically." not in readme, \
+        "an unqualified 'never automatically' outlives the flag that breaks it"
+    assert "Nothing else does." not in readme, \
+        "'Nothing else does' is false whenever the model is the one doing it"
+
+    blk = readme[readme.index("**Nothing crystallizes on its own.**"):]
+    blk = blk[:blk.index("```")]
+    assert "MMU_ALLOW_MODEL_CRYSTALLIZE" in blk, \
+        "the claim and its exception must sit together, not 300 lines apart"
+
+
+def test_every_status_the_sweep_writes_can_be_asked_for():
+    """
+    /skill_proposals validates `status` against a hardcoded list, and
+    `superseded` was added to the sweep without being added here -- so the one
+    status the merge and retirement work produce in bulk answered 400, for
+    rows that are plainly there through status= (all).
+
+    Read from the source of both sides rather than asserted as a literal, so
+    a fifth status added to the writer and not the filter fails here rather
+    than in someone's terminal.
+    """
+    import inspect, neo4j_layer as n4j
+
+    src = _server_src()
+    blk = src[src.index("def skill_proposals("):]
+    blk = blk[:blk.index("@app.", 10)]
+    allowed = set(re.findall(r'"(pending|rejected|crystallized|superseded)"', blk))
+
+    written = set()
+    for fn in (n4j.queue_skill_proposals, n4j.retire_unconfirmable_proposals,
+               n4j.reject_skill_proposal, n4j.close_proposal_for_members):
+        src_fn = inspect.getsource(fn)
+        written |= set(re.findall(r"p\.status\s*=\s*'(\w+)'", src_fn))
+        written |= set(re.findall(r"f\.status\s*=\s*'(\w+)'", src_fn))
+
+    missing = written - allowed
+    assert not missing, (
+        f"the sweep writes {sorted(missing)} but /skill_proposals refuses it as "
+        "a filter, so those rows cannot be listed")

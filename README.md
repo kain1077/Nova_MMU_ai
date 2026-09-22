@@ -23,8 +23,10 @@ runs entirely on your own machine.
   searchable with page-level provenance. Reference material never ages.
 - **Proactive suggestions.** Recall can carry a small "you might also want" list drawn
   from connections across different domains.
-- **Routines.** Memories that cluster densely can be crystallized into a `Routine` node
-  with human confirmation, never automatically.
+- **Routines.** Memories that cluster densely can be crystallized into a `Routine` node.
+  By default that takes human confirmation and never happens on its own; one env var
+  hands the decision to your model instead. See
+  [Letting a model do it](#letting-a-model-do-it).
 
 Everything runs locally. See [Privacy](#privacy).
 
@@ -194,9 +196,9 @@ full; the session bundle lists those by title and opening line only, so this is 
 rest of one is reached. `review_routines` is read-only — it reports what is sitting in the
 crystallization queue and cannot act on it.
 
-Four more exist and are **not** registered by default: `crystallize_routine`,
-`link_routine`, `unlink_routine` and `uncrystallize_routine` appear only when
-`MMU_ALLOW_MODEL_CRYSTALLIZE=true`. They restructure memory, so they are also refused
+Five more exist and are **not** registered by default: `crystallize_routine`,
+`grow_routine`, `link_routine`, `unlink_routine` and `uncrystallize_routine` appear only
+when `MMU_ALLOW_MODEL_CRYSTALLIZE=true`. They restructure memory, so they are also refused
 server-side rather than merely hidden from the tool list — see
 [Letting a model do it](#letting-a-model-do-it).
 
@@ -344,6 +346,13 @@ loop is what the un-biasing actually is without it, crystallizing changes what g
 and queues them as proposals; turning one into a Routine is a human decision, because it
 restructures memory rather than adding to it.
 
+That is the default, and the rest of this section describes it. It stops being true the
+moment you set `MMU_ALLOW_MODEL_CRYSTALLIZE=true`, which hands the same decision to your
+model -- including writing the trigger and procedure itself, and growing routines to
+absorb proposals they already overlap. That is a real change in who is deciding, not a
+convenience toggle, and [Letting a model do it](#letting-a-model-do-it) is where it is
+described.
+
 ```
 python mmu_review.py                    # what is waiting
 python mmu_review.py 1                  # inspect proposal 1 in full
@@ -353,7 +362,8 @@ python mmu_review.py --sweep            # look for new candidates now
 ```
 
 Confirming shows exactly which memories will be demoted and requires you to type
-`CRYSTALLIZE`. You write the trigger and the procedure. Nothing else does.
+`CRYSTALLIZE`. You write the trigger and the procedure -- unless you have handed that to
+your model, in which case it writes them and no typed confirmation is asked for.
 
 Everything is reversible:
 
@@ -403,34 +413,42 @@ active child cannot be deleted out from under it.
 
 ### Letting a model do it
 
-`MMU_ALLOW_MODEL_CRYSTALLIZE=true` lets your model confirm a queued proposal, branch one
-under another, and reverse either. Reviewing is not part of that bargain and never was:
-`review_routines` is always registered, because reading the queue changes nothing.
+`MMU_ALLOW_MODEL_CRYSTALLIZE=true` gives your model tools to confirm, grow, branch and
+reverse routines itself. Reviewing is not on that list and never was: `review_routines` is
+always registered, because reading the queue changes nothing.
 
-**What the model does and does not decide.** It does not choose which memories get
-compressed. Proposals are written only by the density sweep, which scores clusters on
-co-recall and semantic similarity; there is no path from a model to a new proposal, and
-the sweep is not exposed as a tool. `POST /skill_proposals/{id}/crystallize` ignores
-`member_addresses` outright and resolves the members from the proposal's immutable
-`created_at` stamps, and the general `/crystallize` endpoint — the one that does take an
-arbitrary member list — is not offered to the model at all.
+Be clear about what it removes. With it on there is no confirmation step at all: the model
+picks which proposal to act on, writes the trigger and the procedure, demotes the memories,
+and moves to the next one. A queue of nineteen proposals can be empty before you next look
+at it, and nothing warns you, because from the system's point of view nothing unusual
+happened.
 
-What the model supplies is the **trigger** and the **procedure**, plus the confidence and
-the parent to branch under. That division is the argument for turning this on rather than
-against it. The sweep can tell that a cluster is dense; it cannot tell you what the
-memories *mean*, and a trigger and a procedure are prose. Leaving that to a human who was
-not in the conversation means the model recommends wording and someone retypes it into
-`mmu_review.py` — a transcription step wearing a reviewer's hat.
+That is a reasonable thing to want -- it is fast, and it is what the tooling is for -- but
+it is a different system from the one the rest of this README describes. The session
+context tells the model so, rather than repeating the human-gated wording at a model that
+can act.
 
-**Off by default anyway**, because confirming a proposal is a real write: the source
-memories are demoted to Blue, which changes how they are retrieved. That is worth an
-explicit opt-in even when the judgement behind it is sound. It is enforced server-side by
+**What it does not hand over is the membership.** Proposals are written only by the density
+sweep, which scores clusters on co-recall and semantic similarity, and the sweep is not
+exposed as a tool. `POST /skill_proposals/{id}/crystallize` ignores `member_addresses`
+outright and resolves the members from the proposal's immutable `created_at` stamps, and
+the general `/crystallize` — the one that does take an arbitrary member list — is not
+offered to the model at all. So the model chooses which queued cluster to act on and what
+to call it. It cannot invent one, and it cannot draft the proposal it then confirms.
+
+What it does supply is the **trigger** and the **procedure**. That is the half a density
+score cannot produce: the sweep knows that a cluster is dense, not what its memories
+*mean*, and a trigger and a procedure are prose.
+
+**Off by default** for the plain reason rather than a subtle one: there is no confirmation
+step, and confirming demotes the source memories to Blue. It is enforced server-side by
 `_guard_model_write()`, which refuses any request tagged `X-MMU-Source: model` while the
 flag is off, so the gate is not merely a hidden tool.
 
-Reversal is offered to the model for the same reason. Being able to create without being
-able to undo is the worse half to hand out, and `uncrystallize_routine` restores the
-members' original colours and returns the proposal to the queue.
+Useful for testing the whole loop, and the reason reversal is available to the model too.
+Being able to create without being able to undo is the worse half to hand out, so
+everything stays reversible: `uncrystallize_routine` for a whole routine,
+`POST /skills/<id>/members/remove` for a single growth.
 
 ---
 
@@ -495,7 +513,7 @@ worth knowing early:
 | `MMU_SEMANTIC_FLOOR` | `0.0` | Drop weak keyword hits. `0.0` = off. |
 | `MMU_ANTICIPATE_MAX` | `3` | Proactive suggestions per recall. `0` = off. |
 | `MMU_BIND` | `127.0.0.1` | Interface the ports bind to. `0.0.0.0` exposes to your LAN. |
-| `MMU_ALLOW_MODEL_CRYSTALLIZE` | `false` | Let a model confirm and reverse routine *proposals* itself. It never picks the members. See [Routines](#routines). |
+| `MMU_ALLOW_MODEL_CRYSTALLIZE` | `false` | Let a model confirm, grow and reverse routine *proposals* itself, with no confirmation step. It never picks the members. See [Letting a model do it](#letting-a-model-do-it). |
 | `MMU_API_KEY` | *(unset)* | Shared secret. Required on every endpoint but `/health` when set. |
 | `MMU_CORS_ORIGINS` | *(empty)* | Browser origins allowed. Empty disables CORS. |
 

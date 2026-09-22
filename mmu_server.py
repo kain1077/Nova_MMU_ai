@@ -367,6 +367,14 @@ class CrystallizeIn(BaseModel):
     extends:          Optional[str] = None
 
 
+class GrowFromProposalIn(BaseModel):
+    # skill_id is optional: the server can pick the skill that already owns
+    # the most of this proposal. Naming one is allowed, but it is checked
+    # against the proposal's actual owners -- see the endpoint.
+    skill_id:  Optional[str] = None
+    confirmed: bool = False
+
+
 class SkillMembersIn(BaseModel):
     # Phase 13.3. Explicit addresses for the same reason CrystallizeIn takes
     # them: aging rewrites addresses in place, so anything resolved from a
@@ -1701,15 +1709,30 @@ def recall(body: RecallIn):
     skills, replaced = [], set()
     try:
         qvec = EMB.embed(body.prompt) if EMB.enabled else None
+        # Hand the addresses this query already matched to the association
+        # path, so a skill can surface because the conversation is demonstrably
+        # in its neighbourhood -- not only because the wording lined up.
+        matched_addrs = [r.get("address") for r in results if r.get("address")]
         skills = n4j.match_skills(
-            query_vector = qvec,
-            terms        = ingest.extract_keywords(body.prompt),
-            limit        = SKILL_RECALL_MAX,
+            query_vector      = qvec,
+            terms             = ingest.extract_keywords(body.prompt),
+            limit             = SKILL_RECALL_MAX,
+            matched_addresses = matched_addrs,
         )
         if skills:
             for sk in skills:
                 replaced.update(a for a in (sk.get("members") or []) if a)
             n4j.record_skill_invocation([sk["skill_id"] for sk in skills])
+            # The live half, and the only growth path left: members are
+            # excluded from co-recall pairing once compressed, so an edge that
+            # depended on them would never strengthen. A memory delivered
+            # beside a skill is the same evidence co-recall captures between
+            # two memories, one level up -- and one that keeps arriving with a
+            # skill is a candidate for belonging to it. Members are excluded
+            # inside the query: a skill already contains them.
+            n4j.bump_skill_associations(
+                [sk["skill_id"] for sk in skills],
+                [a for a in matched_addrs if a not in replaced])
     except Exception as e:
         log.warning("skill matching failed (recall unaffected): %s", e)
 
@@ -2063,7 +2086,69 @@ def crystallize(body: CrystallizeIn, x_mmu_source: Optional[str] = Header(None))
     skill["indexed"] = _index_skill(skill["skill_id"], body.trigger, body.procedure)
     skill["extends"] = _link_parent(skill["skill_id"], body.extends)
 
+    # Carry the members' co-recall onto the skill. Without this, compressing a
+    # cluster severs the associative pathway that identified it: the members go
+    # Blue, the pairing exclusion stops them accumulating at all, and the skill
+    # has no graph position of its own to inherit what they were connected to.
+    skill["associations"] = n4j.project_skill_associations(skill["skill_id"])
+
     return {"status": "crystallized", **skill}
+
+
+@app.post("/skills/project_associations")
+def project_associations(apply: bool = False):
+    """
+    Backfill ASSOCIATED_WITH for skills crystallized before the projection
+    existed.
+
+    Every skill created until now inherited nothing: its members went Blue,
+    stopped accumulating co-recall of their own, and the weight that identified
+    the cluster stayed attached to memories the skill could not reach.
+
+    Dry-run by default, like /index_repair -- it writes edges across the whole
+    graph and should be inspectable before it runs. Idempotent: the projection
+    SETS the seed and carries forward whatever has accumulated since, so
+    running it twice does not double anything.
+    """
+    skills = n4j.get_skills(status="active")
+    if not apply:
+        return {
+            "status": "dry-run",
+            "skills": len(skills),
+            "note": ("Nothing was written. Re-run with apply=true to project "
+                     "co-recall weight from each skill's members onto the skill."),
+        }
+
+    out = n4j.project_all_skill_associations()
+    if out is None:
+        raise HTTPException(503, "Could not reach Neo4j.")
+    return {
+        "status": "projected",
+        "skills": out["skills"],
+        "edges_written": out["edges"],
+        "note": f"Projected {out['edges']} association(s) across {out['skills']} skill(s).",
+    }
+
+
+@app.get("/skills/growth")
+def skill_growth(skill_id: Optional[str] = None, limit: int = 10,
+                 min_weight: int = 3):
+    """
+    Memories strongly associated with a skill but not part of it.
+
+    This is what the live association edge is FOR. A memory that keeps being
+    delivered alongside a skill is evidence the skill should grow to include
+    it -- and since add_skill_members() that is something the system can
+    actually do, rather than a suggestion with no mechanism behind it.
+
+    Reports `seeded` (what the projection put there at crystallization) beside
+    `grown` (what has accumulated since), because only the second is new
+    evidence -- a high weight that is entirely seed is just the cluster it
+    already was.
+    """
+    rows = n4j.skill_growth_candidates(skill_id=skill_id, limit=limit,
+                                       min_weight=min_weight)
+    return {"candidates": rows, "count": len(rows)}
 
 
 @app.get("/skills")
@@ -2159,6 +2244,11 @@ def uncrystallize(skill_id: str, confirm: str = ""):
     resolved, why = n4j.resolve_skill_id(skill_id)
     if not resolved:
         raise HTTPException(404, why)
+    # Drop the projected associations before the skill goes. They describe a
+    # position in the graph that is about to stop existing, and a DETACH DELETE
+    # would remove the edges without anyone being told how many.
+    dropped = n4j.clear_skill_associations(resolved)
+
     info, why = n4j.uncrystallize_skill(resolved)
     if info is None:
         raise HTTPException(404 if why == "no such skill" else 409, why)
@@ -2174,6 +2264,7 @@ def uncrystallize(skill_id: str, confirm: str = ""):
     mmu.v2_index.set_skill_member([m["address"] for m in info["restored"]], False)
     mmu.v2_index.save()
 
+    info["associations_dropped"] = dropped
     return {"status": "uncrystallized", **info}
 
 
@@ -2269,6 +2360,12 @@ def add_skill_members(skill_id: str, body: SkillMembersIn,
             reindexed = _index_skill(resolved, updated["trigger"],
                                      updated["procedure"], replace_keywords=True)
 
+    # Membership changed, so the projection is stale: the new members bring
+    # their own outward co-recall with them. Re-projecting SETS the seed and
+    # carries forward whatever growth has accumulated, so this cannot inflate
+    # the skill's associations.
+    info["associations"] = n4j.project_skill_associations(resolved)
+
     return {"status": "members_added", **info,
             **({"reindexed": reindexed} if reindexed else {}),
             "note": ("Skill id, invocation_count and tree edges are unchanged. "
@@ -2303,6 +2400,10 @@ def remove_skill_members(skill_id: str, body: SkillMemberRemoveIn):
     # another active skill and stay compressed, the same asymmetry this
     # endpoint already applies to colour.
     mmu.v2_index.set_skill_member([r["address"] for r in info["removed"]], False)
+
+    # A removed member's contribution has to come off the skill's seed, which
+    # re-projecting from the current membership does.
+    info["associations"] = n4j.project_skill_associations(resolved)
 
     return {"status": "members_removed", **info}
 
@@ -2443,8 +2544,13 @@ def skill_proposals(status: Optional[str] = "pending", limit: int = 50):
     """
     if status == "":
         status = None
-    if status and status not in ("pending", "rejected", "crystallized"):
-        raise HTTPException(400, "status must be pending, rejected or crystallized")
+    # `superseded` was added with the merge and retirement work and never
+    # added here, so the one status the sweep now produces in bulk was the one
+    # you could not ask for -- the filter answered 400 for rows that plainly
+    # exist and are visible through status= (all).
+    if status and status not in ("pending", "rejected", "crystallized", "superseded"):
+        raise HTTPException(
+            400, "status must be pending, rejected, crystallized or superseded")
 
     props = n4j.get_skill_proposals(status=status, limit=limit)
     return {
@@ -2531,7 +2637,102 @@ def crystallize_proposal(proposal_id: str, body: CrystallizeIn,
     n4j.close_proposal_for_members(addrs, skill["skill_id"])
     skill["indexed"] = _index_skill(skill["skill_id"], body.trigger, body.procedure)
     skill["extends"] = _link_parent(skill["skill_id"], body.extends)
+    skill["associations"] = n4j.project_skill_associations(skill["skill_id"])
+
     return {"status": "crystallized", "proposal_id": proposal_id, **skill}
+
+
+@app.post("/skill_proposals/{proposal_id}/grow")
+def grow_from_proposal(proposal_id: str, body: GrowFromProposalIn,
+                       x_mmu_source: Optional[str] = Header(None)):
+    """
+    Resolve a BLOCKED proposal by growing the skill that already owns part of
+    it, instead of creating a second skill over the same material.
+
+    This endpoint exists because every other route out of a blocked proposal
+    was a dead end. A memory belongs to exactly one skill, so a proposal
+    overlapping an existing skill can never be crystallized as it stands --
+    and `extends` does not change that, because it only draws a tree edge
+    between two Skill nodes after the fact. The overlap is not an obstacle to
+    route around; it is evidence the existing skill should be bigger.
+
+    The free members are derived HERE, from the proposal, rather than taken
+    from the caller. A caller naming memories to demote is a far larger
+    capability than resolving a block needs, and the free set is not a
+    judgement -- it is a fact about the graph.
+
+    The target skill must already own part of this proposal. Without that
+    check this degenerates into "put any memories into any skill", which is
+    not what breaking the loop requires.
+    """
+    _guard_model_write(x_mmu_source)
+    if not body.confirmed:
+        raise HTTPException(
+            400,
+            "Refusing to grow without confirmed=true. This demotes the added "
+            "memories to Blue and is not something to trigger by accident."
+        )
+
+    free, owners, all_members, why = n4j.get_proposal_free_members(proposal_id)
+    if why:
+        raise HTTPException(404 if why == "no such proposal" else 409, why)
+    if not owners:
+        raise HTTPException(
+            409,
+            "Nothing owns any member of this proposal, so there is no skill to "
+            "grow. It is not blocked -- crystallize it normally."
+        )
+    if not free:
+        raise HTTPException(
+            409,
+            f"Every member of this proposal already belongs to skill "
+            f"{owners[0]['skill_id']}, so it is fully absorbed and there is "
+            "nothing to add. Leave it; the next sweep retires it."
+        )
+
+    target = body.skill_id or owners[0]["skill_id"]
+    resolved, resolve_why = n4j.resolve_skill_id(target)
+    if not resolved:
+        raise HTTPException(404, resolve_why)
+
+    # The safety rail. Growth may only merge a proposal into a skill the
+    # system itself reported as blocking that proposal.
+    if resolved not in {o["skill_id"] for o in owners}:
+        raise HTTPException(
+            409,
+            f"Skill {resolved} does not own any member of this proposal. "
+            "Growth can only merge a proposal into a skill it actually "
+            f"overlaps -- that is {', '.join(o['skill_id'] for o in owners)}."
+        )
+
+    info, why = n4j.add_skill_members(resolved, free)
+    if not info:
+        raise HTTPException(409, why)
+
+    mmu.v2_index.set_skill_member(info["added"], True)
+    for addr in info["added"]:
+        try:
+            mmu.v2_index.set_color(addr, "Blue")
+        except Exception as e:
+            log.warning("v2 index colour sync failed for %s: %s", addr, e)
+    mmu.v2_index.save()
+
+    # Closed with the WHOLE member set, not just the free ones.
+    # close_proposal_for_members() keys on the member_key of everything it is
+    # given, so the free subset would compute a different key and match
+    # nothing -- leaving the proposal pending and fully absorbed, which is
+    # precisely the state that sends a reader round again.
+    n4j.close_proposal_for_members(all_members, resolved)
+    info["associations"] = n4j.project_skill_associations(resolved)
+
+    return {
+        "status":      "grown",
+        "proposal_id": proposal_id,
+        **info,
+        "note": (f"Skill {resolved} now has {info['member_count']} members. Its id, "
+                 "invocation_count and tree position are unchanged. Undo just "
+                 f"this: POST /skills/{resolved}/members/remove"),
+    }
 
 
 @app.post("/skill_proposals/{proposal_id}/reject")
@@ -2804,7 +3005,12 @@ def session_bundle(top_per_domain: int = 1):
 
     if pending:
         lines.append("")
-        lines.append("MEMORY CLUSTERS READY FOR REVIEW (needs the user's decision):")
+        # Whose decision it is depends on the flag, same as the body below.
+        lines.append(
+            "MEMORY CLUSTERS READY FOR REVIEW "
+            + ("(yours to decide in this session):" if MODEL_MAY_CRYSTALLIZE
+               else "(needs the user's decision):")
+        )
         for p in pending:
             sem = p.get("semantic_coherence")
             sem_s = f", meaning {sem:.2f}" if isinstance(sem, (int, float)) else ""
@@ -2813,14 +3019,45 @@ def session_bundle(top_per_domain: int = 1):
             )
             for prev in p.get("previews", []):
                 lines.append(f"    - {prev}")
-        lines.append(
-            "  Crystallizing one of these compresses its members into a Skill and "
-            "DEMOTES those memories to Blue. That is a change to how memory is "
-            "structured, so it is the user's call and cannot be done from any tool you "
-            "have. Use review_skills for the full list. If one looks right to you, "
-            "say which memories would be demoted and why the compression is worth "
-            "it -- do not ask for approval as though it were a formality."
-        )
+        # What this says depends on what the reader can actually do.
+        #
+        # It used to assert flatly that crystallizing "cannot be done from any
+        # tool you have". That is true only while MMU_ALLOW_MODEL_CRYSTALLIZE
+        # is off. With it on, the model has crystallize_routine and
+        # grow_routine, and this block was telling it otherwise at the top of
+        # every single conversation -- a standing claim contradicted by its own
+        # tool list.
+        #
+        # It also said "Use review_skills", which is not a tool. The Skill ->
+        # Routine rename covered the MCP surface and missed this string, so the
+        # one instruction here that was actionable named something the model
+        # could not call.
+        #
+        # Same failure both times as the blocked-proposal refusal: a message
+        # describing a world the reader is not in.
+        if MODEL_MAY_CRYSTALLIZE:
+            lines.append(
+                "  Crystallizing one of these compresses its members into a Routine "
+                "and DEMOTES those memories to Blue, the state the recall gate "
+                "treats as inactive. You CAN do this yourself in this session: "
+                "crystallize_routine for a proposal nothing else owns, grow_routine "
+                "for one marked OWNED. Use review_routines for the full list and "
+                "the detail. Because nobody else is checking, say which memories "
+                "you are demoting and why the compression earns it -- as a record "
+                "of the decision, not a request for permission. Everything here is "
+                "reversible: uncrystallize_routine undoes a whole routine, and "
+                "removing members undoes a growth."
+            )
+        else:
+            lines.append(
+                "  Crystallizing one of these compresses its members into a Routine "
+                "and DEMOTES those memories to Blue. That is a change to how memory "
+                "is structured, so it is the user's call and cannot be done from any "
+                "tool you have in this session. Use review_routines for the full "
+                "list. If one looks right to you, say which memories would be "
+                "demoted and why the compression is worth it -- do not ask for "
+                "approval as though it were a formality."
+            )
 
     # Phase 8: blend in the most recently closed session's summary, if one
     # exists, so a brand new conversation can open with continuity instead
