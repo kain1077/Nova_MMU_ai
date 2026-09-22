@@ -2681,3 +2681,34 @@ def test_the_readme_does_not_promise_a_gate_the_flag_removes():
     blk = blk[:blk.index("```")]
     assert "MMU_ALLOW_MODEL_CRYSTALLIZE" in blk, \
         "the claim and its exception must sit together, not 300 lines apart"
+
+
+def test_every_status_the_sweep_writes_can_be_asked_for():
+    """
+    /skill_proposals validates `status` against a hardcoded list, and
+    `superseded` was added to the sweep without being added here -- so the one
+    status the merge and retirement work produce in bulk answered 400, for
+    rows that are plainly there through status= (all).
+
+    Read from the source of both sides rather than asserted as a literal, so
+    a fifth status added to the writer and not the filter fails here rather
+    than in someone's terminal.
+    """
+    import inspect, neo4j_layer as n4j
+
+    src = _server_src()
+    blk = src[src.index("def skill_proposals("):]
+    blk = blk[:blk.index("@app.", 10)]
+    allowed = set(re.findall(r'"(pending|rejected|crystallized|superseded)"', blk))
+
+    written = set()
+    for fn in (n4j.queue_skill_proposals, n4j.retire_unconfirmable_proposals,
+               n4j.reject_skill_proposal, n4j.close_proposal_for_members):
+        src_fn = inspect.getsource(fn)
+        written |= set(re.findall(r"p\.status\s*=\s*'(\w+)'", src_fn))
+        written |= set(re.findall(r"f\.status\s*=\s*'(\w+)'", src_fn))
+
+    missing = written - allowed
+    assert not missing, (
+        f"the sweep writes {sorted(missing)} but /skill_proposals refuses it as "
+        "a filter, so those rows cannot be listed")
