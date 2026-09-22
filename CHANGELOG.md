@@ -10,6 +10,28 @@ Packaged installers for every platform, and an audit pass: two concurrency
 bugs with real data loss behind them, one write-amplification fix on the
 hottest path, and the removal of code that could not run.
 
+### Fixed
+
+- **The session context no longer tells the model it cannot do what it can do.** The
+  crystallization block asserted flatly that this "cannot be done from any tool you have".
+  That holds only while `MMU_ALLOW_MODEL_CRYSTALLIZE` is off. With it on the model has
+  `crystallize_routine` and `grow_routine`, and the block was contradicting its own tool
+  list at the top of every conversation. It now branches: unchanged when the gate is on,
+  and when it is off it says which tool fits which proposal, notes that nothing else is
+  checking, asks for a record of what is being demoted and why, and names both undos.
+
+- **The same block pointed at `review_skills`, which is not a tool.** The Skill to Routine
+  rename covered the MCP surface and missed this string, so the one actionable instruction
+  in it named something the model could not call.
+
+- **The README promised a gate that one env var removes.** "never automatically",
+  "Nothing crystallizes on its own" and "You write the trigger and the procedure. Nothing
+  else does." are all true by default and all false with `MMU_ALLOW_MODEL_CRYSTALLIZE=true`
+  -- and a reader met them three hundred lines before the section explaining the flag.
+  Each now carries its qualification, and the flag's own section says plainly what it
+  removes: no confirmation step at all, the model writing the trigger and procedure, and a
+  queue of nineteen proposals that can be empty before you next look at it.
+
 ### Added
 
 - **A blocked proposal has a route that exists.** `POST /skill_proposals/{id}/grow`
