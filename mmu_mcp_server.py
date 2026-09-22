@@ -499,9 +499,11 @@ if ALLOW_CRYSTALLIZE:
             "are demoted to Blue, the state the recall gate treats as "
             "inactive, exactly as crystallizing would. The routine keeps its "
             "id, its invocation_count and its place in the tree. Say which "
-            "memories will be demoted before you call it. This does NOT work "
-            "through `extends` -- `extends` only draws a tree edge between two "
-            "routines and never changes which routine owns a memory."
+            "memories will be demoted before you call it. If the user asked "
+            "you to CHECK or REVIEW the queue rather than clear it, ask before "
+            "calling this at all. This does NOT work through `extends` -- "
+            "`extends` only draws a tree edge between two routines and never "
+            "changes which routine owns a memory."
         ),
         "inputSchema": {
             "type": "object",
@@ -891,13 +893,42 @@ def mmu_skill_proposals(limit=10):
             lines.append("")
 
         lines.append(
-            "These are proposals only. Nothing has been written. Crystallizing one "
-            "compresses its members into a Routine and DEMOTES them to Blue, which "
-            "changes how memory is structured -- so it needs the user's explicit "
-            "confirmation and cannot be done from this tool. You may read them, "
-            "argue for or against one, and draft the trigger and procedure text. "
-            "Say plainly which members would be demoted when you do."
+            "These are proposals only. Nothing has been written. Crystallizing "
+            "one compresses its members into a Routine and DEMOTES them to "
+            "Blue, which changes how memory is structured."
         )
+        if ALLOW_CRYSTALLIZE:
+            # The instruction this block was missing.
+            #
+            # "Check the proposals" and "clear the proposals" are different
+            # requests, and with crystallization enabled there is nothing
+            # between them -- asked to look, the sensible-seeming move is to
+            # start acting, and a queue of nineteen goes in one turn without
+            # anyone seeing it. That is a reasonable thing to be ABLE to do and
+            # a bad thing to do by default.
+            #
+            # So the gate is a question, not a lock: one word re-enables the
+            # fast path, and the user keeps the choice of whether they wanted
+            # to read first.
+            lines.append(
+                "  You CAN act on these yourself in this session -- "
+                "crystallize_routine for a proposal nothing else owns, "
+                "grow_routine for one marked OWNED. But being asked to CHECK "
+                "or REVIEW the proposals is not being asked to clear them. "
+                "Unless the user has said to go ahead, show them what is here, "
+                "say which memories each one would demote, give your read on "
+                "the strongest, and ASK whether they want to review them "
+                "themselves or have you work through them. Then do what they "
+                "say -- if they say go, go, and do not ask again for the rest "
+                "of that run."
+            )
+        else:
+            lines.append(
+                "  That needs the user's explicit confirmation and cannot be "
+                "done from this tool. You may read them, argue for or against "
+                "one, and draft the trigger and procedure text. Say plainly "
+                "which members would be demoted when you do."
+            )
         return "\n".join(lines)
     except Exception as e:
         return f"[MMU routine proposals error: {e}]"

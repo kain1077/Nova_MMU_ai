@@ -2122,11 +2122,17 @@ def project_associations(apply: bool = False):
     out = n4j.project_all_skill_associations()
     if out is None:
         raise HTTPException(503, "Could not reach Neo4j.")
+    note = (f"Projected {out['edges']} association(s) across "
+            f"{out['skills']} skill(s).")
+    if out.get("retracted"):
+        note += (f" Retracted {out['retracted']} stale self-association(s) "
+                 f"from memories the skill has since absorbed.")
     return {
         "status": "projected",
         "skills": out["skills"],
         "edges_written": out["edges"],
-        "note": f"Projected {out['edges']} association(s) across {out['skills']} skill(s).",
+        "retracted": out.get("retracted", 0),
+        "note": note,
     }
 
 

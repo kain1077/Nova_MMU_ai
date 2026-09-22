@@ -12,6 +12,43 @@ hottest path, and the removal of code that could not run.
 
 ### Fixed
 
+- **A closed proposal is no longer a proposal.** Neo4j showed 25 proposals while the
+  review queue showed none, and both were right: a rejected or crystallized row kept the
+  `:SkillProposal` label, so anyone opening the browser counted settled decisions as
+  pending work. Closing one now relabels it `:ProposalRecord`, and releasing or
+  uncrystallizing puts the label back. `bootstrap_schema()` migrates the rows that were
+  already closed when the label arrived -- without that the split would describe only
+  decisions made from here on. Reads that should span history (`get_skill_proposals`,
+  `count_skill_proposals`, `GET /skill_proposals?status=`) match both labels, so the HTTP
+  API is unchanged.
+
+- **That relabel silently removed the guarantee that rejection is permanent.** It was
+  never enforced anywhere: it worked because the sweep's `MERGE` found the closed row and
+  its `ON MATCH` -- which only writes while `status = 'pending'` -- declined to touch it.
+  Once closed rows carry a different label the `MERGE` stops seeing them, and the next
+  sweep would have created a fresh pending proposal for a cluster the user had refused.
+  The sweep now checks for a record explicitly, before the `MERGE`, on every candidate.
+  The queue-ceiling lookup is not that check: it only runs when the queue is full, so on
+  a graph with room it never executes at all.
+
+- **A routine could stay associated with a memory it had already absorbed.** Six of these
+  were on a live graph. `WHERE NOT o IN members` stops the projection *writing* a
+  self-edge but cannot unwrite one: an outside memory earns its edge honestly, a later
+  `grow_routine` absorbs it, and the edge it already holds now points at its own routine.
+  An edge from a member is a routine recommending itself -- `/skills/growth` reads
+  association as evidence the routine should grow, so a self-edge makes delivering a
+  member read as growth, corrupting the one signal the edge exists to give honestly. Both
+  projection paths now retract before they project, and
+  `POST /skills/project_associations?apply=true` reports the count as `retracted`.
+
+- **Asking a model to check the proposals is not asking it to clear them.** With
+  `MMU_ALLOW_MODEL_CRYSTALLIZE=true` there was nothing between those two requests, and a
+  queue of nineteen went through in one turn without anyone seeing it. `review_routines`
+  now tells the model to show what is queued, say which memories each proposal would
+  demote, and ask whether the user wants to review them or have it work through them. One
+  word re-enables the fast path, and it does not ask again for the rest of that run. The
+  capability is unchanged; only the default is.
+
 - **The session context no longer tells the model it cannot do what it can do.** The
   crystallization block asserted flatly that this "cannot be done from any tool you have".
   That holds only while `MMU_ALLOW_MODEL_CRYSTALLIZE` is off. With it on the model has
@@ -33,6 +70,12 @@ hottest path, and the removal of code that could not run.
   queue of nineteen proposals that can be empty before you next look at it.
 
 ### Added
+
+- **A retention window on closed proposal records.** `MMU_PROPOSAL_RETENTION_DAYS`
+  (default 90) prunes superseded and crystallized records once they are older than the
+  window. **Rejections are never pruned, at any age** -- a rejected record is the only
+  thing stopping the sweep re-offering that cluster, so deleting one does not forget a
+  decision, it reverses one. Set `0` to disable pruning entirely.
 
 - **A blocked proposal has a route that exists.** `POST /skill_proposals/{id}/grow`
   and a `grow_routine` MCP tool resolve a proposal whose members are already owned, by
