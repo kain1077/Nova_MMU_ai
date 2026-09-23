@@ -407,11 +407,17 @@ and reverse routines itself. **Off by default, and the default is the recommenda
 that drafts a proposal can then approve its own draft, and the review stops being a
 review. It is enforced server-side, not merely by hiding the tool.
 
-Be clear about what it removes. With it on there is no confirmation step at all: the
-model picks the cluster, writes the trigger and the procedure, demotes the memories, and
-moves to the next one. A queue of nineteen proposals can be empty before you next look
-at it, and nothing warns you, because from the system's point of view nothing unusual
-happened.
+Be clear about what it removes. With it on there is no server-side confirmation step at
+all: the model picks the cluster, writes the trigger and the procedure, demotes the
+memories, and moves to the next one. Nothing in the system distinguishes that from any
+other write.
+
+What remains is one instruction, not a gate. Asking your model to *check* the proposals
+is not asking it to clear them, so `review_routines` now tells it to show you what is
+queued, say which memories each one would demote, and ask whether you want to review them
+yourself or have it work through them. Say go and it goes, and it will not ask again for
+the rest of that run. This is a default, not a permission: the tools are registered and
+the model can call them whenever it judges that is what you meant.
 
 That is a reasonable thing to want -- it is fast, and it is what the tooling is for --
 but it is a different system from the one the rest of this README describes. The session
@@ -487,6 +493,7 @@ worth knowing early:
 | `MMU_ANTICIPATE_MAX` | `3` | Proactive suggestions per recall. `0` = off. |
 | `MMU_BIND` | `127.0.0.1` | Interface the ports bind to. `0.0.0.0` exposes to your LAN. |
 | `MMU_ALLOW_MODEL_CRYSTALLIZE` | `false` | Let a model create, grow and reverse routines itself, with no confirmation step. See [Letting a model do it](#letting-a-model-do-it). |
+| `MMU_PROPOSAL_RETENTION_DAYS` | `90` | How long a closed proposal record is kept. Rejections are never pruned at any age. `0` disables pruning. |
 | `MMU_API_KEY` | *(unset)* | Shared secret. Required on every endpoint but `/health` when set. |
 | `MMU_CORS_ORIGINS` | *(empty)* | Browser origins allowed. Empty disables CORS. |
 

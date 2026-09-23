@@ -23,7 +23,7 @@ import time
 import uuid
 import hashlib
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 
 log = logging.getLogger("neo4j_layer")
@@ -102,6 +102,12 @@ CONSTRAINTS = [
     # instead of stacking duplicates of a cluster that is simply still dense.
     "CREATE CONSTRAINT proposal_id   IF NOT EXISTS FOR (p:SkillProposal) REQUIRE p.proposal_id IS UNIQUE",
     "CREATE CONSTRAINT proposal_key  IF NOT EXISTS FOR (p:SkillProposal) REQUIRE p.member_key IS UNIQUE",
+    # Phase 13.6 -- a closed proposal is relabelled :ProposalRecord and leaves
+    # the two constraints above, so it needs its own. Without these, a bug that
+    # failed to check both labels would quietly stack duplicate records for one
+    # cluster -- the exact thing member_key exists to prevent.
+    "CREATE CONSTRAINT record_id     IF NOT EXISTS FOR (r:ProposalRecord) REQUIRE r.proposal_id IS UNIQUE",
+    "CREATE CONSTRAINT record_key    IF NOT EXISTS FOR (r:ProposalRecord) REQUIRE r.member_key IS UNIQUE",
     # Monotonic counters (currently just 'con'). One node per counter name;
     # the constraint is what stops a race from creating two of the same one.
     "CREATE CONSTRAINT counter_name  IF NOT EXISTS FOR (c:Counter) REQUIRE c.name IS UNIQUE",
@@ -190,6 +196,43 @@ def bootstrap_schema():
                 WHERE m.last_touched_at IS NULL
                 SET m.last_touched_at = $now
             """, now=datetime.now().isoformat())
+
+            # Phase 13.6 migration -- closed proposals predating the
+            # :ProposalRecord label.
+            #
+            # Without this the split is true only of decisions made from here
+            # on: every proposal already rejected or crystallized keeps
+            # :SkillProposal, so `MATCH (p:SkillProposal)` in the browser goes
+            # on counting settled decisions as pending work -- which is the
+            # confusion the label exists to end, and it is the EXISTING rows
+            # that cause it.
+            #
+            # Idempotent, and ordered after the constraints above so the
+            # uniqueness rules on :ProposalRecord are in place before anything
+            # arrives to be checked against them.
+            moved = s.run("""
+                MATCH (p:SkillProposal)
+                WHERE p.status IN ['rejected', 'crystallized', 'superseded']
+                SET p:ProposalRecord REMOVE p:SkillProposal
+                RETURN count(p) AS n
+            """).single()["n"]
+            if moved:
+                log.info("Relabelled %d closed proposal(s) as :ProposalRecord", moved)
+
+            # And the reverse, for safety: a pending row must never be a
+            # record. Nothing writes that state, but a half-applied migration
+            # or a hand-edit in the browser would make it invisible to the
+            # review queue while still blocking its own cluster from being
+            # re-proposed -- silent, and unreachable without this.
+            back = s.run("""
+                MATCH (r:ProposalRecord)
+                WHERE r.status = 'pending'
+                SET r:SkillProposal REMOVE r:ProposalRecord
+                RETURN count(r) AS n
+            """).single()["n"]
+            if back:
+                log.warning("Restored %d pending row(s) wrongly labelled "
+                            ":ProposalRecord", back)
         log.info("Neo4j schema bootstrapped (Phase 4 fields backfilled)")
     except Exception as e:
         log.warning(f"Neo4j schema bootstrap failed: {e}")
@@ -2013,10 +2056,11 @@ def uncrystallize_skill(skill_id):
                 # than vanishing: undoing a crystallization is a statement that
                 # the skill was wrong, not that the pattern was imaginary.
                 tx.run("""
-                    MATCH (p:SkillProposal {skill_id: $sid})
+                    MATCH (p:ProposalRecord {skill_id: $sid})
                     SET p.status      = 'pending',
                         p.skill_id    = null,
                         p.reviewed_at = null
+                    SET p:SkillProposal REMOVE p:ProposalRecord
                 """, sid=skill_id)
 
                 tx.run("MATCH (sk:Skill {skill_id: $sid}) DETACH DELETE sk", sid=skill_id)
@@ -2447,6 +2491,27 @@ def project_skill_associations(skill_id):
         return 0
     try:
         with driver.session() as s:
+            # Absorbed since the last projection.
+            #
+            # `WHERE NOT o IN members` below keeps this from WRITING a
+            # self-edge, but it cannot unwrite one: an outsider earns an edge
+            # honestly, is later absorbed by add_skill_members or by a
+            # crystallize that claims it, and the edge it already holds now
+            # points at its own skill. An edge from a member is not a near
+            # miss, it is a skill recommending itself -- association is how a
+            # skill reaches memories it does NOT contain, so every delivery
+            # would read as growth and /skills/growth would recommend
+            # absorbing what is already absorbed.
+            stale = s.run("""
+                MATCH (o:Memory)-[a:ASSOCIATED_WITH]->(sk:Skill {skill_id: $sid})
+                WHERE (o)-[:PROCEDURALIZED_FROM]->(sk)
+                DELETE a
+                RETURN count(*) AS n
+            """, sid=skill_id).single()["n"]
+            if stale:
+                log.info("Retracted %d self-association(s) on skill %s",
+                         stale, skill_id[:8])
+
             rec = s.run("""
                 MATCH (m:Memory)-[:PROCEDURALIZED_FROM]->(sk:Skill {skill_id: $sid})
                 WITH sk, collect(m) AS members
@@ -2483,13 +2548,26 @@ def project_all_skill_associations():
         return None
     try:
         with driver.session() as s:
+            # Retraction is NOT limited to active skills, unlike the projection
+            # below. This is the repair path: a self-edge on an inactive skill
+            # is just as wrong, and an uncrystallize would otherwise put one
+            # permanently out of reach of the only thing that clears it.
+            retracted = s.run("""
+                MATCH (o:Memory)-[a:ASSOCIATED_WITH]->(sk:Skill)
+                WHERE (o)-[:PROCEDURALIZED_FROM]->(sk)
+                DELETE a
+                RETURN count(*) AS n
+            """).single()["n"]
+            if retracted:
+                log.info("Retracted %d self-association(s) during backfill", retracted)
+
             ids = [r["sid"] for r in s.run("""
                 MATCH (sk:Skill) WHERE sk.status = 'active'
                 RETURN sk.skill_id AS sid
             """)]
         total = sum(project_skill_associations(sid) for sid in ids)
         log.info("Projected %d association(s) across %d skill(s)", total, len(ids))
-        return {"skills": len(ids), "edges": total}
+        return {"skills": len(ids), "edges": total, "retracted": retracted}
     except Exception as e:
         log.warning(f"project_all_skill_associations failed: {e}")
         return None
@@ -3187,6 +3265,7 @@ def retire_unconfirmable_proposals(session, exclude_key=None):
         SET p.status      = 'superseded',
             p.updated_at  = $now,
             p.review_note = 'Members were crystallized into another skill'
+        SET p:ProposalRecord REMOVE p:SkillProposal
         RETURN count(p) AS n
     """, key=exclude_key, now=datetime.now().isoformat()).single()
     return rec["n"] if rec else 0
@@ -3437,8 +3516,14 @@ def queue_skill_proposals(candidates=None, min_score=0.70, limit=10,
                 # Room check is per-candidate: rejecting something mid-sweep
                 # should let the next one through rather than wait a pass.
                 if pending_now >= int(max_pending):
+                    # BOTH labels. A closed proposal is a :ProposalRecord, so
+                    # a query that only looks at :SkillProposal would call an
+                    # already-decided cluster unknown and defer a candidate
+                    # that is not new work at all.
                     known = s.run("""
-                        MATCH (p:SkillProposal {member_key: $key}) RETURN count(p) AS n
+                        MATCH (p) WHERE (p:SkillProposal OR p:ProposalRecord)
+                          AND p.member_key = $key
+                        RETURN count(p) AS n
                     """, key=_member_key(c["member_created"])).single()["n"]
                     # A cluster that absorbs what is already queued does not
                     # add unreviewed work, it consolidates it -- so the ceiling
@@ -3465,6 +3550,29 @@ def queue_skill_proposals(candidates=None, min_score=0.70, limit=10,
                         deferred += 1
                         continue
                 key = _member_key(c["member_created"])
+
+                # Already decided? Then leave it alone.
+                #
+                # This used to be free. A closed proposal kept the
+                # :SkillProposal label, so the MERGE below found it and its
+                # ON MATCH -- which only writes while status = 'pending' --
+                # did nothing. Relabelling closed rows to :ProposalRecord took
+                # that away: the MERGE can no longer see them, and without this
+                # check it would CREATE a fresh pending proposal for a cluster
+                # the user already rejected. "Rejection is permanent" is a
+                # documented guarantee and it lived entirely in that MERGE.
+                #
+                # The ceiling's own `known` lookup is not this check. It runs
+                # only when the queue is full, so on a graph with room it never
+                # executes at all.
+                closed = s.run("""
+                    MATCH (r:ProposalRecord {member_key: $key})
+                    RETURN r.status AS status
+                """, key=key).single()
+                if closed:
+                    skipped += 1
+                    continue
+
                 rec = s.run("""
                     MERGE (p:SkillProposal {member_key: $key})
                     ON CREATE SET p.proposal_id   = $pid,
@@ -3557,6 +3665,7 @@ def queue_skill_proposals(candidates=None, min_score=0.70, limit=10,
                             p.updated_at    = $now,
                             p.superseded_by = $key,
                             p.review_note   = 'Absorbed into a larger cluster'
+                        SET p:ProposalRecord REMOVE p:SkillProposal
                         RETURN count(p) AS n
                     """, key=key, created=list(c["member_created"]), now=now).single()
                     n = gone["n"] if gone else 0
@@ -3608,10 +3717,16 @@ def get_skill_proposals(status="pending", limit=50):
         return []
     try:
         with driver.session() as s:
-            where = "WHERE p.status = $status" if status else ""
+            # Spans both labels. A live proposal is :SkillProposal, a closed
+            # one is :ProposalRecord, and a caller asking for
+            # status=crystallized or status=None (all) wants rows that are no
+            # longer proposals -- the split is about what the label MEANS, not
+            # about hiding history from the API.
+            where = "AND p.status = $status" if status else ""
             rows = s.run(f"""
-                MATCH (p:SkillProposal)
+                MATCH (p) WHERE (p:SkillProposal OR p:ProposalRecord)
                 {where}
+                WITH p
                 OPTIONAL MATCH (m:Memory) WHERE m.created_at IN p.member_created
                 WITH p, collect({{created_at: m.created_at,
                                  address:    m.address,
@@ -3763,6 +3878,57 @@ def get_skill_proposals(status="pending", limit=50):
         return []
 
 
+# How long a CLOSED proposal record is kept before pruning. Rejected records
+# are exempt at any age -- see prune_proposal_records() for why deleting one
+# reverses a decision rather than forgetting it.
+PROPOSAL_RETENTION_DAYS = int(os.environ.get("MMU_PROPOSAL_RETENTION_DAYS", "90"))
+
+
+def prune_proposal_records(days=None):
+    """
+    Drop closed proposal records past the retention window.
+
+    Returns {"pruned": n, "kept_rejected": n} or None if the graph is
+    unreachable.
+
+    REJECTED RECORDS ARE NEVER PRUNED, at any age. A rejection is a human
+    judgement, and the only thing that stops the sweep re-offering that
+    cluster is the record's continued existence -- deleting it does not
+    forget a decision, it reverses one. Superseded and crystallized records
+    are different: a crystallized cluster's members are Blue and excluded from
+    candidacy, so it cannot come back, and a superseded one SHOULD come back
+    if its members are ever free again.
+
+    Keyed on updated_at, which every closing transition sets.
+    """
+    driver = get_driver()
+    if driver is None:
+        return None
+    window = int(days if days is not None else PROPOSAL_RETENTION_DAYS)
+    if window <= 0:
+        return {"pruned": 0, "kept_rejected": 0}
+    cutoff = (datetime.now() - timedelta(days=window)).isoformat()
+    try:
+        with driver.session() as s:
+            kept = s.run("""
+                MATCH (r:ProposalRecord {status: 'rejected'}) RETURN count(r) AS n
+            """).single()["n"]
+            n = s.run("""
+                MATCH (r:ProposalRecord)
+                WHERE r.status IN ['superseded', 'crystallized']
+                  AND coalesce(r.updated_at, r.created_at) < $cutoff
+                DETACH DELETE r
+                RETURN count(*) AS n
+            """, cutoff=cutoff).single()["n"]
+        if n:
+            log.info("Pruned %d closed proposal record(s) older than %d days "
+                     "(%d rejected kept)", n, window, kept)
+        return {"pruned": n, "kept_rejected": kept}
+    except Exception as e:
+        log.warning(f"prune_proposal_records failed: {e}")
+        return None
+
+
 def count_skill_proposals(status="pending"):
     """How many proposals exist, independent of any page limit."""
     driver = get_driver()
@@ -3770,9 +3936,11 @@ def count_skill_proposals(status="pending"):
         return 0
     try:
         with driver.session() as s:
-            where = "WHERE p.status = $status" if status else ""
-            rec = s.run(f"MATCH (p:SkillProposal) {where} RETURN count(p) AS n",
-                        status=status).single()
+            where = "AND p.status = $status" if status else ""
+            rec = s.run(
+                f"MATCH (p) WHERE (p:SkillProposal OR p:ProposalRecord) "
+                f"{where} RETURN count(p) AS n",
+                status=status).single()
             return int(rec["n"]) if rec else 0
     except Exception as e:
         log.warning(f"count_skill_proposals failed: {e}")
@@ -3807,6 +3975,7 @@ def reject_skill_proposal(proposal_id, note=""):
                     p.reviewed_at = $now,
                     p.review_note = $note,
                     p.updated_at  = $now
+                SET p:ProposalRecord REMOVE p:SkillProposal
             """, pid=proposal_id, now=now, note=(note or ""))
 
             # Give back the fragments this cluster absorbed.
@@ -3824,14 +3993,20 @@ def reject_skill_proposal(proposal_id, note=""):
             # Only the ones THIS proposal superseded, and only if they are
             # still superseded -- a fragment that has since been rejected on
             # its own merits keeps that rejection.
+            # Both sides are records by now: `p` was relabelled by the write
+            # above, and a superseded fragment was relabelled when it was
+            # absorbed. Matching either as :SkillProposal here would find
+            # nothing and silently release no fragments.
             back = s.run("""
-                MATCH (p:SkillProposal {proposal_id: $pid})
-                MATCH (f:SkillProposal {status: 'superseded',
-                                        superseded_by: p.member_key})
+                MATCH (p:ProposalRecord {proposal_id: $pid})
+                MATCH (f:ProposalRecord {status: 'superseded',
+                                         superseded_by: p.member_key})
                 SET f.status        = 'pending',
                     f.superseded_by = null,
                     f.updated_at    = $now,
                     f.review_note   = 'Released when the larger cluster was rejected'
+                // Pending again, so it is a proposal again.
+                SET f:SkillProposal REMOVE f:ProposalRecord
                 RETURN count(f) AS n
             """, pid=proposal_id, now=now).single()
             released = back["n"] if back else 0
@@ -3970,6 +4145,7 @@ def close_proposal_for_members(member_addresses, skill_id):
                     p.skill_id    = $sid,
                     p.reviewed_at = $now,
                     p.updated_at  = $now
+                SET p:ProposalRecord REMOVE p:SkillProposal
                 RETURN p.proposal_id AS pid
             """, key=_member_key(created), sid=skill_id,
                  now=datetime.now().isoformat()).single()

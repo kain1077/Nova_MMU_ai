@@ -2262,11 +2262,17 @@ def test_rejecting_a_merged_cluster_releases_its_fragments():
                                      (other, "superseded", "someone-elses-key")):
                 pid = "test-" + key
                 ids[key] = pid
-                s.run("""
-                    CREATE (p:SkillProposal {proposal_id: $pid, member_key: $key,
-                                             status: $status, superseded_by: $sup,
-                                             member_created: [], skill_score: 0.9,
-                                             created_at: $now, updated_at: $now})
+                # The label has to match what the real code writes, or this
+                # test passes against a graph shape that cannot occur. A
+                # pending row is a :SkillProposal; a superseded one was
+                # relabelled :ProposalRecord when it was absorbed, and that is
+                # the label the release query looks for.
+                label = "SkillProposal" if status == "pending" else "ProposalRecord"
+                s.run(f"""
+                    CREATE (p:{label} {{proposal_id: $pid, member_key: $key,
+                                        status: $status, superseded_by: $sup,
+                                        member_created: [], skill_score: 0.9,
+                                        created_at: $now, updated_at: $now}})
                 """, pid=pid, key=key, status=status, sup=sup,
                      now=n4j.datetime.now().isoformat())
 
@@ -2274,19 +2280,30 @@ def test_rejecting_a_merged_cluster_releases_its_fragments():
         assert ok, msg
 
         with drv.session() as s:
-            rows = {r["k"]: r["st"] for r in s.run("""
-                MATCH (p:SkillProposal) WHERE p.member_key IN $keys
-                RETURN p.member_key AS k, p.status AS st
+            rows = {r["k"]: (r["st"], r["lbl"]) for r in s.run("""
+                MATCH (p) WHERE (p:SkillProposal OR p:ProposalRecord)
+                  AND p.member_key IN $keys
+                RETURN p.member_key AS k, p.status AS st, labels(p) AS lbl
             """, keys=[big, frag, other])}
 
-        assert rows[big] == "rejected"
-        assert rows[frag] == "pending", \
+        assert rows[big][0] == "rejected"
+        assert rows[frag][0] == "pending", \
             "a fragment of the rejected cluster must return"
-        assert rows[other] == "superseded", \
+        assert rows[other][0] == "superseded", \
             "a fragment of a DIFFERENT cluster must not"
+
+        # Status and label move together, in both directions. A released
+        # fragment that stayed a :ProposalRecord would be pending and invisible
+        # to every read that matters.
+        assert "SkillProposal" in rows[frag][1], "released, so a proposal again"
+        assert "ProposalRecord" not in rows[frag][1]
+        assert "ProposalRecord" in rows[big][1], "rejected, so not a proposal"
+        assert "SkillProposal" not in rows[big][1]
+        assert "ProposalRecord" in rows[other][1], "still superseded, still a record"
     finally:
         with drv.session() as s:
-            s.run("MATCH (p:SkillProposal) WHERE p.member_key IN $keys DETACH DELETE p",
+            s.run("""MATCH (p) WHERE (p:SkillProposal OR p:ProposalRecord)
+                       AND p.member_key IN $keys DETACH DELETE p""",
                   keys=[big, frag, other])
 
 
@@ -2330,6 +2347,188 @@ def test_association_floor_keeps_weak_matches_out():
 
 
 @live
+def test_closed_proposals_are_relabelled_and_pending_ones_are_not():
+    """
+    A rejected or crystallized proposal is not a proposal any more.
+
+    It used to keep the :SkillProposal label, so `MATCH (p:SkillProposal)` in
+    the browser counted settled decisions as pending work. The label now moves
+    on every closing transition, and the migration in bootstrap_schema() moves
+    the rows that were already closed when it arrived -- without that the
+    split describes only decisions made from here on, and it is the EXISTING
+    rows that cause the confusion.
+
+    Read from source: bootstrap_schema() runs once at startup, against a graph
+    this suite must not migrate to prove a point.
+    """
+    with open(os.path.join(_ROOT, "neo4j_layer.py"), encoding="utf-8") as fh:
+        body = fh.read()
+
+    boot = body[body.index("def bootstrap_schema("):]
+    boot = boot[:boot.index(chr(10) + "def ", 1)]
+
+    assert "SET p:ProposalRecord REMOVE p:SkillProposal" in boot, (
+        "bootstrap_schema must relabel closed proposals that predate the label")
+    assert "SET r:SkillProposal REMOVE r:ProposalRecord" in boot, (
+        "and must restore any pending row wrongly left as a record")
+    assert boot.index("CONSTRAINTS") < boot.index("ProposalRecord"), (
+        "the migration must run after the constraints are ensured")
+
+    # Pending is never swept up -- that would hide live proposals from review.
+    mig = boot[boot.index("MATCH (p:SkillProposal)"):]
+    mig = mig[:mig.index("RETURN count(p)")]
+    assert "'pending'" not in mig, "a pending proposal must not be relabelled"
+    for st in ("rejected", "crystallized", "superseded"):
+        assert st in mig, st + " must be migrated"
+
+    # And every closing transition relabels, not only the migration.
+    for fn in ("def reject_skill_proposal(", "def close_proposal_for_members(",
+               "def retire_unconfirmable_proposals("):
+        blk = body[body.index(fn):]
+        blk = blk[:blk.index(chr(10) + "def ", 1)]
+        assert "ProposalRecord" in blk, fn + " closes a proposal without relabelling"
+
+
+def test_a_rejected_cluster_is_never_re_offered_by_a_sweep():
+    """
+    The guarantee the relabel silently removed.
+
+    "Rejection is permanent" was never enforced anywhere. It worked because
+    the sweep's MERGE found the closed row and its ON MATCH -- which only
+    writes while status = 'pending' -- declined to touch it. Once closed rows
+    carry a different label the MERGE stops seeing them, and the next sweep
+    would CREATE a fresh pending proposal for a cluster the user refused.
+
+    The ceiling's own `known` lookup is not this check: it runs only when the
+    queue is full, so on a graph with room it never executes at all.
+    """
+    with open(os.path.join(_ROOT, "neo4j_layer.py"), encoding="utf-8") as fh:
+        body = fh.read()
+    fn = body[body.index("def queue_skill_proposals("):]
+    fn = fn[:fn.index(chr(10) + "def ", 1)]
+
+    guard = fn.index("MATCH (r:ProposalRecord {member_key: $key})")
+    merge = fn.index("MERGE (p:SkillProposal {member_key: $key})")
+    assert guard < merge, "the closed-cluster check must run BEFORE the MERGE"
+
+    # Both labels, wherever a cluster is looked up by key.
+    known = fn[fn.index("known = s.run("):]
+    known = known[:known.index("single()")]
+    assert "ProposalRecord" in known, "the ceiling lookup must see closed clusters"
+
+
+def test_rejected_records_are_never_pruned():
+    """
+    Retention forgets bookkeeping; it must not reverse a decision.
+
+    A rejected record is the only thing standing between the sweep and
+    re-offering that cluster -- deleting it does not forget the rejection, it
+    undoes it. Superseded and crystallized records are different: one cannot
+    come back (its members are Blue and out of candidacy) and the other should
+    if its members are ever free again.
+    """
+    with open(os.path.join(_ROOT, "neo4j_layer.py"), encoding="utf-8") as fh:
+        body = fh.read()
+    fn = body[body.index("def prune_proposal_records("):]
+    fn = fn[:fn.index(chr(10) + "def ", 1)]
+
+    cut = fn.index("DETACH DELETE r")
+    where = fn[fn.rindex("WHERE", 0, cut):cut]
+    assert "'superseded', 'crystallized'" in where, (
+        "the prune must name exactly the statuses it removes")
+    assert "rejected" not in where, (
+        "a rejected record must never be selected for deletion")
+
+    # days=0 disables it, rather than meaning "everything is older than now".
+    assert "if window <= 0:" in fn, "a non-positive window must disable pruning"
+
+
+def test_projecting_retracts_an_association_to_an_absorbed_member():
+    """
+    `WHERE NOT o IN members` stops the projection WRITING a self-edge, which
+    is not the same as one never existing: an outsider earns its edge
+    honestly, add_skill_members later absorbs it, and the edge it already
+    holds now points at its own skill.
+
+    An edge from a member is a skill recommending itself -- /skills/growth
+    reads association as evidence the skill should grow, so a self-edge makes
+    delivering a member read as growth.
+
+    Synthetic skill and memory, torn down whether or not this passes.
+    """
+    n4j, drv = _n4j()
+    if drv is None:
+        pytest.skip("no Neo4j")
+
+    sid, stamp = "test-retract-skill", "test-retract-2000-01-01T00:00:00"
+    try:
+        with drv.session() as s:
+            s.run("""
+                CREATE (sk:Skill {skill_id: $sid, trigger: 'test', procedure: 'test',
+                                  created_at: $now, status: 'active'})
+                CREATE (m:Memory {created_at: $stamp, address: $stamp})
+                CREATE (m)-[:PROCEDURALIZED_FROM]->(sk)
+                CREATE (m)-[:ASSOCIATED_WITH {weight: 5, seeded: 5,
+                                              created_at: $now, last_at: $now}]->(sk)
+            """, sid=sid, stamp=stamp, now=n4j.datetime.now().isoformat())
+            before = s.run("""
+                MATCH (:Memory {created_at: $stamp})-[a:ASSOCIATED_WITH]->
+                      (:Skill {skill_id: $sid})
+                RETURN count(a) AS n
+            """, stamp=stamp, sid=sid).single()["n"]
+        assert before == 1, "fixture did not take"
+
+        n4j.project_skill_associations(sid)
+
+        with drv.session() as s:
+            after = s.run("""
+                MATCH (:Memory {created_at: $stamp})-[a:ASSOCIATED_WITH]->
+                      (:Skill {skill_id: $sid})
+                RETURN count(a) AS n
+            """, stamp=stamp, sid=sid).single()["n"]
+            member = s.run("""
+                MATCH (:Memory {created_at: $stamp})-[r:PROCEDURALIZED_FROM]->
+                      (:Skill {skill_id: $sid})
+                RETURN count(r) AS n
+            """, stamp=stamp, sid=sid).single()["n"]
+        assert after == 0, "a member's association with its own skill is retracted"
+        assert member == 1, "retraction must not touch membership"
+    finally:
+        with drv.session() as s:
+            s.run("MATCH (m:Memory {created_at: $stamp}) DETACH DELETE m", stamp=stamp)
+            s.run("MATCH (sk:Skill {skill_id: $sid}) DETACH DELETE sk", sid=sid)
+
+
+def test_review_routines_asks_before_clearing_the_queue():
+    """
+    Being asked to CHECK the queue is not being asked to empty it.
+
+    With crystallization enabled there was nothing between the two requests,
+    and nineteen proposals went through in one turn without anyone seeing
+    them. The fix is a question, not a lock -- the capability is unchanged.
+    """
+    with open(os.path.join(_ROOT, "mmu_mcp_server.py"), encoding="utf-8") as fh:
+        src = fh.read()
+    block = src[src.index("These are proposals only."):]
+    block = block[:block.index("return ")]
+    # Rejoin adjacent string literals, so these assertions survive a rewrap.
+    # The instruction is one sentence to the model; where the source happens
+    # to break the line is not part of it.
+    joined = re.sub(r'"\s*"', "", block)
+
+    assert "ALLOW_CRYSTALLIZE" in block, (
+        "the instruction must depend on whether the model can actually act")
+    assert "ASK whether" in joined, "it must ask, not assume"
+    assert "do not ask again for the rest of that run" in joined, (
+        "one answer must cover the run -- asking per proposal is its own problem")
+
+    # Every tool it names has to exist. Text naming an unregistered tool is
+    # what sent the model round the loop twice before.
+    for tool in ("crystallize_routine", "grow_routine"):
+        assert tool in joined, "the instruction should name " + tool
+        assert '"name": "' + tool + '"' in src, tool + " is named but not registered"
+
+
 def test_a_skill_is_never_associated_with_its_own_members():
     """
     A skill already contains its members. An edge back would make every
