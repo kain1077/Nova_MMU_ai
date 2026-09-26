@@ -2440,7 +2440,7 @@ def index_repair(apply: bool = False):
     Reconcile the v2 index against Neo4j. Reports by default; pass apply=true
     to write.
 
-    Two kinds of drift, and they fail differently:
+    Four kinds of drift, and they fail differently:
 
       MISSING   in Neo4j, absent from the index. Invisible to recall, because
                 the index IS the read path -- but still counted by every graph
@@ -2459,6 +2459,12 @@ def index_repair(apply: bool = False):
                 was supposed to replace. Every member crystallized before the
                 flag existed is in this state, which is why this reconciles
                 rather than assuming a fresh graph.
+
+      AGED OUT  a member of an active Skill that is no longer Blue in Neo4j.
+                Before the flag above existed, aging promoted recalled members
+                to Yellow and Green and wrote that to the graph, so they sat in
+                the recall pool while compressed into a skill. Reconciling the
+                flag stops it recurring; only this puts them back.
 
     Incremental on purpose: rebuild_from_neo4j() would fix both and also
     discard the shortcut cache and reset the generation counter, which is a
@@ -2479,7 +2485,7 @@ def index_repair(apply: bool = False):
     # it as the latter would unflag every member in the index on the strength
     # of an answer that never came back.
     members = n4j.get_skill_member_addresses()
-    misfiled_on, misfiled_off = [], []
+    misfiled_on, misfiled_off, aged_out = [], [], []
     if members is not None:
         member_set = set(members)
         for addr, card in mmu.v2_index.shortcut_cache.items():
@@ -2488,6 +2494,12 @@ def index_repair(apply: bool = False):
                 misfiled_on.append(addr)
             elif flagged and addr not in member_set:
                 misfiled_off.append(addr)
+        # Read off the rows already loaded, so the dry run costs no extra query.
+        aged_out = sorted(
+            ({"address": a, "color": graph[a]["color"]}
+             for a in member_set
+             if a in graph and (graph[a]["color"] or "") != "Blue"),
+            key=lambda d: d["address"])
 
     result = {
         "status":       "repaired" if apply else "dry-run",
@@ -2501,13 +2513,15 @@ def index_repair(apply: bool = False):
         "misfiled_unflagged":    sorted(misfiled_on),
         "misfiled_stale_flag":   sorted(misfiled_off),
         "misfiled_count":        len(misfiled_on) + len(misfiled_off),
+        "aged_out_of_skill":     aged_out,
+        "aged_out_count":        len(aged_out),
     }
     if members is None:
         result["skill_members_note"] = (
             "Skill membership could not be read from Neo4j and was NOT "
             "reconciled. Nothing was unflagged on the strength of that.")
     if not apply:
-        drift = missing or phantom or misfiled_on or misfiled_off
+        drift = missing or phantom or misfiled_on or misfiled_off or aged_out
         result["note"] = ("Nothing was written. Re-run with apply=true to fix."
                           if drift else "Index and graph agree.")
         return result
@@ -2534,11 +2548,30 @@ def index_repair(apply: bool = False):
         mmu.v2_index.set_skill_member(
             [a for a in mmu.v2_index.shortcut_cache if a not in member_set], False)
 
+    # The graph moves first and the index follows what landed. Aging wrote the
+    # promoted colour to Neo4j too, so fixing only the card would let the next
+    # rebuild reintroduce it from the graph.
+    restored = n4j.repair_crystallized_colors()
+    if restored is None:
+        result["colour_repair_note"] = (
+            "Crystallized members could not be restored to Blue: Neo4j did not "
+            "answer. Nothing was recoloured.")
+        restored = []
+    for row in restored:
+        try:
+            mmu.v2_index.set_color(row["address"], "Blue")
+            mmu.v2_index.set_skill_member([row["address"]], True)
+        except Exception as e:
+            log.warning("v2 index colour sync failed for %s: %s", row["address"], e)
+    result["restored_to_blue"] = [
+        {"address": r["address"], "was": r["was"]} for r in restored]
+
     mmu.v2_index.save()
     result["note"] = (
         f"Added {len(missing)}, removed {len(phantom)}, "
         f"reconciled {len(misfiled_on) + len(misfiled_off)} skill membership "
-        f"flag(s). Index and graph now agree.")
+        f"flag(s), restored {len(restored)} crystallized member(s) to Blue. "
+        f"Index and graph now agree.")
     return result
 
 
