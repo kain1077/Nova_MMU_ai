@@ -595,7 +595,8 @@ curl -X POST http://127.0.0.1:8765/index_repair
 curl -X POST "http://127.0.0.1:8765/index_repair?apply=true"
 ```
 
-The first reports; only the second writes.
+The first reports; only the second writes. The same repair also puts crystallized
+memories that drifted out of Blue (listed as `aged_out_of_skill`) back where they belong.
 
 ---
 

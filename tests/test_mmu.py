@@ -620,6 +620,42 @@ def test_membership_lookup_distinguishes_empty_from_unreachable():
     assert "return None" in src, "unreachable must be distinguishable from empty"
 
 
+def test_colour_repair_restores_members_without_losing_their_history():
+    """
+    The flag stops a crystallized member ageing out of Blue; it cannot undo the
+    ones that already had -- 11 of 33 on the graph this was found on, promoted
+    to Yellow and Green in Neo4j as well as in the index. The repair has to
+    target only members of live skills, and must not touch pre_skill_color:
+    that is what uncrystallize restores, and overwriting it with Blue would
+    turn an undo into a second demotion.
+    """
+    import neo4j_layer as n4j
+    src = inspect.getsource(n4j.repair_crystallized_colors)
+    assert "PROCEDURALIZED_FROM" in src,    "must be keyed on skill membership"
+    assert "'deprecated'" in src,           "a retired skill's members are not compressed"
+    assert "SET m.color = 'Blue'" in src
+    assert "pre_skill_color" not in src.split('"""', 2)[2], \
+        "the pre-crystallization colour must be left for uncrystallize"
+    assert "return None" in src, "unreachable must be distinguishable from nothing drifted"
+
+
+def test_index_repair_restores_aged_out_members_from_what_landed():
+    """
+    Neo4j first, then the index -- and only for the rows the graph says it
+    changed, the same rule the aging pass follows. Read as text for the reason
+    the aging test above gives.
+    """
+    import pathlib
+    src = (pathlib.Path(__file__).resolve().parents[1] / "mmu_server.py").read_text(
+        encoding="utf-8")
+    body = src.split("def index_repair", 1)[1].split("\n@app.", 1)[0]
+    assert '"aged_out_of_skill"' in body, "the dry run must report the drift"
+    assert "n4j.repair_crystallized_colors()" in body
+    tail = body.split("n4j.repair_crystallized_colors()", 1)[1]
+    assert "for row in restored" in tail, "the index must follow what landed"
+    assert 'set_color(row["address"], "Blue")' in tail
+
+
 def test_the_aging_pass_leaves_crystallized_members_alone():
     """
     The leak itself. _age_memories() promotes Blue back to Yellow on recall,
@@ -965,6 +1001,20 @@ def test_index_repair_reports_before_it_writes():
     assert st == 200 and d["status"] == "dry-run"
     _, after = _call("GET", "/health")
     assert after["total_memories"] == before["total_memories"]
+
+
+@live
+def test_no_crystallized_member_has_aged_out_of_compression():
+    """
+    A member of an active skill that is anything but Blue is live in the recall
+    pool while compressed into that skill. The dry run must say so, and on a
+    healthy graph must find none.
+    """
+    st, d = _call("POST", "/index_repair")
+    assert st == 200
+    assert "aged_out_of_skill" in d and d["aged_out_count"] == len(d["aged_out_of_skill"])
+    assert d["aged_out_of_skill"] == [], \
+        "run POST /index_repair?apply=true to restore these to Blue"
 
 
 @live

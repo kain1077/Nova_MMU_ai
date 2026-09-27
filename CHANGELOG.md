@@ -12,6 +12,15 @@ hottest path, and the removal of code that could not run.
 
 ### Fixed
 
+- **Crystallized members that aged out of Blue are put back.** Before the `skill_member`
+  flag existed, aging promoted a recalled member from Blue to Yellow and then Green and
+  wrote that to Neo4j, so it sat in the recall pool while still compressed into its
+  skill -- 11 of 33 members on the graph this was found on. The flag stopped new drift
+  but nothing undid the old. `POST /index_repair` now reports these as
+  `aged_out_of_skill`, and `?apply=true` restores them to Blue in the graph first and
+  then in the index, for exactly the rows the graph changed. `pre_skill_color` is left
+  alone, so uncrystallizing still restores each member's original colour.
+
 - **A closed proposal is no longer a proposal.** Neo4j showed 25 proposals while the
   review queue showed none, and both were right: a rejected or crystallized row kept the
   `:SkillProposal` label, so anyone opening the browser counted settled decisions as

@@ -2835,6 +2835,56 @@ def get_skill_member_addresses():
         return None
 
 
+def repair_crystallized_colors():
+    """
+    Put members of active skills back to Blue, and report which moved.
+
+    Before the aging exemption existed, _age_memories() promoted a recalled
+    Blue memory to Yellow and then Green and knew nothing about skills, so a
+    crystallized member that happened to be recalled climbed back out of
+    compression -- live in the recall pool and compressed into a skill at the
+    same time. On the graph where this was found, 11 of 33 members had drifted:
+    10 Yellow, 1 Green, every one of them under an active skill.
+
+    The skill_member flag stops it recurring. It cannot undo what already
+    drifted, and aging wrote the promoted colour to Neo4j as well as to the
+    index, so fixing only the card would let the next rebuild reintroduce it
+    from the graph.
+
+    One statement rather than a read and then a write: the rows returned are
+    exactly the rows changed, so a caller mirroring them onto the index follows
+    what landed and nothing else.
+
+    pre_skill_color is left alone. crystallize_skill() wrote it with coalesce
+    precisely so a second demotion could not overwrite the original, so it
+    still holds the colour from before crystallization and uncrystallize will
+    restore the right one. The address is left alone for the same reason
+    crystallize_skill() leaves it: demotion into a skill has never rewritten it.
+
+    Returns None (not []) when the graph is unreachable, so a caller can tell
+    "nothing drifted" from "could not ask".
+    """
+    driver = get_driver()
+    if driver is None:
+        return None
+    try:
+        with driver.session() as s:
+            rows = [dict(r) for r in s.run("""
+                MATCH (m:Memory)-[:PROCEDURALIZED_FROM]->(sk:Skill)
+                WHERE sk.status <> 'deprecated' AND m.color <> 'Blue'
+                WITH DISTINCT m, m.color AS was
+                SET m.color = 'Blue'
+                RETURN m.address AS address, was
+            """)]
+        if rows:
+            log.info("Restored %d crystallized member(s) to Blue after aging drift",
+                     len(rows))
+        return rows
+    except Exception as e:
+        log.warning(f"repair_crystallized_colors failed: {e}")
+        return None
+
+
 def get_skills_needing_index():
     """
     Active skills with no embedding or no keywords -- everything crystallized
