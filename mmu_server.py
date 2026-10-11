@@ -3362,6 +3362,15 @@ Priority 7-9 = minor notes
 
 # ── Phase 4 endpoints ─────────────────────────────────
 
+def _require_memory(address):
+    """404 when no node holds the address, 503 when Neo4j cannot say."""
+    exists = n4j.memory_exists(address)
+    if exists is None:
+        raise HTTPException(503, "Neo4j unavailable")
+    if not exists:
+        raise HTTPException(404, f"Address not found: {address}")
+
+
 @app.post("/flag_recall")
 def flag_recall(body: FlagIn):
     """
@@ -3379,6 +3388,7 @@ def flag_recall(body: FlagIn):
     if addr is None:
         raise HTTPException(404, f"Address not found or invalid: {body.address}")
     body.address = addr
+    _require_memory(addr)
 
     new_count = n4j.flag_memory(body.address, reason=body.reason)
     if new_count == -1:
@@ -3430,6 +3440,7 @@ def audit_memory(body: AuditIn):
     if addr is None:
         raise HTTPException(404, f"Address not found or invalid: {body.address}")
     body.address = addr
+    _require_memory(addr)
 
     n4j.snapshot_memory_before_audit(body.address)   # Phase 5 -- snapshot before overwrite
 
@@ -3946,6 +3957,9 @@ def rate_memory_endpoint(body: RateIn, x_mmu_session: Optional[str] = Header(Non
     old_addr  = mmu.extract_address(body.address)
     if old_addr is None:
         raise HTTPException(404, f"Address not found or invalid: {body.address.strip()}")
+    # Every write below is a MATCH, and a MATCH on nothing is not an error, so
+    # without this a stale or invented address was "rated" with a 200.
+    _require_memory(old_addr)
 
     new_addr = mmu.rate_memory(old_addr, vt, intensity,
                                emotion_label=body.emotion_label)

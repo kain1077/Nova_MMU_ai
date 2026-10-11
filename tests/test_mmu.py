@@ -920,9 +920,8 @@ def test_flag_and_delete_from_pasted_display_line():
         assert st == 200 and d["address"] == addr and d["false_recall_count"] == 1, d
         st, d = _call("DELETE", f"/memories/{urllib.parse.quote(_pasted(addr), safe='')}")
         assert st == 200 and d["address"] == addr, d
-        # A node that still existed would be renamed by the rating.
         st, d = _call("POST", "/rate", {"address": addr, "val_type": "like", "intensity": 4})
-        assert d.get("new_address") == addr, "the pasted DELETE left the memory in place"
+        assert st == 404, "the pasted DELETE left the memory in place"
     finally:
         _call("DELETE", f"/memories/{urllib.parse.quote(addr, safe='')}")
 
@@ -933,6 +932,26 @@ def test_flag_and_delete_from_pasted_display_line():
     ("/flag_recall", {"address": "not an address"}),
 ])
 def test_unparseable_address_is_404(path, body):
+    st, _ = _call("POST", path, body)
+    assert st == 404
+
+
+@live
+@pytest.mark.parametrize("path,body", [
+    ("/rate", {"address": "987654.005.500.000,000~000|0.000.000",
+               "val_type": "like", "intensity": 4}),
+    ("/rate", {"address": "[Green | GRP 500 | 987654.005.500.000,000~000|0.000.000]",
+               "val_type": "dislike", "intensity": 2}),
+    ("/flag_recall", {"address": "987654.005.500.000,000~000|0.000.000"}),
+    ("/audit_memory", {"address": "987654.005.500.000,000~000|0.000.000",
+                       "new_color": "Yellow", "audit_note": "probe"}),
+])
+def test_missing_memory_is_404(path, body):
+    """
+    A well-formed address with no node behind it. Every write on these routes
+    is a MATCH ... SET, and a MATCH on nothing is not an error: /rate answered
+    200 and /flag_recall a false 503 "Neo4j unavailable".
+    """
     st, _ = _call("POST", path, body)
     assert st == 404
 

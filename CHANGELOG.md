@@ -20,6 +20,13 @@ hottest path, and the removal of code that could not run.
   matched nothing either. All of them now act on the address substring exactly as it was
   sent, and answer 404 when nothing address-shaped is in it.
 
+- **An address with no memory behind it is a 404.** The writes on `/rate`, `/flag_recall`
+  and `/audit_memory` are `MATCH ... SET`, and a match on nothing is not an error, so
+  `/rate` answered 200 for a stale or invented address and `/flag_recall` answered 503
+  "Neo4j unavailable" whenever the node was missing. They now ask `memory_exists()` first:
+  404 for no node, 503 only when Neo4j really cannot be reached. `DELETE /memories` is
+  unchanged, because it also clears index entries whose node is already gone.
+
 - **Crystallized members that aged out of Blue are put back.** Before the `skill_member`
   flag existed, aging promoted a recalled member from Blue to Yellow and then Green and
   wrote that to Neo4j, so it sat in the recall pool while still compressed into its
