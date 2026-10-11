@@ -787,7 +787,7 @@ class MMUCore:
         # Phase 6.5: ~VAL segment (TTS: TT=type 00/01/02, S=intensity 0-9)
         return f"{con:03d}.{pri:03d}.{grp:03d}.{use:03d},{arc:03d}~{val:03d}|{st}.{sc:03d}.{sl:03d}"
 
-    def _parse_addr(self, address):
+    def _match_addr(self, address):
         # Phase 6.5: ~VAL is optional so old addresses still parse during migration
         # Phase 8 hardening: re.search (not re.match) so a model that pastes the
         # whole "[Color | GRP nnn | address]" display line instead of just the
@@ -811,8 +811,29 @@ class MMUCore:
             # group is backward compatible: existing 3-digit addresses parse
             # exactly as before.
             r"(\d{3,})\.(\d{3})\.(\d{3})\.(\d{3}),(\d{3})(?:~(\d{3}))?\|(\d+)\.(\d{3})\.(\d{3})",
-            address
+            address or ""
         )
+        return m
+
+    def extract_address(self, address):
+        """
+        The address substring exactly as it appears in what was sent, or None.
+
+        _parse_addr() finds an address inside a pasted display line, but every
+        store is keyed on the bare address. A caller that parses the pasted
+        string and then MATCHes on the original matches nothing: /rate returned
+        200 with the rating silently dropped. Anything that looks up or writes
+        by an address the caller supplied goes through here first.
+
+        m.group(0) rather than an address rebuilt with _gen_addr(): a pre-6.5
+        address with no ~VAL segment is stored without it, and rebuilding it
+        would add ~000.
+        """
+        m = self._match_addr(address)
+        return m.group(0) if m else None
+
+    def _parse_addr(self, address):
+        m = self._match_addr(address)
         if m:
             k = ["con", "pri", "grp", "use", "arc", "val", "src_type", "src_chunk", "src_line"]
             groups = list(m.groups())
@@ -1418,9 +1439,12 @@ class MMUCore:
         s_int   = max(1, min(9, int(intensity))) if tt != 0 else 0
         val     = tt * 10 + s_int   # 019 = like-9, 028 = dislike-8, 000 = cleared
 
-        p = self._parse_addr(address)
-        if p is None:
+        # The bare address, not whatever was pasted around it: everything
+        # below MATCHes on it.
+        address = self.extract_address(address)
+        if address is None:
             return None
+        p = self._parse_addr(address)
 
         new_addr = self._gen_addr(
             p["con"], p["pri"], p["grp"], p["use"], p["arc"],
@@ -3198,6 +3222,8 @@ def session_resume(session_id: str):
 
 @app.get("/neighbors/{address:path}")
 def neighbors(address: str, limit: int = 5):
+    if mmu is not None:
+        address = mmu.extract_address(address) or address
     return {
         "address":   address,
         "neighbors": n4j.graph_neighbors(address, limit=limit)
@@ -3205,6 +3231,10 @@ def neighbors(address: str, limit: int = 5):
 
 @app.delete("/memories/{address:path}")
 def delete_memory(address: str):
+    addr = mmu.extract_address(address)
+    if addr is None:
+        raise HTTPException(404, f"Address not found or invalid: {address}")
+    address = addr
     mmu.delete_memory(address)
     return {"status": "deleted", "address": address}
 
@@ -3343,6 +3373,12 @@ def flag_recall(body: FlagIn):
     """
     if not body.address:
         raise HTTPException(status_code=400, detail="address is required")
+    if mmu is None:
+        raise HTTPException(503, "MMU not initialized")
+    addr = mmu.extract_address(body.address)
+    if addr is None:
+        raise HTTPException(404, f"Address not found or invalid: {body.address}")
+    body.address = addr
 
     new_count = n4j.flag_memory(body.address, reason=body.reason)
     if new_count == -1:
@@ -3388,6 +3424,12 @@ def audit_memory(body: AuditIn):
     """
     if not body.address:
         raise HTTPException(status_code=400, detail="address is required")
+    if mmu is None:
+        raise HTTPException(503, "MMU not initialized")
+    addr = mmu.extract_address(body.address)
+    if addr is None:
+        raise HTTPException(404, f"Address not found or invalid: {body.address}")
+    body.address = addr
 
     n4j.snapshot_memory_before_audit(body.address)   # Phase 5 -- snapshot before overwrite
 
@@ -3899,7 +3941,11 @@ def rate_memory_endpoint(body: RateIn, x_mmu_session: Optional[str] = Header(Non
     if vt not in ("like", "dislike", "clear"):
         raise HTTPException(400, "val_type must be 'like', 'dislike', or 'clear'")
     intensity = max(1, min(9, body.intensity))
-    old_addr  = body.address.strip()
+    # A pasted display line parses, but the bare address is what the graph is
+    # keyed on and what the caller should see back as old_address.
+    old_addr  = mmu.extract_address(body.address)
+    if old_addr is None:
+        raise HTTPException(404, f"Address not found or invalid: {body.address.strip()}")
 
     new_addr = mmu.rate_memory(old_addr, vt, intensity,
                                emotion_label=body.emotion_label)

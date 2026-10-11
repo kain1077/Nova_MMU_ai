@@ -873,6 +873,70 @@ def test_save_recall_roundtrip():
         _call("DELETE", f"/memories/{urllib.parse.quote(addr, safe='')}")
 
 
+def _pasted(addr):
+    # What a model sends when it copies the whole recall display line.
+    return f"[Green | GRP 500 | {addr}]"
+
+
+def _probe(tag):
+    # A nonce, because /remember refuses an identical payload, and a run on a
+    # server with this bug cannot delete its probe through the pasted line.
+    st, saved = _call("POST", "/remember", {
+        "keywords": [tag, "ratepaste"],
+        "payload": f"Pytest pasted-address probe {tag} {os.urandom(4).hex()}.",
+        "src_type": 1,
+    })
+    assert st == 200 and saved["status"] == "saved"
+    return saved["address"]
+
+
+@live
+def test_rate_from_pasted_display_line_applies():
+    """
+    _parse_addr() finds the address inside a pasted display line, but
+    rate_memory() used to MATCH on the raw pasted string. /rate answered 200
+    with old_address == new_address (both the bracketed string) and the
+    rating went nowhere. A landed rating renames the node to ~014.
+    """
+    addr = _probe("pastedrate")
+    new = addr
+    try:
+        st, d = _call("POST", "/rate", {"address": _pasted(addr),
+                                        "val_type": "like", "intensity": 4})
+        assert st == 200, d
+        new = d["new_address"]
+        assert d["old_address"] == addr
+        assert new != addr and new.split("~")[1].startswith("014"), d
+    finally:
+        _call("DELETE", f"/memories/{urllib.parse.quote(new, safe='')}")
+
+
+@live
+def test_flag_and_delete_from_pasted_display_line():
+    """Same class: /flag_recall answered a false 503, DELETE a false 200."""
+    addr = _probe("pastedflag")
+    try:
+        st, d = _call("POST", "/flag_recall", {"address": _pasted(addr), "reason": "probe"})
+        assert st == 200 and d["address"] == addr and d["false_recall_count"] == 1, d
+        st, d = _call("DELETE", f"/memories/{urllib.parse.quote(_pasted(addr), safe='')}")
+        assert st == 200 and d["address"] == addr, d
+        # A node that still existed would be renamed by the rating.
+        st, d = _call("POST", "/rate", {"address": addr, "val_type": "like", "intensity": 4})
+        assert d.get("new_address") == addr, "the pasted DELETE left the memory in place"
+    finally:
+        _call("DELETE", f"/memories/{urllib.parse.quote(addr, safe='')}")
+
+
+@live
+@pytest.mark.parametrize("path,body", [
+    ("/rate", {"address": "[Green | GRP 500 | no address here]", "val_type": "like"}),
+    ("/flag_recall", {"address": "not an address"}),
+])
+def test_unparseable_address_is_404(path, body):
+    st, _ = _call("POST", path, body)
+    assert st == 404
+
+
 @live
 def test_index_and_graph_agree():
     """

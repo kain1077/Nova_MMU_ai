@@ -12,6 +12,14 @@ hottest path, and the removal of code that could not run.
 
 ### Fixed
 
+- **A pasted display line now rates the memory it names.** `_parse_addr()` finds the
+  address inside `[Green | GRP 500 | <address>]`, but `rate_memory()` then matched the
+  graph on the raw pasted string: `/rate` answered 200 with `old_address == new_address`
+  and the rating went nowhere. The same input gave `/flag_recall` a false 503 and
+  `DELETE /memories` a 200 that deleted nothing, and `/audit_memory` and `/neighbors`
+  matched nothing either. All of them now act on the address substring exactly as it was
+  sent, and answer 404 when nothing address-shaped is in it.
+
 - **Crystallized members that aged out of Blue are put back.** Before the `skill_member`
   flag existed, aging promoted a recalled member from Blue to Yellow and then Green and
   wrote that to Neo4j, so it sat in the recall pool while still compressed into its
