@@ -853,6 +853,30 @@ def write_addr_rename(old_address, new_address):
         return None
 
 
+def memory_exists(address):
+    """
+    True or False for whether a Memory node holds this address; None when
+    Neo4j cannot be asked.
+
+    The write helpers below MATCH and SET, and a MATCH that finds nothing is
+    not an error in Cypher -- so /rate answered 200 for an address with no
+    node, and flag_memory()'s -1 could not tell "no such memory" from "Neo4j
+    down" (/flag_recall said 503 for both). Routes that write to one named
+    memory ask this first, so each case gets its own status.
+    """
+    s = neo4j_session()
+    if s is None:
+        return None
+    try:
+        with s:
+            rec = s.run("MATCH (m:Memory {address: $addr}) RETURN count(m) AS n",
+                        addr=address).single()
+            return bool(rec and rec["n"])
+    except Exception as e:
+        log.warning(f"Neo4j memory_exists failed: {e}")
+        return None
+
+
 def write_valence(address, val_type, val_intensity, emotion_label=None):
     """
     Phase 6.5: Set valence properties on a Memory node.
