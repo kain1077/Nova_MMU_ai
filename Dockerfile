@@ -1,7 +1,13 @@
-FROM python:3.11-slim
+# Pinned by digest, not just by tag: "3.11-slim" is re-pointed at every Python
+# and Debian update, so the same Dockerfile built a month apart gives two
+# different images. This digest is the multi-architecture index (amd64, arm64,
+# ...) for Python 3.11.16 on Debian trixie, the image the pins below were
+# validated on. To move to a newer base, update the digest and re-test.
+FROM python:3.11-slim@sha256:1042b61448fef4ba92d16a8c7eb4996d027568ce64792a7877fd88511e0af7c6
 
 WORKDIR /app
 
+# Every package pinned, transitive ones included -- see requirements.txt.
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
