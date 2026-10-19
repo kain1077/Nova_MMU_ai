@@ -39,7 +39,7 @@ USAGE
   python mmu_recall_speed_test.py --prompts "who wrote this" "project deadline"
   python mmu_recall_speed_test.py --prompts-file probes.txt
   python mmu_recall_speed_test.py --skip-color-check
-  python mmu_recall_speed_test.py --base-url http://127.0.0.1:8766
+  python mmu_recall_speed_test.py --base-url http://127.0.0.1:8767
 """
 
 from __future__ import annotations
@@ -300,8 +300,8 @@ def main():
         description="Measure MMU /recall latency (read_ms and round-trip).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--base-url", default=os.environ.get("MMU_BASE", "http://127.0.0.1:8766"),
-                   help="MMU server base URL (default: $MMU_BASE or http://127.0.0.1:8766, "
+    p.add_argument("--base-url", default=os.environ.get("MMU_BASE", "http://127.0.0.1:8767"),
+                   help="MMU server base URL (default: $MMU_BASE or http://127.0.0.1:8767, "
                         "the second-instance convention)")
     p.add_argument("--allow-production", action="store_true",
                    help=f"Permit running against port {PRODUCTION_PORT}, where a real graph lives")

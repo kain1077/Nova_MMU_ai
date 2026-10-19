@@ -44,7 +44,7 @@ Clone to a separate directory and override ports **and container names** in its
 
 ```
 NEO4J_PASS=something-else
-MMU_PORT=8766
+MMU_PORT=8767
 NEO4J_HTTP_PORT=7475
 NEO4J_BOLT_PORT=7688
 MMU_NEO4J_NAME=mmu-bench-neo4j
@@ -77,7 +77,7 @@ Once, interactively. This is the step where a human decides the graph is
 expendable:
 
 ```bash
-python -m bench.longmemeval.run init --base-url http://127.0.0.1:8766
+python -m bench.longmemeval.run init --base-url http://127.0.0.1:8767
 ```
 
 It prints the graph's current memory count and asks you to type `disposable`.
@@ -107,7 +107,7 @@ all one category:
 ```bash
 python -m bench.longmemeval.run run \
   --dataset path/to/longmemeval_s.json \
-  --base-url http://127.0.0.1:8766 \
+  --base-url http://127.0.0.1:8767 \
   --limit 50
 ```
 
@@ -116,7 +116,7 @@ Then the full set, with resume, because it takes hours:
 ```bash
 python -m bench.longmemeval.run run \
   --dataset path/to/longmemeval_s.json \
-  --base-url http://127.0.0.1:8766 \
+  --base-url http://127.0.0.1:8767 \
   --resume
 ```
 

@@ -39,6 +39,8 @@ def pytest_report_header(config):
             lines.append("!! " + _t._SERVER_IMPORT_REASON)
         if getattr(_t, "_AIMED_AT_PRODUCTION", False):
             lines.append("!! " + _t._PRODUCTION_REASON)
+        elif getattr(_t, "_AIMED_AT_DAEMON", False):
+            lines.append("!! " + _t._DAEMON_REASON)
         elif not getattr(_t, "_LIVE_OK", False):
             lines.append("!! no MMU server at %s -- every live test will skip"
                          % getattr(_t, "BASE", "?"))

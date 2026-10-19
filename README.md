@@ -591,7 +591,7 @@ project name is not enough on its own:
 
 ```
 NEO4J_PASS=something-else
-MMU_PORT=8766
+MMU_PORT=8767
 NEO4J_HTTP_PORT=7475
 NEO4J_BOLT_PORT=7688
 MMU_NEO4J_NAME=mmu-test-neo4j
@@ -619,20 +619,20 @@ aging state machine -- need nothing running, and are the ones that catch a regre
 before it reaches a container. The **live** tests hit a running server and skip
 themselves automatically when nothing is listening.
 
-**The live tests default to port 8766, not 8765.** They write memories, and every
+**The live tests default to port 8767, not 8765.** They write memories, and every
 `/recall` they make ages every memory it *doesn't* return Green to Yellow, and far
 enough to Blue. So a bare `pytest tests/` runs the pure tier and skips the live tier
-unless a throwaway instance is listening on 8766:
+unless a throwaway instance is listening on 8767:
 
 ```bash
-MMU_TEST_BASE=http://127.0.0.1:8766 pytest tests/ -v
+MMU_TEST_BASE=http://127.0.0.1:8767 pytest tests/ -v
 ```
 
 In PowerShell, set it on its own line first — the inline `VAR=value command` prefix is
 shell syntax that PowerShell doesn't have:
 
 ```powershell
-$env:MMU_TEST_BASE = "http://127.0.0.1:8766"; pytest tests/ -v
+$env:MMU_TEST_BASE = "http://127.0.0.1:8767"; pytest tests/ -v
 ```
 
 Pointing them at 8765 is refused before any request is made. If that instance really is
@@ -641,6 +641,11 @@ disposable, opt in explicitly:
 ```bash
 MMU_TEST_ALLOW_PRODUCTION=1 MMU_TEST_BASE=http://127.0.0.1:8765 pytest tests/ -v
 ```
+
+The idle daemon's control port (`MMU_IDLE_CONTROL_PORT`, default 8766) is refused with
+no opt-in: it is never an MMU server. The second-instance convention used to be 8766
+too, so on a machine running the daemon the suite probed the daemon and aimed its live
+tests at it. If your test instance still listens on 8766, move it to 8767.
 
 [Running a second instance](#running-a-second-instance) covers standing one up.
 

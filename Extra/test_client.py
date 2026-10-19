@@ -29,7 +29,7 @@ import time
 # ages memories the burst did not touch. It used to hardcode 8765 with no way
 # to override it. Same reasoning as tests/test_mmu.py and
 # mmu_recall_speed_test.py; all three now agree.
-BASE = os.environ.get("MMU_BASE", "http://127.0.0.1:8766").rstrip("/")
+BASE = os.environ.get("MMU_BASE", "http://127.0.0.1:8767").rstrip("/")
 
 PRODUCTION_PORT = 8765
 if urllib.parse.urlparse(BASE).port == PRODUCTION_PORT and \

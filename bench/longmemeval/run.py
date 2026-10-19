@@ -9,9 +9,9 @@ Every backend sees the same instances in the same order at the same k, so a
 difference in the output is a difference in retrieval.
 
     python -m bench.longmemeval.run inspect --dataset data/longmemeval_s.json
-    python -m bench.longmemeval.run init    --base-url http://127.0.0.1:8766
+    python -m bench.longmemeval.run init    --base-url http://127.0.0.1:8767
     python -m bench.longmemeval.run run     --dataset data/longmemeval_s.json \\
-        --base-url http://127.0.0.1:8766 --limit 50
+        --base-url http://127.0.0.1:8767 --limit 50
 """
 
 from __future__ import annotations
@@ -298,7 +298,7 @@ def main(argv=None) -> int:
 
     p_run = sub.add_parser("run", help="run the benchmark")
     p_run.add_argument("--dataset", required=True)
-    p_run.add_argument("--base-url", default="http://127.0.0.1:8766")
+    p_run.add_argument("--base-url", default="http://127.0.0.1:8767")
     p_run.add_argument("--backends", default="mmu,flat_vector,bm25")
     p_run.add_argument("--top-k", type=int, default=10)
     p_run.add_argument("--limit", type=int, default=0,
