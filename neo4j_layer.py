@@ -1284,7 +1284,12 @@ def get_next_con():
                 """).single()
                 return int((rec["max_con"] or 0)) + 1 if rec else 1
         except Exception:
-            return get_memory_count() + 1
+            # Not get_memory_count() + 1: that collides after any deletion
+            # (delete 5 of 100 and it hands out 96, already taken), and it is
+            # the one step of this chain that is wrong even when it works. If
+            # max() cannot run either, Neo4j is down; 1 is what the docstring
+            # promises for that case.
+            return 1
 
 
 def delete_all_memories():
