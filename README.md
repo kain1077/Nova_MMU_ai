@@ -198,34 +198,14 @@ interpreter (a virtualenv's, say) works and is the more reliable choice.
 
 ### Giving the model web search
 
-MMU does not browse, and shouldn't, it's a memory system. Run a search MCP server
-*alongside* it and let the model do its own reading, then save what it judges worth
-keeping. `mcp_config_example.json` in this repo shows both wired together using
-[duckduckgo-mcp-server](https://github.com/nickclyde/duckduckgo-mcp-server) (MIT, no API
-key), which needs [uv](https://docs.astral.sh/uv/):
+MMU does not browse, and shouldn't, it's a memory system. Enable a web search plugin in
+your client *alongside* it and let the model do its own reading, then save what it judges
+worth keeping. With LM Studio, install the **altra/web-search** plugin from the plugin
+directory and enable it for the chat. It is configured in LM Studio, not in your MCP
+config, so nothing in `mcp_config_example.json` changes.
 
-```bash
-# macOS / Linux
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Windows
-winget install --id=astral-sh.uv -e
-```
-
-**Pin the version.** A bare `uvx duckduckgo-mcp-server` resolves to the latest release on
-every launch, so third-party code running next to your memories can change between
-sessions without you noticing. Find the current version at
-[pypi.org/project/duckduckgo-mcp-server](https://pypi.org/project/duckduckgo-mcp-server/)
-and write it as `duckduckgo-mcp-server@X.Y.Z`.
-
-Most MCP clients **replace** their config rather than merging into it, so paste a complete
-file containing every server you want, not just the new one. Two are provided:
-`mcp_config_example.json` (MMU + search) and `mcp_config_mmu_only.json` (MMU alone) —
-swap between them to test with search on or off.
-
-If `uvx` is not found when the client launches, use its absolute path in `command`. A
-freshly installed `uv` is often not on `PATH` for already-running applications until you
-sign out and back in.
+If your client does use an MCP config file, note that most **replace** their config rather
+than merging into it, so paste a complete file containing every server you want.
 
 `save_memory` takes an optional **`source_url`**. When set, MMU marks that memory
 `src_type=3` and stores the URL, so it renders as `[Green | Web | …]` in every later
