@@ -5,15 +5,17 @@ The harness erases the graph between instances -- it has to, since each
 LongMemEval instance is its own haystack and leftover memories from the last
 one would poison retrieval for the next. That makes a wrong --base-url a
 data-loss event, and the wrong URL is one character away from the right one
-(8765 is the default MMU port; 8766 is the convention for a second instance).
+(8765 is the default MMU port; 8767 is the convention for a second instance).
 
 So a destructive call is allowed only against a graph that has explicitly been
 marked as disposable. Marking is a separate, deliberate step (`run.py init`),
 and the mark lives *in the graph itself* -- not in a config file that could
 still be pointing at last week's target.
 
-Three independent checks, all of which must pass:
+Four independent checks, all of which must pass:
 
+  0. The base URL is not the idle daemon's control port (MMU_IDLE_CONTROL_PORT,
+     default 8766). Never an MMU server, so no flag overrides this.
   1. The base URL is not the default production port, unless --allow-default-port.
   2. The graph carries the sentinel memory written by `init`.
   3. The graph is smaller than MAX_SAFE_MEMORIES, or the sentinel is present.
@@ -25,8 +27,10 @@ should still give them pause.
 
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 import requests
 
@@ -34,6 +38,10 @@ import requests
 # anything about it is special, but because it's the one your real graph is
 # most likely behind.
 PRODUCTION_PORT = 8765
+
+# The idle daemon's control port. This used to be the second-instance
+# convention too, so a habitual --base-url ...:8766 reached the daemon.
+DAEMON_PORT = int(os.environ.get("MMU_IDLE_CONTROL_PORT", "8766"))
 
 # A graph larger than this is assumed to be real until proven otherwise. The
 # LongMemEval haystacks are large, so this is checked before ingest, not after.
@@ -130,6 +138,13 @@ def check_target(base_url: str, *, allow_default_port: bool = False,
     than a string that may or may not have been checked somewhere.
     """
     base_url = base_url.rstrip("/")
+
+    if urlsplit(base_url).port == DAEMON_PORT:
+        raise UnsafeTarget(
+            f"Refusing to use {base_url}: port {DAEMON_PORT} is the idle daemon's\n"
+            f"control port (MMU_IDLE_CONTROL_PORT), not an MMU server.\n\n"
+            f"Point --base-url at your throwaway instance -- the convention is 8767."
+        )
 
     if f":{PRODUCTION_PORT}" in base_url and not allow_default_port:
         raise UnsafeTarget(

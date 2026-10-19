@@ -215,25 +215,43 @@ def test_production_port_refusal_can_be_overridden(monkeypatch):
         safety.check_target("http://127.0.0.1:8765", allow_default_port=True)
 
 
+def test_daemon_control_port_is_refused_before_any_request(monkeypatch):
+    """Check 0: the idle daemon's port is never an MMU server; no flag gets past it."""
+    def no_request(*a, **k):
+        raise AssertionError("a request was made to the daemon's port")
+    monkeypatch.setattr(safety, "_health", no_request)
+    monkeypatch.setattr(safety, "has_sentinel", no_request)
+    for kw in ({}, {"allow_default_port": True}, {"require_sentinel": False}):
+        with pytest.raises(safety.UnsafeTarget, match="idle daemon"):
+            safety.check_target(f"http://127.0.0.1:{safety.DAEMON_PORT}", **kw)
+
+
+def test_daemon_port_follows_its_env_var(monkeypatch):
+    monkeypatch.setattr(safety, "DAEMON_PORT", 9123)
+    monkeypatch.setattr(safety, "_health", lambda *a, **k: (_ for _ in ()).throw(AssertionError))
+    with pytest.raises(safety.UnsafeTarget, match="idle daemon"):
+        safety.check_target("http://127.0.0.1:9123")
+
+
 def test_graph_without_sentinel_is_refused(monkeypatch):
     monkeypatch.setattr(safety, "_health", lambda *a, **k: {"total_memories": 1009})
     monkeypatch.setattr(safety, "has_sentinel", lambda *a, **k: False)
     with pytest.raises(safety.UnsafeTarget, match="1009"):
-        safety.check_target("http://127.0.0.1:8766")
+        safety.check_target("http://127.0.0.1:8767")
 
 
 def test_graph_with_sentinel_is_accepted(monkeypatch):
     monkeypatch.setattr(safety, "_health", lambda *a, **k: {"total_memories": 12})
     monkeypatch.setattr(safety, "has_sentinel", lambda *a, **k: True)
-    target = safety.check_target("http://127.0.0.1:8766")
-    assert target.base_url == "http://127.0.0.1:8766"
-    assert target.url("/recall") == "http://127.0.0.1:8766/recall"
+    target = safety.check_target("http://127.0.0.1:8767")
+    assert target.base_url == "http://127.0.0.1:8767"
+    assert target.url("/recall") == "http://127.0.0.1:8767/recall"
 
 
 def test_erase_refuses_when_the_sentinel_vanished(monkeypatch):
     monkeypatch.setattr(safety, "has_sentinel", lambda *a, **k: False)
     with pytest.raises(safety.UnsafeTarget, match="Sentinel missing"):
-        safety.erase(safety.Target("http://127.0.0.1:8766"))
+        safety.erase(safety.Target("http://127.0.0.1:8767"))
 
 
 def test_unreachable_server_is_not_silently_treated_as_empty():

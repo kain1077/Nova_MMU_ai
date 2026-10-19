@@ -131,6 +131,15 @@ hottest path, and the removal of code that could not run.
 
 ### Changed
 
+- **The second-instance convention is now port 8767, and the daemon's port is refused.**
+  It was 8766, which is also the idle daemon's control port (`MMU_IDLE_CONTROL_PORT`).
+  On a machine running the daemon, `tests/test_mmu.py` probed the daemon when it was
+  imported and aimed its live tests at it. The tests, the LongMemEval harness,
+  `mmu_validate.py`, `mmu_recall_speed_test.py` and `Extra/test_client.py` now default to
+  8767; the tests and the harness refuse the daemon's port before making any request,
+  with no override, since it is never an MMU server. **If your test instance listens on
+  8766, move it to 8767** (`MMU_PORT=8767`) or point `MMU_TEST_BASE` at it.
+
 - **`suggested_parent` is now `owner_skill_id`** on a proposal. The old name said
   "parent", which is what pushed both the queue text and the reader toward `extends`;
   the value is the routine that already owns the most of this proposal — the one to grow.

@@ -11,14 +11,14 @@ Two tiers, deliberately:
             listening, so `pytest` works on a clean checkout.
 
     pytest tests/ -v                     # pure only, if nothing is running
-    MMU_TEST_BASE=http://127.0.0.1:8766 pytest tests/ -v
+    MMU_TEST_BASE=http://127.0.0.1:8767 pytest tests/ -v
 
 The live tests write memories, and every /recall they make ages every memory it
 does not return. That is not destructive -- aged memories go Green -> Yellow and
 come back on the next recall -- but it is a real change to a real graph, and a
 long enough test run can push memories to Blue.
 
-So the default target is port 8766, the second-instance convention, and NOT 8765,
+So the default target is port 8767, the second-instance convention, and NOT 8765,
 which is where a real graph usually lives. Aiming the live tests at 8765 needs an
 explicit opt-in:
 
@@ -28,6 +28,11 @@ This default used to be 8765, which meant a bare `pytest tests/` on a machine
 running MMU normally silently exercised the user's own memories. It aged four of
 them before anyone noticed, and turned up an index-drift bug on the way -- a good
 outcome from a bad default, but the default was still backwards.
+
+The convention used to be 8766 -- which is also the idle daemon's control port
+(MMU_IDLE_CONTROL_PORT). On a machine running the daemon, the suite probed the
+daemon at import and live tests were aimed at it. The daemon's port is now
+refused outright: it is never an MMU server, so there is nothing to opt into.
 
 [Running a second instance] in the README covers standing up something disposable.
 """
@@ -74,7 +79,7 @@ if os.environ.get("NEO4J_PASS"):
     os.environ.setdefault("NEO4J_USER", "neo4j")
     os.environ.setdefault("NEO4J_ENABLED", "true")
 
-BASE = os.environ.get("MMU_TEST_BASE", "http://127.0.0.1:8766")
+BASE = os.environ.get("MMU_TEST_BASE", "http://127.0.0.1:8767")
 
 # The port a normal MMU install listens on, and therefore the one the live tests
 # must not touch without being told to.
@@ -90,11 +95,22 @@ _PRODUCTION_REASON = (
     f"MMU_TEST_ALLOW_PRODUCTION=1 if this really is disposable."
 )
 
+# The idle daemon's control port. Never an MMU server, so never a test target:
+# refused unconditionally, before any request.
+DAEMON_PORT = int(os.environ.get("MMU_IDLE_CONTROL_PORT", "8766"))
+_AIMED_AT_DAEMON = urllib.parse.urlsplit(BASE).port == DAEMON_PORT
+
+_DAEMON_REASON = (
+    f"refusing to run live tests against {BASE}: port {DAEMON_PORT} is the idle "
+    f"daemon's control port (MMU_IDLE_CONTROL_PORT), not an MMU server. Point "
+    f"MMU_TEST_BASE at a throwaway instance -- the convention is 8767."
+)
+
 
 def _server_up():
     # Checked only when the target is allowed, so a refused target costs no
     # request at all -- the same ordering the benchmark harness uses.
-    if _AIMED_AT_PRODUCTION:
+    if _AIMED_AT_PRODUCTION or _AIMED_AT_DAEMON:
         return False
     try:
         with urllib.request.urlopen(f"{BASE}/health", timeout=3) as r:
@@ -107,7 +123,9 @@ _LIVE_OK = _server_up()
 
 live = pytest.mark.skipif(
     not _LIVE_OK,
-    reason=(_PRODUCTION_REASON if _AIMED_AT_PRODUCTION else f"no MMU server at {BASE}"),
+    reason=(_PRODUCTION_REASON if _AIMED_AT_PRODUCTION
+            else _DAEMON_REASON if _AIMED_AT_DAEMON
+            else f"no MMU server at {BASE}"),
 )
 
 if _AIMED_AT_PRODUCTION:
@@ -115,6 +133,8 @@ if _AIMED_AT_PRODUCTION:
     # difference between "the live tests didn't run" and "the live tests ran
     # against your real graph".
     print(f"\n!! {_PRODUCTION_REASON}\n", file=sys.stderr)
+elif _AIMED_AT_DAEMON:
+    print(f"\n!! {_DAEMON_REASON}\n", file=sys.stderr)
 
 
 # mmu_server imports fastapi, a container dependency that is routinely absent
@@ -158,6 +178,37 @@ def _call(method, path, payload=None, timeout=120, headers=None):
             return r.status, json.load(r)
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read().decode() or "{}")
+
+
+# ═════════════════════════════════════════════════════════════
+#  PURE -- the live-test target
+# ═════════════════════════════════════════════════════════════
+
+def _target_flags(env, drop=()):
+    """Import this module fresh with `env` and report how it treats the target."""
+    import subprocess
+    code = ("import sys; sys.path.insert(0, 'tests'); import test_mmu as t; "
+            "print(t.BASE, t._AIMED_AT_DAEMON, t._LIVE_OK)")
+    run_env = {k: v for k, v in os.environ.items() if k not in drop}
+    run_env.update(env)
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                         cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         env=run_env, timeout=120)
+    assert out.returncode == 0, out.stderr[-2000:]
+    return out.stdout.split()
+
+
+def test_default_target_is_8767_not_the_daemon_port():
+    base, aimed, _ = _target_flags({}, drop=("MMU_TEST_BASE", "MMU_IDLE_CONTROL_PORT"))
+    assert base == "http://127.0.0.1:8767" and aimed == "False"
+
+
+@pytest.mark.parametrize("port", ["8766", "9123"])
+def test_daemon_control_port_is_refused(port):
+    """Aimed at MMU_IDLE_CONTROL_PORT, the live tier is off and no request is made."""
+    base, aimed, live_ok = _target_flags({"MMU_TEST_BASE": f"http://127.0.0.1:{port}",
+                                          "MMU_IDLE_CONTROL_PORT": port})
+    assert aimed == "True" and live_ok == "False"
 
 
 # ═════════════════════════════════════════════════════════════
