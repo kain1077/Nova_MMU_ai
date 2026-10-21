@@ -64,6 +64,9 @@ desktop.ini
 # tracked; what it produces on someone's machine is not.
 bench/results/
 
+# wslc scripts: generated env files (they hold NEO4J_PASS) and run logs.
+wslc/runtime/
+
 # ── Packaging output ─────────────────────────────────
 # PyInstaller's working directory and the binaries it produces. Released
 # artifacts come from CI, not from anyone's laptop.

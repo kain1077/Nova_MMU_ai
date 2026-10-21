@@ -58,7 +58,9 @@ you hit something, please open an issue, since a report is the only way it gets 
 ## Install
 
 Two routes. The installer does the same work the manual steps do, and prints
-what it did at each stage; neither is more "real" than the other.
+what it did at each stage; neither is more "real" than the other. A third,
+experimental route for Windows runs MMU on WSL containers instead of Docker
+Desktop: see [Option C](#option-c--wsl-containers-without-docker-desktop-experimental-windows-only).
 
 ### Option A — the installer
 
@@ -158,6 +160,74 @@ MMU self-check
 
 If those last two numbers disagree, stop and fix it. See
 [Troubleshooting](#troubleshooting).
+
+### Option C — WSL containers, without Docker Desktop (experimental, Windows only)
+
+This path is experimental. Docker Compose (Option B) is the supported way to run MMU.
+WSL containers (`wslc`, part of WSL 3.0.1 and newer) run the same Dockerfile and the same
+Neo4j image, with three PowerShell scripts in `wslc\` doing Compose's job. Compared with
+Docker it needs no Docker Desktop and gives all its memory back when MMU is stopped; recall
+is about 20% slower, and nothing restarts MMU after a reboot.
+
+**Before you start, check:**
+
+- Windows 11 with virtualization enabled. Only Windows 11 build 26300 has been tested so far.
+- `wsl --version` in PowerShell shows **WSL version 3.0.1 or newer**. If not, run
+  `wsl --update` (`winget` does not offer it yet). If you already run anything in Docker
+  Desktop or WSL, stop it first: the update restarts WSL.
+- After updating, open a **new** PowerShell window and run `wslc --version`.
+- Ports 8765, 7474 and 7687 are free (`Get-NetTCPConnection -State Listen -LocalPort 8765,7474,7687`
+  should print nothing). If you also run MMU in Docker, see
+  [Running a second instance](#running-a-second-instance). `up.ps1` checks this too and stops
+  with "Port ... is already in use" if one is taken.
+- If you use embeddings: LM Studio (or another OpenAI-compatible server) is running on port
+  1234 with your embedding model loaded. Note its API token if it requires one.
+
+**Install**
+
+1. Get the MMU repository (clone or download) and open PowerShell in that folder.
+2. `Copy-Item .env.example .env`, then edit `.env`:
+   - `NEO4J_PASS=` any password of your own.
+   - `MMU_EMBEDDING_BASE=http://host.wslc.internal:1234/v1` (**not** `host.docker.internal`,
+     which refuses connections under wslc).
+   - `MMU_EMBEDDING_API_KEY=` your LM Studio token, if it requires one.
+   - Keep `MMU_BIND=127.0.0.1`. The scripts refuse any other value unless `MMU_API_KEY` is set.
+3. Start it: `powershell -ExecutionPolicy Bypass -File .\wslc\up.ps1`
+   The first run builds the server and downloads Neo4j (about a minute). It prints the total
+   time and `MMU /health: status=ok` when ready.
+4. Check it: `powershell -ExecutionPolicy Bypass -File .\wslc\status.ps1`. You should see both
+   containers healthy, three sockets on `127.0.0.1` only, and `/embedding_status` showing
+   `backend_reachable: true` and the right `dim`.
+5. Point your MCP bridge at `http://127.0.0.1:8765`, as with Docker.
+
+**Every day**
+
+- **After a reboot, run `up.ps1` again.** WSL containers have no auto-restart.
+- Stop MMU: `.\wslc\down.ps1`. Your memories are kept.
+- `.\wslc\down.ps1 -RemoveData` deletes **all** memories and the database. There is no undo.
+- After updating MMU: `.\wslc\up.ps1 -Rebuild -RecreateServer`. After changing an `MMU_*`
+  value in `.env`: `.\wslc\up.ps1 -RecreateServer`.
+- `wsl --shutdown` does not stop wslc; it runs its own VM. `wslc system session terminate`
+  does, cleanly, and `up.ps1` starts MMU again afterwards.
+
+The scripts read the same `.env` as Compose and use its defaults: containers `mmu-neo4j` and
+`mmu-memory-server`, ports 8765/7474/7687. Under wslc they also create volumes
+`mmu-neo4j-data`, `mmu-neo4j-logs` and `mmu-mmu-data`, a network `mmu-net` and an image
+`mmu-server:wslc`; `WSLC_VOLUME_PREFIX`, `WSLC_NETWORK` and `WSLC_SERVER_IMAGE` in `.env`
+change them. Every container, volume and network name must start with `mmu-`, and
+`down.ps1` only ever removes the ones `.env` names. Generated env files and run logs go to
+`wslc\runtime\`, which is gitignored.
+
+**If something goes wrong**
+
+- "wslc is not recognized": open a new terminal; if it persists, `wsl --version` is below 3.0.1.
+- "Port ... is already in use": change the port in `.env`.
+- `/embedding_status` shows `backend_reachable: false`: check `MMU_EMBEDDING_BASE` uses
+  `host.wslc.internal` and that LM Studio's server is started. `auth_failed: true` means the
+  token is missing or wrong.
+- Logs: `wslc logs mmu-memory-server` (or your `MMU_SERVER_NAME`). Each `up.ps1` run also
+  writes a transcript to `wslc\runtime\`.
+- In a bug report, include `wsl --version` and `winver`.
 
 ---
 
@@ -604,6 +674,16 @@ docker compose -p mmu-test up -d
 
 Volumes are namespaced by the project name, so the two graphs stay separate.
 Tear it down with `docker compose -p mmu-test down -v`.
+
+Under wslc (Option C) there is no project name, so also give the second instance its own
+volumes and network in its `.env`, then run its `wslc\up.ps1`:
+
+```
+WSLC_VOLUME_PREFIX=mmu-test-
+WSLC_NETWORK=mmu-test-net
+```
+
+Tear it down with `.\wslc\down.ps1 -RemoveData`.
 
 ---
 
